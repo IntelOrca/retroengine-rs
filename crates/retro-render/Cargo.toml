@@ -8,3 +8,8 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+blake3.workspace = true
+png.workspace = true
+retro-core.workspace = true
