@@ -64,6 +64,14 @@ mod tests {
     #[test]
     fn to_fixed_wraps_on_overflow_like_c() {
         assert_eq!(to_fixed(i32::MAX), -ONE);
+        assert_eq!(to_fixed(i32::MIN), 0);
+    }
+
+    #[test]
+    fn from_fixed_handles_extremes() {
+        assert_eq!(from_fixed(i32::MAX), 0x7FFF);
+        assert_eq!(from_fixed(i32::MIN), -0x8000);
+        assert_eq!(from_fixed(i32::MIN + 1), -0x8000);
     }
 
     #[test]

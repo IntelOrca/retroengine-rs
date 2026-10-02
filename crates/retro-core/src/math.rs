@@ -51,7 +51,11 @@ pub fn cos_m7(angle: i32) -> i32 {
 
 #[inline]
 fn normalize(angle: i32, size: i32) -> i32 {
-    let angle = if angle < 0 { size - angle } else { angle };
+    let angle = if angle < 0 {
+        size.wrapping_sub(angle)
+    } else {
+        angle
+    };
     angle & (size - 1)
 }
 
@@ -120,5 +124,20 @@ mod tests {
             assert_eq!(sin_512(i), SIN_512_LOOKUP[i as usize]);
             assert_eq!(sin_m7(i), SIN_M7_LOOKUP[i as usize]);
         }
+    }
+
+    #[test]
+    fn extreme_angles_do_not_overflow() {
+        assert_eq!(sin_256(i32::MIN), sin_256(0));
+        assert_eq!(cos_256(i32::MIN), cos_256(0));
+        assert_eq!(sin_512(i32::MIN), sin_512(0));
+        assert_eq!(cos_512(i32::MIN), cos_512(0));
+        assert_eq!(sin_m7(i32::MIN), sin_m7(0));
+        assert_eq!(cos_m7(i32::MIN), cos_m7(0));
+        assert_eq!(sin_256(i32::MAX), sin_256(i32::MAX & 0xFF));
+        assert_eq!(
+            sin_m7(i32::MIN + 1),
+            sin_m7((0x200i32.wrapping_sub(i32::MIN + 1)) & 0x1FF)
+        );
     }
 }

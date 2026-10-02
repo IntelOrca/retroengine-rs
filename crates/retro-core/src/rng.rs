@@ -93,14 +93,19 @@ impl RandSeeded {
     }
 
     /// Advances the generator and maps the result into `[min, max)` like RSDK's `RandSeeded`.
+    ///
+    /// Unlike the upstream C macro, this never panics or overflows: when `min >= max` it returns
+    /// `min` (upstream would divide by zero for `min == max` and rely on undefined signed
+    /// overflow for extreme spans), and the span is computed in 64-bit wrapping arithmetic.
     #[inline]
     pub fn next_in(&mut self, min: i32, max: i32) -> i32 {
         let result = self.next();
-        if min < max {
-            min + result % (max - min)
-        } else {
-            max + result % (min - max)
+        if min >= max {
+            return min;
         }
+        let span = (max as i64).wrapping_sub(min as i64) as u64;
+        let offset = (result as u32 as u64) % span;
+        min.wrapping_add(offset as i32)
     }
 }
 
@@ -181,9 +186,22 @@ mod tests {
     }
 
     #[test]
-    fn rand_seeded_handles_reversed_bounds() {
+    fn rand_seeded_next_in_handles_reversed_and_equal_bounds() {
         let mut rng = RandSeeded::new(1);
-        let value = rng.next_in(100, 0);
-        assert!((0..100).contains(&value));
+        assert_eq!(rng.next_in(100, 0), 100);
+        assert_eq!(rng.next_in(5, 5), 5);
+        assert_eq!(rng.next_in(i32::MAX, i32::MIN), i32::MAX);
+    }
+
+    #[test]
+    fn rand_seeded_next_in_handles_extreme_bounds() {
+        let mut rng = RandSeeded::new(1);
+        assert_eq!(rng.next_in(i32::MIN, i32::MAX), -1_669_726_335);
+        let mut rng = RandSeeded::new(1);
+        let value = rng.next_in(0, i32::MAX);
+        assert_eq!(value, 477_757_313);
+        let mut rng = RandSeeded::new(1);
+        let value = rng.next_in(i32::MIN, 0);
+        assert!(value < 0);
     }
 }
