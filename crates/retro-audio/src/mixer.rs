@@ -211,6 +211,31 @@ impl Mixer {
         self.voices = [Voice::default(); SFX_CHANNEL_COUNT];
     }
 
+    /// Stops every voice currently playing `id` (`StopSfx` upstream).
+    pub fn stop_sfx_id(&mut self, id: SfxId) {
+        for voice in &mut self.voices {
+            if voice.sfx == Some(id.0) {
+                *voice = Voice::default();
+            }
+        }
+    }
+
+    /// Updates the loop flag and pan of every voice playing `id` (`SetSfxAttributes` upstream).
+    ///
+    /// `loop_count` of `-1` keeps the current loop flag, matching the upstream
+    /// `loopCount == -1 ? loopSFX : loopCount` assignment. Pan is clamped to `-100..=100` like
+    /// [`Mixer::play_sfx`].
+    pub fn set_sfx_attributes(&mut self, id: SfxId, loop_count: i32, pan: i8) {
+        for voice in &mut self.voices {
+            if voice.sfx == Some(id.0) {
+                if loop_count != -1 {
+                    voice.looping = loop_count != 0;
+                }
+                voice.pan = pan.clamp(-100, 100);
+            }
+        }
+    }
+
     /// Decodes and stores an Ogg Vorbis music stream (`LoadMusic` upstream).
     pub fn load_stream(&mut self, bytes: Vec<u8>) -> Result<StreamId, AudioError> {
         if !bytes.starts_with(b"OggS") {
@@ -667,6 +692,50 @@ mod tests {
         mixer.stop_all_sfx();
         mixer.mix_frame(&mut out, 2);
         assert_eq!(out, [0.0; 4]);
+    }
+
+    #[test]
+    fn stop_sfx_id_stops_every_matching_voice() {
+        let mut mixer = Mixer::new();
+        let first = load_stereo(&mut mixer, &[1000, 1000, 1000, 1000]);
+        let second = load_stereo(&mut mixer, &[2000, 2000, 2000, 2000]);
+        mixer.play_sfx(first, 100, 0);
+        mixer.play_sfx(second, 100, 0);
+        // Re-playing an id reuses its channel, so there is one voice per id here.
+        mixer.play_sfx(first, 100, 0);
+        mixer.stop_sfx_id(second);
+        let mut out = vec![0.0f32; 4];
+        mixer.mix_frame(&mut out, 2);
+        assert_eq!(out, [1000.0 / 32768.0; 4]);
+        mixer.stop_sfx_id(first);
+        mixer.mix_frame(&mut out, 2);
+        assert_eq!(out, [0.0; 4]);
+    }
+
+    #[test]
+    fn set_sfx_attributes_updates_loop_and_pan() {
+        let mut mixer = Mixer::new();
+        let id = load_stereo(&mut mixer, &[1000, 1000, 1000, 1000]);
+        let channel = mixer.play_sfx(id, 100, 0);
+        assert_eq!(mixer.channel_position(channel), Some(0));
+
+        // `-1` keeps the loop flag, any other value sets it.
+        mixer.set_sfx_attributes(id, -1, -100);
+        let mut out = vec![0.0f32; 2];
+        mixer.mix_frame(&mut out, 1);
+        assert_eq!(out, [1000.0 / 32768.0, 0.0]);
+
+        mixer.set_sfx_attributes(id, 0, 100);
+        mixer.mix_frame(&mut out, 1);
+        assert_eq!(out, [0.0, 1000.0 / 32768.0]);
+
+        // Loop flag set: the voice restarts instead of ending.
+        mixer.set_sfx_attributes(id, 1, 0);
+        let mut long = vec![0.0f32; 16];
+        mixer.mix_frame(&mut long, 8);
+        assert_eq!(mixer.channel_sfx(channel), Some(id));
+        assert_eq!(long[0], 1000.0 / 32768.0);
+        assert_eq!(long[8], 1000.0 / 32768.0);
     }
 
     #[test]

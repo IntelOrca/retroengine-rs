@@ -12,5 +12,5 @@ workspace = true
 [dependencies]
 blake3.workspace = true
 lewton.workspace = true
-retro-platform = { path = "../retro-platform", default-features = false }
+retro-platform.workspace = true
 thiserror.workspace = true
