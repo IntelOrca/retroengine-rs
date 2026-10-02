@@ -4,7 +4,8 @@
 mod tables;
 
 pub use tables::{
-    COS_256_LOOKUP, COS_512_LOOKUP, COS_M7_LOOKUP, SIN_256_LOOKUP, SIN_512_LOOKUP, SIN_M7_LOOKUP,
+    ARC_TAN_256_LOOKUP, COS_256_LOOKUP, COS_512_LOOKUP, COS_M7_LOOKUP, SIN_256_LOOKUP,
+    SIN_512_LOOKUP, SIN_M7_LOOKUP,
 };
 
 /// `Sin256` equivalent: 256 entries per full turn, scaled by 256.
@@ -47,6 +48,47 @@ pub fn sin_m7(angle: i32) -> i32 {
 #[must_use]
 pub fn cos_m7(angle: i32) -> i32 {
     COS_M7_LOOKUP[(normalize(angle, 0x200)) as usize]
+}
+
+/// `ArcTanLookup` equivalent: returns the byte angle (`0..=255`) of `(X, Y)`.
+///
+/// Ported from `ArcTanLookup` in `RSDKv4/Math.cpp`; the table stores
+/// `atan2f(Y, X) * 40.743664f` at `Y + X * 0x100`.
+#[inline]
+#[must_use]
+pub fn arc_tan(x: i32, y: i32) -> i32 {
+    let mut short_x = x.wrapping_abs();
+    let mut short_y = y.wrapping_abs();
+    if short_x <= short_y {
+        while short_y > 0xFF {
+            short_x >>= 4;
+            short_y >>= 4;
+        }
+    } else {
+        while short_x > 0xFF {
+            short_x >>= 4;
+            short_y >>= 4;
+        }
+    }
+    let lookup = |x: i32, y: i32| {
+        let index = x.wrapping_mul(0x100).wrapping_add(y);
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| ARC_TAN_256_LOOKUP.get(index).copied())
+            .map(i32::from)
+            .unwrap_or(0)
+    };
+    if x <= 0 {
+        if y <= 0 {
+            (lookup(short_x, short_y) - 0x80) & 0xFF
+        } else {
+            (-0x80 - lookup(short_x, short_y)) & 0xFF
+        }
+    } else if y <= 0 {
+        (-lookup(short_x, short_y)) & 0xFF
+    } else {
+        lookup(short_x, short_y)
+    }
 }
 
 #[inline]
@@ -124,6 +166,35 @@ mod tests {
             assert_eq!(sin_512(i), SIN_512_LOOKUP[i as usize]);
             assert_eq!(sin_m7(i), SIN_M7_LOOKUP[i as usize]);
         }
+    }
+
+    #[test]
+    fn arc_tan_cardinals() {
+        assert_eq!(arc_tan(1, 0), 0);
+        assert_eq!(arc_tan(-1, 0), 0x80);
+        assert_eq!(arc_tan(1, 1), 0x20);
+        assert_eq!(arc_tan(-1, 1), 0x60);
+        assert_eq!(arc_tan(0, 0), 0x80);
+        assert_eq!(arc_tan(1, -1), 0xE0);
+        // Extreme inputs must not panic (upstream's `abs(INT_MIN)` is undefined behaviour).
+        assert!((0..=255).contains(&arc_tan(i32::MIN, i32::MIN)));
+        assert!((0..=255).contains(&arc_tan(i32::MAX, i32::MAX)));
+        assert!((0..=255).contains(&arc_tan(i32::MIN, i32::MAX)));
+    }
+
+    #[test]
+    fn arc_tan_matches_generated_table_formula() {
+        for y in 0..0x100i32 {
+            for x in 0..0x100i32 {
+                let expected = ARC_TAN_256_LOOKUP[(y + x * 0x100) as usize];
+                if x != 0 && y != 0 {
+                    assert_eq!(arc_tan(x, y), i32::from(expected), "at ({x}, {y})");
+                }
+            }
+        }
+        // Downscaling large coordinates must land on the same table entry as the exact
+        // `(x, y)` after the 4-bit shifts.
+        assert_eq!(arc_tan(0x1234, 0x2345), arc_tan(0x12, 0x23));
     }
 
     #[test]

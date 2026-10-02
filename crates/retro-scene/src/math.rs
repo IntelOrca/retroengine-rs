@@ -1,148 +1,59 @@
-//! Trigonometry lookup tables and wrappers, ported from `RSDKv4/Math.cpp`/`Math.hpp`
-//! (RSDKModding/RSDKv4-Decompilation @ a7f5195).
+//! Trigonometry accessors for the engine script host.
 //!
-//! Upstream fills the tables once at startup with libm `sin`/`atan2`; this port computes the
-//! same values in Rust `f64`. Results are deterministic for a given binary, which is what the
-//! M3 state hashes require.
+//! The lookup tables are generated into `retro-core` by `tools/gen_math_tables.sh` from the
+//! exact `RSDKv4/Math.cpp` formulas (`CalculateTrigAngles`). This module keeps the script-facing
+//! [`MathTables`] API but is a thin delegate, so there is a single source of truth for the
+//! tables (bit-exact on every host, not just this one).
 
-use std::f64::consts::PI;
+use retro_core::math;
 
 /// Addressable sin/cos angle count for the 512-step tables.
 pub const SIN512_COUNT: usize = 0x200;
 /// Addressable sin/cos angle count for the 256-step tables.
 pub const SIN256_COUNT: usize = 0x100;
 
-/// The `sinM7`/`sin512`/`sin256`/`arcTan256` lookup tables.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MathTables {
-    /// `sin512LookupTable`.
-    pub sin512: [i32; SIN512_COUNT],
-    /// `cos512LookupTable`.
-    pub cos512: [i32; SIN512_COUNT],
-    /// `sin256LookupTable`.
-    pub sin256: [i32; SIN256_COUNT],
-    /// `cos256LookupTable`.
-    pub cos256: [i32; SIN256_COUNT],
-    atan: Vec<u8>,
-}
-
-impl Default for MathTables {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Script-facing trigonometry accessors.
+///
+/// The historical implementation owned the tables; it now delegates to
+/// [`retro_core::math`]. The unit type keeps the call sites unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MathTables;
 
 impl MathTables {
-    /// Computes every table exactly like `CalculateTrigAngles`.
+    /// Creates the accessor.
     #[must_use]
-    pub fn new() -> Self {
-        let mut sin512 = [0i32; SIN512_COUNT];
-        let mut cos512 = [0i32; SIN512_COUNT];
-        for index in 0..SIN512_COUNT {
-            let fraction = index as f64 / 256.0;
-            sin512[index] = ((fraction * PI).sin() * 512.0) as i32;
-            cos512[index] = ((fraction * PI).cos() * 512.0) as i32;
-        }
-        cos512[0x00] = 0x200;
-        cos512[0x80] = 0;
-        cos512[0x100] = -0x200;
-        cos512[0x180] = 0;
-        sin512[0x00] = 0;
-        sin512[0x80] = 0x200;
-        sin512[0x100] = 0;
-        sin512[0x180] = -0x200;
-
-        let mut sin256 = [0i32; SIN256_COUNT];
-        let mut cos256 = [0i32; SIN256_COUNT];
-        for index in 0..SIN256_COUNT {
-            sin256[index] = sin512[index * 2] >> 1;
-            cos256[index] = cos512[index * 2] >> 1;
-        }
-
-        let mut atan = vec![0u8; 0x100 * 0x100];
-        for y in 0..0x100usize {
-            for x in 0..0x100usize {
-                let angle = (y as f64).atan2(x as f64) as f32;
-                atan[x * 0x100 + y] = (angle * 40.743_664_f32) as u8;
-            }
-        }
-
-        Self {
-            sin512,
-            cos512,
-            sin256,
-            cos256,
-            atan,
-        }
+    pub const fn new() -> Self {
+        Self
     }
 
     /// `Sin512`.
     #[must_use]
     pub fn sin512(&self, angle: i32) -> i32 {
-        let angle = if angle < 0 { 0x200 - angle } else { angle };
-        let index = (angle & 0x1FF) as usize;
-        self.sin512.get(index).copied().unwrap_or(0)
+        math::sin_512(angle)
     }
 
     /// `Cos512`.
     #[must_use]
     pub fn cos512(&self, angle: i32) -> i32 {
-        let angle = if angle < 0 { 0x200 - angle } else { angle };
-        let index = (angle & 0x1FF) as usize;
-        self.cos512.get(index).copied().unwrap_or(0)
+        math::cos_512(angle)
     }
 
     /// `Sin256`.
     #[must_use]
     pub fn sin256(&self, angle: i32) -> i32 {
-        let angle = if angle < 0 { 0x100 - angle } else { angle };
-        let index = (angle & 0xFF) as usize;
-        self.sin256.get(index).copied().unwrap_or(0)
+        math::sin_256(angle)
     }
 
     /// `Cos256`.
     #[must_use]
     pub fn cos256(&self, angle: i32) -> i32 {
-        let angle = if angle < 0 { 0x100 - angle } else { angle };
-        let index = (angle & 0xFF) as usize;
-        self.cos256.get(index).copied().unwrap_or(0)
+        math::cos_256(angle)
     }
 
-    /// `ArcTanLookup(X, Y)`.
+    /// `ArcTanLookup(X, Y)`; returns the byte angle (`0..=255`).
     #[must_use]
     pub fn atan2(&self, x: i32, y: i32) -> i32 {
-        let mut short_x = x.abs();
-        let mut short_y = y.abs();
-        if short_x <= short_y {
-            while short_y > 0xFF {
-                short_x >>= 4;
-                short_y >>= 4;
-            }
-        } else {
-            while short_x > 0xFF {
-                short_x >>= 4;
-                short_y >>= 4;
-            }
-        }
-        let lookup = |x: i32, y: i32| {
-            let index = x.wrapping_mul(0x100).wrapping_add(y);
-            usize::try_from(index)
-                .ok()
-                .and_then(|index| self.atan.get(index).copied())
-                .map(i32::from)
-                .unwrap_or(0)
-        };
-        if x <= 0 {
-            if y <= 0 {
-                (lookup(short_x, short_y) - 0x80) & 0xFF
-            } else {
-                (-0x80 - lookup(short_x, short_y)) & 0xFF
-            }
-        } else if y <= 0 {
-            (-lookup(short_x, short_y)) & 0xFF
-        } else {
-            lookup(short_x, short_y)
-        }
+        math::arc_tan(x, y)
     }
 }
 
@@ -179,13 +90,15 @@ mod tests {
     }
 
     #[test]
-    fn atan2_cardinals() {
+    fn atan2_matches_retro_core() {
         let tables = MathTables::new();
-        assert_eq!(tables.atan2(1, 0), 0);
-        assert_eq!(tables.atan2(-1, 0), 0x80);
         assert_eq!(tables.atan2(1, 1), 0x20);
         assert_eq!(tables.atan2(-1, 1), 0x60);
         assert_eq!(tables.atan2(0, 0), 0x80);
-        assert_eq!(tables.atan2(1, -1), 0xE0);
+        for y in [0i32, 1, 17, 255, 4096] {
+            for x in [0i32, 1, 17, 255, 4096] {
+                assert_eq!(tables.atan2(x, y), retro_core::math::arc_tan(x, y));
+            }
+        }
     }
 }

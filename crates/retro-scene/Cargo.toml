@@ -10,6 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+retro-core.workspace = true
 retro-format-v4.workspace = true
 retro-script.workspace = true
 serde.workspace = true
