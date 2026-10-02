@@ -5,9 +5,13 @@
 //! official RSDKv5U v4 legacy compiler. The engine uses this path when `Bytecode/` is absent.
 //!
 //! The port is validated byte-for-byte against that C++ compiler on the shipped script sources:
-//! `GlobalCode` for both games plus several stage groups match on code words, jump table entries,
-//! function positions and object entry points. See `tests/compiler_assets.rs` for the golden
-//! comparison against the shipped `_Bytecode` and the script data-version caveats.
+//! 71 of the 72 shipped groups match on code words, jump table entries, function positions and
+//! object entry points. The single divergence is S2 `Mission_Zone02`: the reference stores alias
+//! names in a 32-byte buffer, so the 32-character `EGGMANSIGNPOST_SPAWNFALLSIGNPOST` loses its
+//! NUL terminator and fails to resolve there, while this port resolves it exactly like the
+//! original tools (the shipped `_Bytecode` agrees). See `tests/compiler_assets.rs` for the golden
+//! hashes, the divergence test and the script data-version caveats, and `tools/script-oracle` for
+//! the reproducible reference harness.
 //!
 //! # Fidelity notes
 //!
@@ -2576,6 +2580,22 @@ mod tests {
                 op(Op::End),
             ]
         );
+    }
+
+    #[test]
+    fn thirty_two_character_alias_names_resolve() {
+        // The decomp reference stores alias names in `char name[0x20]`; a 32-character name has
+        // no room for a NUL terminator, so the reference's `StrComp` reads into the following
+        // `value` field and the alias never matches (see the asset-gated
+        // `mission_zone02_long_alias_divergence` test). This port uses `String` and resolves it,
+        // matching the shipped `_Bytecode`.
+        let file = compile(
+            "private alias 5 : EGGMANSIGNPOST_SPAWNFALLSIGNPOST\n\
+             event ObjectUpdate\n\
+             temp0 = EGGMANSIGNPOST_SPAWNFALLSIGNPOST\n\
+             end event\n",
+        );
+        assert_eq!(file.code, vec![op(Op::Equal), 1, 0, 0, 2, 5, op(Op::End)]);
     }
 
     #[test]
