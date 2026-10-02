@@ -6,11 +6,13 @@
 //! `frame_%04d.png` headlessly; without `--headless` the same frames are presented through the
 //! SDL3 backend at 60 Hz.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
 use retro_audio::{AudioEngine, SAMPLE_RATE};
+use retro_format_v4::GameConfig;
 use retro_input::ScriptedInput;
 use retro_io::{DataSource, DirSource};
 use retro_platform::{AudioDesc, BackendKind, FsStorage, Storage, WindowDesc};
@@ -20,32 +22,53 @@ use crate::loader;
 use crate::runtime::Engine;
 use crate::save::{seed_memory_storage, seed_storage_from_source};
 
-/// Number of frames run when `--frames` is omitted or `0`.
+/// Default headless frame count used when `--frames` is omitted or `0`.
+///
+/// Windowed runs without an explicit `--frames` run until the window closes instead.
 pub const DEFAULT_FRAMES: u64 = 600;
 
 /// Command line arguments for the engine binary.
 #[derive(Debug, Parser)]
 #[command(
-    name = "retro-engine",
+    name = "retroengine",
     version,
-    about = "Retro Engine (RSDK v4 legacy) reimplementation"
+    about = "Retro Engine (RSDK v4 legacy) reimplementation",
+    long_about = "Runs an unpacked Sonic 1 or Sonic 2 (RSDK v4 legacy) asset folder.\n\
+        Headless mode is deterministic and prints a BLAKE3 state hash; without --headless \
+        the game opens in an SDL3 window and runs until the window closes.",
+    after_help = "EXAMPLES:\n  \
+        retroengine C:\\games\\S1 --headless --frames 600\n  \
+        retroengine C:\\games\\S1 --scene GHZ --act 1\n  \
+        retroengine C:\\games\\S2 --scene \"EMERALD HILL ZONE 1\"\n  \
+        retroengine C:\\games\\S1 --list\n\n\
+        Scene names are case-insensitive and ignore spaces/punctuation: Zone01, \
+        \"GREEN HILL ZONE 1\", GreenHill, GHZ and GHZ2 all work.\n\
+        Saves are written to --user-dir, or %APPDATA%\\retroengine-rs\\retroengine on Windows."
 )]
 pub struct Args {
-    /// Path to an unpacked RSDK asset folder (e.g. assets/S1)
+    /// Path to an unpacked RSDK asset folder (e.g. C:\games\S1)
     pub assets_dir: PathBuf,
-    /// Scene to start: a stage folder (`Zone01`) or a GameConfig scene name
+    /// Scene to start: a stage folder (`Zone01`), a GameConfig name (`GREEN HILL ZONE 1`),
+    /// a short name (`GHZ`, `GreenHill`, `GHZ2`) or a `--list` index (`7`)
     #[arg(long)]
     pub scene: Option<String>,
-    /// Act id to start (numeric, or a stage id such as `B`); defaults to the
-    /// GameConfig entry's id
+    /// Act id to start (`1`, `2`, `B`, ...); case-insensitive. Defaults to the GameConfig
+    /// entry's id, or a trailing number in `--scene`
     #[arg(long)]
     pub act: Option<String>,
     /// Run without a window using the deterministic headless backend
     #[arg(long)]
     pub headless: bool,
-    /// Number of frames to run (0 means the 600-frame default)
+    /// Number of frames to run; 0 means the 600-frame default headlessly and "until the
+    /// window closes" in windowed mode
     #[arg(long, default_value_t = 0)]
     pub frames: u64,
+    /// List categories, scenes and available `Act*.bin` files, then exit
+    #[arg(long, conflicts_with = "list_json")]
+    pub list: bool,
+    /// Like `--list` but prints machine-readable JSON
+    #[arg(long)]
+    pub list_json: bool,
     /// Scripted input file to replay; overrides the windowed SDL input in either mode
     #[arg(long)]
     pub input: Option<PathBuf>,
@@ -68,7 +91,8 @@ pub struct Args {
     #[arg(long)]
     pub mute: bool,
     /// Directory to persist user data (save RAM) in; seeded from the shipped SData.bin/SGame.bin
-    /// on first run. Headless without it uses in-memory storage
+    /// on first run. Headless without it uses in-memory storage; windowed runs default to the
+    /// SDL preferred path (`%APPDATA%\retroengine-rs\retroengine` on Windows)
     #[arg(long)]
     pub user_dir: Option<PathBuf>,
 }
@@ -131,8 +155,148 @@ fn save_storage(
     Ok(Box::new(storage))
 }
 
+/// One row of the `--list` output.
+#[derive(Clone, Debug)]
+struct ListedScene {
+    /// Global 1-based index accepted by `--scene`.
+    index: usize,
+    /// File-order category index.
+    category: usize,
+    /// Stage folder under `Data/Stages`.
+    folder: String,
+    /// GameConfig act/stage id.
+    id: String,
+    /// Display name.
+    name: String,
+    /// Raw "highlighted" byte.
+    highlighted: u8,
+    /// Available `Act*.bin` ids, discovered case-insensitively.
+    acts: Vec<String>,
+}
+
+/// Collects `--list` rows, enumerating each stage folder once.
+fn collect_listing(game_config: &GameConfig, source: &dyn DataSource) -> Vec<ListedScene> {
+    let mut rows = Vec::new();
+    let mut acts_cache: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (category, data) in game_config.categories.iter().enumerate() {
+        for entry in &data.scenes {
+            let acts = acts_cache
+                .entry(entry.folder.clone())
+                .or_insert_with(|| {
+                    loader::available_acts(source, &format!("Data/Stages/{}", entry.folder))
+                })
+                .clone();
+            rows.push(ListedScene {
+                index: rows.len() + 1,
+                category,
+                folder: entry.folder.clone(),
+                id: entry.id.clone(),
+                name: entry.name.clone(),
+                highlighted: entry.highlighted,
+                acts,
+            });
+        }
+    }
+    rows
+}
+
+/// Renders the plain `--list` output.
+#[must_use]
+pub fn format_listing(game_config: &GameConfig, root: &Path, source: &dyn DataSource) -> String {
+    let rows = collect_listing(game_config, source);
+    let folder_width = rows.iter().map(|row| row.folder.len()).max().unwrap_or(0);
+    let name_width = rows.iter().map(|row| row.name.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    out.push_str(&format!("game: {}\n", game_config.title));
+    out.push_str(&format!("assets dir: {}\n", root.display()));
+    out.push_str(&format!("scenes: {}\n", rows.len()));
+    out.push_str("categories:\n");
+    let mut current = None;
+    for row in &rows {
+        if current != Some(row.category) {
+            current = Some(row.category);
+            out.push_str(&format!(
+                "[{}] {}\n",
+                row.category, game_config.categories[row.category].name
+            ));
+        }
+        let acts = if row.acts.is_empty() {
+            "<none>".to_owned()
+        } else {
+            row.acts.join(", ")
+        };
+        out.push_str(&format!(
+            "  #{:<3} {:<folder_width$} id={:<3} {:<name_width$} acts: {acts}\n",
+            row.index, row.folder, row.id, row.name
+        ));
+    }
+    out.push_str("\nuse: retroengine <assets-dir> --scene <folder|name|GHZ|index> [--act <id>]\n");
+    out
+}
+
+/// Builds the `--list-json` value.
+fn listing_json(
+    game_config: &GameConfig,
+    root: &Path,
+    source: &dyn DataSource,
+) -> serde_json::Value {
+    let rows = collect_listing(game_config, source);
+    let categories: Vec<serde_json::Value> = game_config
+        .categories
+        .iter()
+        .enumerate()
+        .map(|(index, category)| {
+            let scenes: Vec<serde_json::Value> = rows
+                .iter()
+                .filter(|row| row.category == index)
+                .map(|row| {
+                    serde_json::json!({
+                        "index": row.index,
+                        "folder": row.folder,
+                        "id": row.id,
+                        "name": row.name,
+                        "highlighted": row.highlighted,
+                        "acts": row.acts,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "index": index,
+                "name": category.name,
+                "engine_index": GameConfig::engine_category_index(index),
+                "scenes": scenes,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "game": game_config.title,
+        "assets_dir": root.display().to_string(),
+        "scene_count": rows.len(),
+        "categories": categories,
+    })
+}
+
+/// Implements `--list`/`--list-json`: prints the scene table and exits successfully.
+pub fn list(args: &Args) -> Result<(), EngineError> {
+    let assets = resolve_assets(&args.assets_dir)?;
+    let source = DirSource::new(&assets.root)?;
+    let game_config = GameConfig::load(&source)?;
+    if args.list_json {
+        let value = listing_json(&game_config, &assets.root, &source);
+        let text = serde_json::to_string_pretty(&value)
+            .map_err(|error| EngineError::File(std::io::Error::other(error)))?;
+        println!("{text}");
+    } else {
+        print!("{}", format_listing(&game_config, &assets.root, &source));
+    }
+    Ok(())
+}
+
 /// Parses arguments, loads the requested scene and runs the frame loop.
 pub fn run(args: &Args) -> Result<(), EngineError> {
+    if args.list || args.list_json {
+        return list(args);
+    }
     let assets = resolve_assets(&args.assets_dir)?;
     let source: Arc<dyn DataSource> = Arc::new(DirSource::new(&assets.root)?);
     let seed = args.seed.unwrap_or(crate::rng::DEFAULT_SEED);
@@ -169,13 +333,27 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     println!("scene: {folder} act {act}");
     println!("profile: {}", engine.settings().profile.name());
     println!("backend: {}", backend_for(args).name());
-    let frames = if args.frames == 0 {
-        DEFAULT_FRAMES
+    // Headless runs default to 600 deterministic frames; windowed runs without an explicit
+    // limit keep going until the user closes the window.
+    let frame_limit = if args.frames == 0 {
+        if args.headless {
+            Some(DEFAULT_FRAMES)
+        } else {
+            None
+        }
     } else {
-        args.frames
+        Some(args.frames)
     };
-    println!("frames: {frames}");
+    match frame_limit {
+        Some(frames) => println!("frames: {frames}"),
+        None => println!("frames: until the window closes"),
+    }
     println!("seed: {seed}");
+    if !args.headless && !engine.input.has_keyboard_bindings() {
+        eprintln!(
+            "warning: Settings.ini has no keyboard bindings; gamepads and the mouse still work"
+        );
+    }
     if let Some(input) = &args.input {
         println!("input: {} (scripted replay)", input.display());
     }
@@ -224,7 +402,14 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     let dump_every = args.dump_frame_every.max(1);
     let mut present_buffer = Vec::new();
     let mut presented = 0u64;
-    for _ in 0..frames {
+    let mut executed = 0u64;
+    loop {
+        if let Some(limit) = frame_limit
+            && executed >= limit
+        {
+            break;
+        }
+        executed += 1;
         if engine.input.uses_platform_input() {
             let raw = platform.input().poll_raw();
             engine.set_raw_input(raw);
@@ -355,6 +540,8 @@ mod tests {
         assert!(!args.headless);
         assert_eq!(args.frames, 0);
         assert!(args.scene.is_none());
+        assert!(!args.list);
+        assert!(!args.list_json);
         assert!(!args.hash_every_frame);
         assert!(!args.audio_hash);
         assert!(!args.mute);
@@ -401,7 +588,96 @@ mod tests {
         assert!(args.audio_hash);
         assert!(args.mute);
         assert_eq!(args.user_dir, Some(PathBuf::from("user")));
+        assert!(!args.list);
         assert_eq!(backend_for(&args), BackendKind::Headless);
+    }
+
+    fn listing_config() -> GameConfig {
+        use retro_format_v4::gameconfig::PALETTE_COUNT;
+        use retro_format_v4::{SceneCategory, SceneEntry};
+
+        let mut config = GameConfig {
+            title: "Sonic Test".to_owned(),
+            subtitle: String::new(),
+            palette: vec![[0, 0, 0]; PALETTE_COUNT],
+            objects: Vec::new(),
+            global_variables: Vec::new(),
+            sound_effects: Vec::new(),
+            players: Vec::new(),
+            categories: retro_format_v4::gameconfig::CATEGORY_NAMES
+                .iter()
+                .map(|name| SceneCategory {
+                    name: (*name).to_owned(),
+                    scenes: Vec::new(),
+                })
+                .collect(),
+        };
+        config.categories[1].scenes = vec![
+            SceneEntry {
+                folder: "Zone01".to_owned(),
+                id: "1".to_owned(),
+                name: "GREEN HILL ZONE 1".to_owned(),
+                highlighted: 1,
+            },
+            SceneEntry {
+                folder: "Zone01".to_owned(),
+                id: "2".to_owned(),
+                name: "2".to_owned(),
+                highlighted: 0,
+            },
+        ];
+        config
+    }
+
+    #[test]
+    fn listing_prints_categories_scenes_and_acts() {
+        let mut source = retro_io::MemorySource::new();
+        source.insert("Data/Stages/Zone01/Act1.bin", vec![0]);
+        source.insert("Data/Stages/Zone01/ActB.bin", vec![0]);
+        let text = format_listing(&listing_config(), Path::new("/assets/S1"), &source);
+        assert!(text.contains("game: Sonic Test"), "{text}");
+        assert!(text.contains("[1] Regular"), "{text}");
+        assert!(text.contains("GREEN HILL ZONE 1"), "{text}");
+        assert!(text.contains("acts: 1, B"), "{text}");
+        assert!(text.contains("--scene"), "{text}");
+    }
+
+    #[test]
+    fn listing_json_exposes_indexes_and_engine_categories() {
+        let source = retro_io::MemorySource::new();
+        let value = listing_json(&listing_config(), Path::new("/assets/S1"), &source);
+        assert_eq!(value["game"], "Sonic Test");
+        assert_eq!(value["scene_count"], 2);
+        assert_eq!(value["categories"][1]["name"], "Regular");
+        assert_eq!(value["categories"][1]["engine_index"], 1);
+        assert_eq!(value["categories"][2]["engine_index"], 3);
+        assert_eq!(value["categories"][3]["engine_index"], 2);
+        assert_eq!(value["categories"][1]["scenes"][0]["index"], 1);
+        assert_eq!(value["categories"][1]["scenes"][0]["folder"], "Zone01");
+        assert_eq!(value["categories"][1]["scenes"][1]["index"], 2);
+    }
+
+    #[test]
+    fn list_flags_parse_and_conflict() {
+        let args = Args::try_parse_from(["retroengine", "/tmp/assets", "--list"]).unwrap();
+        assert!(args.list);
+        assert!(!args.list_json);
+        let args = Args::try_parse_from(["retroengine", "/tmp/assets", "--list-json"]).unwrap();
+        assert!(args.list_json);
+        let error = Args::try_parse_from(["retroengine", "/tmp/assets", "--list", "--list-json"])
+            .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn help_shows_examples_and_scene_forms() {
+        let error = Args::try_parse_from(["retroengine", "--help"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        assert!(help.contains("EXAMPLES:"), "{help}");
+        assert!(help.contains("--scene"), "{help}");
+        assert!(help.contains("GHZ"), "{help}");
+        assert!(help.contains("--list"), "{help}");
     }
 
     #[test]

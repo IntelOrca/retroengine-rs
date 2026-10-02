@@ -410,6 +410,7 @@ dependencies = [
  "retro-scene",
  "retro-script",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
