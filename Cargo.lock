@@ -308,6 +308,8 @@ version = "0.1.0"
 name = "retro-format-v4"
 version = "0.1.0"
 dependencies = [
+ "retro-core",
+ "retro-image",
  "retro-io",
  "serde",
  "serde_json",
