@@ -1,16 +1,17 @@
 //! Command line interface for the headless engine.
 //!
-//! M3 runs the real scene loop without rendering: settings/configs/scripts/scenes are loaded,
-//! startup and update events execute at 60 Hz for `--frames` frames (600 by default) and a
-//! BLAKE3 state hash is printed, either once at the end or per frame with
-//! `--hash-every-frame`.
+//! The runtime loads settings/configs/scripts/scenes, runs startup and 60 Hz update/draw events
+//! for `--frames` frames and prints a BLAKE3 hash of the canonical engine state (which includes
+//! the software framebuffer). `--dump-frames DIR` writes the presented RGB565 framebuffer to
+//! `frame_%04d.png` headlessly; without `--headless` the same frames are presented through the
+//! SDL3 backend at 60 Hz.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
 use retro_io::DirSource;
-use retro_platform::BackendKind;
+use retro_platform::{BackendKind, WindowDesc};
 
 use crate::EngineError;
 use crate::loader;
@@ -45,9 +46,12 @@ pub struct Args {
     /// Scripted input file to replay (input replay lands in M5; accepted but unused)
     #[arg(long)]
     pub input: Option<PathBuf>,
-    /// Directory to dump presented frames into (rendering lands in M4; accepted but unused)
+    /// Directory to dump presented frames into as `frame_%04d.png`
     #[arg(long)]
     pub dump_frames: Option<PathBuf>,
+    /// Dump every Nth frame (default 1; frame 0 is dumped before the loop)
+    #[arg(long, default_value_t = 1)]
+    pub dump_frame_every: u64,
     /// RNG seed
     #[arg(long)]
     pub seed: Option<u32>,
@@ -90,7 +94,7 @@ pub fn resolve_assets(root: &Path) -> Result<ResolvedAssets, EngineError> {
     })
 }
 
-/// Parses arguments, loads the requested scene and runs the headless frame loop.
+/// Parses arguments, loads the requested scene and runs the frame loop.
 pub fn run(args: &Args) -> Result<(), EngineError> {
     let assets = resolve_assets(&args.assets_dir)?;
     let source = DirSource::new(&assets.root)?;
@@ -112,9 +116,6 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     println!("scene: {folder} act {act}");
     println!("profile: {}", engine.settings().profile.name());
     println!("backend: {}", backend_for(args).name());
-    if !args.headless {
-        println!("note: the SDL3 window/present path lands in M4; running the headless loop");
-    }
     let frames = if args.frames == 0 {
         DEFAULT_FRAMES
     } else {
@@ -130,20 +131,84 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     }
     if let Some(dir) = &args.dump_frames {
         println!(
-            "note: frame dumping requires the M4 renderer; {} is ignored",
-            dir.display()
+            "dump frames: {} (every {})",
+            dir.display(),
+            args.dump_frame_every
         );
     }
 
-    let outcome = engine.run_frames(frames, args.hash_every_frame)?;
-    if args.hash_every_frame {
-        for (frame, hash) in &outcome.frame_hashes {
-            println!("{frame},{hash}");
-        }
+    let mut platform = retro_platform::create(backend_for(args))?;
+    platform.init()?;
+    let (width, height) = (
+        engine.framebuffer().width() as u32,
+        engine.framebuffer().height() as u32,
+    );
+    let mut window = if args.headless {
+        None
     } else {
-        println!("hash: {}", outcome.final_hash);
+        Some(platform.create_window(WindowDesc::new(
+            format!("{} - {folder} {act}", engine.game_title()),
+            width,
+            height,
+        ))?)
+    };
+
+    if let Some(dir) = &args.dump_frames {
+        std::fs::create_dir_all(dir)?;
+        dump_frame(dir, 0, engine.framebuffer())?;
+    }
+
+    let dump_every = args.dump_frame_every.max(1);
+    let mut present_buffer = Vec::new();
+    let mut presented = 0u64;
+    for _ in 0..frames {
+        engine.run_frame()?;
+        let frame = engine.state.frame;
+        if let Some(window) = &mut window {
+            engine.framebuffer().copy_visible_into(&mut present_buffer);
+            window.present(&present_buffer, width, height)?;
+            platform.clock().advance_frame();
+            platform.clock().sleep_until_next_frame()?;
+            presented += 1;
+            if window.should_close() {
+                break;
+            }
+        }
+        if let Some(dir) = &args.dump_frames
+            && frame % dump_every == 0
+        {
+            dump_frame(dir, frame, engine.framebuffer())?;
+        }
+        if args.hash_every_frame {
+            println!("{frame},{}", engine.state_hash());
+        }
+    }
+
+    if !args.hash_every_frame {
+        let hash = engine.state_hash();
+        println!("hash: {hash}");
+    }
+    if let Some(window) = window.as_mut() {
+        println!("presented-frames: {presented}");
+        println!("window-title: {}", engine.game_title());
+        window.set_title(engine.game_title());
     }
     report_histograms(&engine);
+    platform.shutdown()?;
+    Ok(())
+}
+
+/// Writes one framebuffer to `DIR/frame_%04d.png`.
+fn dump_frame(
+    dir: &Path,
+    frame: u64,
+    framebuffer: &retro_render::Framebuffer,
+) -> Result<(), EngineError> {
+    let path = dir.join(format!("frame_{frame:04}.png"));
+    let bytes = framebuffer
+        .to_png_bytes()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    std::fs::write(path, bytes)?;
     Ok(())
 }
 
@@ -201,6 +266,7 @@ mod tests {
         assert_eq!(args.frames, 0);
         assert!(args.scene.is_none());
         assert!(!args.hash_every_frame);
+        assert_eq!(args.dump_frame_every, 1);
     }
 
     #[test]
@@ -219,6 +285,8 @@ mod tests {
             "replay.bin",
             "--dump-frames",
             "out",
+            "--dump-frame-every",
+            "60",
             "--seed",
             "7",
             "--hash-every-frame",
@@ -230,6 +298,7 @@ mod tests {
         assert_eq!(args.frames, 3);
         assert_eq!(args.input, Some(PathBuf::from("replay.bin")));
         assert_eq!(args.dump_frames, Some(PathBuf::from("out")));
+        assert_eq!(args.dump_frame_every, 60);
         assert_eq!(args.seed, Some(7));
         assert!(args.hash_every_frame);
         assert_eq!(backend_for(&args), BackendKind::Headless);
