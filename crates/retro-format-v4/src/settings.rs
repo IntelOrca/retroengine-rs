@@ -10,6 +10,7 @@
 //! `y/yes/t/true/1` and `n/no/f/false/0`.
 
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
 use serde::Serialize;
 
@@ -273,8 +274,9 @@ impl Settings {
 
     /// Parses `Settings.ini` text. This never fails: malformed lines are ignored like
     /// `iniparser` does.
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(text: &str) -> Result<Self, FormatError> {
+    ///
+    /// [`std::str::FromStr`] is implemented for `Settings` and delegates to this method.
+    pub fn parse(text: &str) -> Result<Self, FormatError> {
         let raw = parse_ini(text);
         Ok(Self::from_raw(raw))
     }
@@ -284,7 +286,7 @@ impl Settings {
         let text = std::str::from_utf8(bytes).map_err(|error| {
             FormatError::invalid(format!("Settings.ini is not valid UTF-8: {error}"))
         })?;
-        Self::from_str(text)
+        Self::parse(text)
     }
 
     /// Reads [`Settings::PATH`] through `src` and parses it.
@@ -405,6 +407,16 @@ impl Settings {
     }
 }
 
+impl FromStr for Settings {
+    type Err = FormatError;
+
+    /// Equivalent to [`Settings::parse`]; parsing is infallible for valid UTF-8 input because
+    /// unknown keys and malformed lines are ignored like `iniparser` does.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::parse(text)
+    }
+}
+
 fn parse_ini(text: &str) -> BTreeMap<String, BTreeMap<String, String>> {
     let mut sections: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut section = String::new();
@@ -493,6 +505,7 @@ fn parse_float(value: Option<&str>, default: f32) -> f32 {
 mod tests {
     use super::*;
     use retro_io::MemorySource;
+    use std::str::FromStr;
 
     const ASSET_STYLE: &str = "; Retro Engine Config File\n\
 \n\
@@ -599,6 +612,8 @@ mystery=42\n";
     #[test]
     fn empty_input_yields_defaults() {
         let settings = Settings::from_str("").unwrap();
+        let via_trait: Settings = "".parse().unwrap();
+        assert_eq!(settings, via_trait);
         assert_eq!(settings, Settings::default());
         assert_eq!(settings.game.game_type, GameType::Origins);
         assert!(settings.video.windowed);

@@ -221,6 +221,48 @@ impl GameConfig {
             .find(|variable| variable.name == name)
             .map(|variable| variable.value)
     }
+
+    /// Maps a category index in **file order** (the order of [`GameConfig::categories`]) to the
+    /// RSDKv4 engine's `STAGELIST_*` index.
+    ///
+    /// The file stores categories as Presentation, Regular, Special, Bonus, but RSDKv4's
+    /// `StageListNames` enum orders them Presentation (`0`), Regular (`1`), Bonus (`2`),
+    /// Special (`3`). `RetroEngine::LoadGameConfig` therefore swaps file categories 2 and 3
+    /// while reading (`if (c == 2) cat = 3; else if (c == 3) cat = 2;`). RSDKv5's legacy v4
+    /// loader (`RetroEnginev4.cpp`) does *not* swap and labels entries in file order, so this
+    /// helper exists specifically so later work packages can address categories the way the
+    /// RSDKv4 engine does.
+    ///
+    /// Returns `None` for indices outside `0..CATEGORY_COUNT`.
+    ///
+    /// ```text
+    /// file index : 0 Presentation | 1 Regular | 2 Special | 3 Bonus
+    /// engine STAGELIST index: 0 | 1 | 3 | 2
+    /// ```
+    pub const fn engine_category_index(file_index: usize) -> Option<usize> {
+        match file_index {
+            0 => Some(0),
+            1 => Some(1),
+            2 => Some(3),
+            3 => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Returns the file-order category for an RSDKv4 engine `STAGELIST_*` index, applying the
+    /// inverse of [`GameConfig::engine_category_index`].
+    ///
+    /// Returns `None` for indices outside `0..CATEGORY_COUNT`.
+    pub fn category_for_engine_index(&self, engine_index: usize) -> Option<&SceneCategory> {
+        let file_index = match engine_index {
+            0 => 0,
+            1 => 1,
+            2 => 3,
+            3 => 2,
+            _ => return None,
+        };
+        self.categories.get(file_index)
+    }
 }
 
 #[cfg(test)]
@@ -405,6 +447,62 @@ mod tests {
         assert_eq!(config.scene_count(), 3);
         assert_eq!(config.global_variable("options.hi"), Some(-1234));
         assert_eq!(config.global_variable("missing"), None);
+    }
+
+    #[test]
+    fn maps_file_categories_to_engine_stage_lists() {
+        let mut fixture = Fixture::minimal();
+        fixture.categories[2] = vec![("Special", "1", "SPECIAL STAGE 1", 1)]
+            .into_iter()
+            .map(|(folder, id, name, highlighted)| {
+                (
+                    folder.to_owned(),
+                    id.to_owned(),
+                    name.to_owned(),
+                    highlighted,
+                )
+            })
+            .collect();
+        fixture.categories[3] = vec![("Mission_M", "1", "MISSION0", 0)]
+            .into_iter()
+            .map(|(folder, id, name, highlighted)| {
+                (
+                    folder.to_owned(),
+                    id.to_owned(),
+                    name.to_owned(),
+                    highlighted,
+                )
+            })
+            .collect();
+        let config = GameConfig::from_bytes(&fixture.build()).unwrap();
+
+        // File order is Presentation, Regular, Special, Bonus.
+        assert_eq!(config.categories[0].name, "Presentation");
+        assert_eq!(config.categories[1].name, "Regular");
+        assert_eq!(config.categories[2].name, "Special");
+        assert_eq!(config.categories[3].name, "Bonus");
+
+        // RSDKv4 engine order is Presentation, Regular, Bonus, Special.
+        assert_eq!(GameConfig::engine_category_index(0), Some(0));
+        assert_eq!(GameConfig::engine_category_index(1), Some(1));
+        assert_eq!(GameConfig::engine_category_index(2), Some(3));
+        assert_eq!(GameConfig::engine_category_index(3), Some(2));
+        assert_eq!(GameConfig::engine_category_index(4), None);
+
+        // The inverse lookup returns the file-order category for an engine index.
+        assert_eq!(
+            config
+                .category_for_engine_index(3)
+                .map(|category| (category.name.as_str(), category.scenes[0].folder.as_str())),
+            Some(("Special", "Special"))
+        );
+        assert_eq!(
+            config
+                .category_for_engine_index(2)
+                .map(|category| (category.name.as_str(), category.scenes[0].folder.as_str())),
+            Some(("Bonus", "Mission_M"))
+        );
+        assert_eq!(config.category_for_engine_index(4), None);
     }
 
     #[test]
