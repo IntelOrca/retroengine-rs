@@ -349,7 +349,7 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         None => println!("frames: until the window closes"),
     }
     println!("seed: {seed}");
-    if !args.headless && !engine.input.has_keyboard_bindings() {
+    if !args.headless && args.input.is_none() && !engine.input.has_keyboard_bindings() {
         eprintln!(
             "warning: Settings.ini has no keyboard bindings; gamepads and the mouse still work"
         );
@@ -410,9 +410,14 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
             break;
         }
         executed += 1;
-        if engine.input.uses_platform_input() {
+        // Pump SDL events every frame a window exists so close/resize/quit keep working with
+        // scripted input (`--input`), which bypasses platform polling; raw device state is only
+        // forwarded in platform-input mode.
+        if window.is_some() {
             let raw = platform.input().poll_raw();
-            engine.set_raw_input(raw);
+            if engine.input.uses_platform_input() {
+                engine.set_raw_input(raw);
+            }
         }
         engine.run_frame()?;
         let frame = engine.state.frame;

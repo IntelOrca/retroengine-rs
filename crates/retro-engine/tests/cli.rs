@@ -58,6 +58,33 @@ fn game_config_bytes() -> Vec<u8> {
     bytes
 }
 
+/// A minimal but valid `StageConfig.bin` with no global objects.
+fn stage_config_bytes() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.push(0); // load_global_objects
+    for _ in 0..retro_format_v4::stageconfig::STAGE_PALETTE_COUNT {
+        bytes.extend_from_slice(&[0, 0, 0]);
+    }
+    bytes.push(0); // sound effects
+    bytes.push(0); // objects
+    bytes
+}
+
+/// A minimal valid act file: one tile, no entities.
+fn scene_bytes() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    push_string(&mut bytes, "TEST");
+    bytes.extend_from_slice(&[9; retro_format_v4::scene::ACTIVE_LAYER_COUNT]);
+    bytes.push(3); // midpoint
+    bytes.push(1); // width
+    bytes.push(0);
+    bytes.push(1); // height
+    bytes.push(0);
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // chunks
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // entities
+    bytes
+}
+
 fn write_assets(root: &Path) {
     let game = root.join("Data").join("Game");
     std::fs::create_dir_all(&game).unwrap();
@@ -65,8 +92,9 @@ fn write_assets(root: &Path) {
     std::fs::write(root.join("Settings.ini"), "[Game]\ngameType=1\n").unwrap();
     let stage = root.join("Data").join("Stages").join("Zone01");
     std::fs::create_dir_all(&stage).unwrap();
-    std::fs::write(stage.join("Act1.bin"), b"not parsed by --list").unwrap();
-    std::fs::write(stage.join("ActB.bin"), b"not parsed by --list").unwrap();
+    std::fs::write(stage.join("StageConfig.bin"), stage_config_bytes()).unwrap();
+    std::fs::write(stage.join("Act1.bin"), scene_bytes()).unwrap();
+    std::fs::write(stage.join("ActB.bin"), scene_bytes()).unwrap();
 }
 
 #[test]
@@ -151,4 +179,64 @@ fn scene_ghz_act1_headless_runs_for_both_games() {
         assert!(text.contains("scene: Zone01 act 1"), "{game}: {text}");
         assert!(text.contains("hash: "), "{game}: {text}");
     }
+}
+
+/// A windowed run with scripted input must still pump SDL events so a quit signal can close
+/// it. SDL turns SIGTERM into a quit event, exactly like the window close button.
+#[cfg(unix)]
+#[test]
+fn windowed_scripted_input_exits_on_quit_event() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let root = temp_assets("windowed-input");
+    write_assets(&root);
+    let script = root.join("input.txt");
+    std::fs::write(
+        &script,
+        "retro-input 1\n\
+         0 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n\
+         1 A 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n",
+    )
+    .unwrap();
+
+    let mut child = Command::new(bin())
+        .arg(&root)
+        .arg("--input")
+        .arg(&script)
+        .arg("--mute")
+        .arg("--user-dir")
+        .arg(root.join("user"))
+        .env("SDL_VIDEO_DRIVER", "dummy")
+        .env("SDL_AUDIODRIVER", "dummy")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn retroengine");
+
+    std::thread::sleep(Duration::from_secs(2));
+    let killed = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(killed.success(), "kill -TERM failed");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = std::fs::remove_dir_all(&root);
+            panic!("windowed --input run did not exit after SIGTERM (events not pumped?)");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "windowed --input run must exit cleanly, got {status}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
