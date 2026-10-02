@@ -131,8 +131,10 @@ fn synthetic_scene_runs_sixty_frames_deterministically() {
     assert_eq!(entity.direction, 0);
     assert!((0..100).contains(&entity.values[2]), "Rand is bounded");
 
-    // The stub histogram sees the PlaySfx call in every update.
-    assert_eq!(first.stub_histogram().get("PlaySfx"), Some(&60));
+    // PlaySfx is a real ported op now; the synthetic config has no SFX slot, so it is a no-op
+    // but still counted.
+    assert_eq!(first.op_histogram().get("PlaySfx"), Some(&60));
+    assert_eq!(first.stub_histogram().get("PlaySfx"), None);
 
     // A second run of the same data must produce the exact same per-frame hashes.
     let mut second = Engine::load(source(), None, None, DEFAULT_SEED).unwrap();
@@ -286,13 +288,19 @@ fn dimming_is_presentation_only_and_never_enters_the_hash() {
     // Idle frames advance the timer towards the limit.
     let mut idle = Engine::load(draw_source(body), None, None, DEFAULT_SEED).unwrap();
     idle.state.render.dim_limit = 10;
+    let mut script = String::from("retro-input 1\n");
+    for frame in 0..4 {
+        script.push_str(&format!("{frame} - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n"));
+    }
+    script.push_str("4 RIGHT 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n");
+    idle.set_scripted_input(retro_input::ScriptedInput::from_str(&script).unwrap());
     for _ in 0..4 {
         idle.run_frame().unwrap();
     }
     assert_eq!(idle.state.render.dim_timer, 4);
     // A held button resets the timer.
-    idle.state.input.right = true;
     idle.run_frame().unwrap();
+    assert!(idle.state.input.right);
     assert_eq!(idle.state.render.dim_timer, 0);
 }
 
