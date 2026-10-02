@@ -5,16 +5,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use ::sdl3::GamepadSubsystem;
 use ::sdl3::audio::{AudioFormat, AudioSpec, AudioStreamOwner};
 use ::sdl3::event::Event;
-use ::sdl3::gamepad::{Button, Gamepad};
-use ::sdl3::keyboard::Scancode;
+use ::sdl3::gamepad::{Axis, Button, Gamepad};
+use ::sdl3::joystick::JoystickId;
+use ::sdl3::keyboard::{KeyboardState, Scancode};
 use ::sdl3::render::WindowCanvas;
 use sdl3_sys::render::SDL_Texture;
 
 use crate::{
-    AudioDesc, AudioDevice, Clock, InputSource, InputState, Platform, PlatformError, Storage,
-    TARGET_FPS, Window, WindowDesc,
+    AudioDesc, AudioDevice, Clock, FsStorage, InputSource, InputState, Platform, PlatformError,
+    RawInput, Storage, TARGET_FPS, Window, WindowDesc,
 };
 
 static SDL3_INIT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -37,6 +39,7 @@ pub struct Sdl3Platform {
     initialized: bool,
     input: Sdl3Input,
     storage: FsStorage,
+    storage_root_override: bool,
     clock: SystemClock,
     sdl: Option<::sdl3::Sdl>,
 }
@@ -45,24 +48,29 @@ impl Sdl3Platform {
     /// Creates an uninitialized SDL3 platform.
     #[must_use]
     pub fn new() -> Self {
-        let quit = Arc::new(AtomicBool::new(false));
         Self {
             initialized: false,
-            input: Sdl3Input {
-                events: None,
-                gamepads: Vec::new(),
-                quit,
-                state: InputState::new(),
-            },
+            input: Sdl3Input::new(Arc::new(AtomicBool::new(false))),
             storage: FsStorage::new("retroengine-user"),
+            storage_root_override: false,
             clock: SystemClock::new(),
             sdl: None,
         }
     }
 
     /// Overrides the root directory used by [`Storage`].
+    ///
+    /// An explicit override also survives [`Platform::init`]; otherwise `init` roots the storage
+    /// at [`crate::user_data_dir`] (the SDL preferred path) when one is available.
     pub fn set_storage_root(&mut self, root: impl Into<PathBuf>) {
         self.storage = FsStorage::new(root);
+        self.storage_root_override = true;
+    }
+
+    /// The directory [`Storage`] is rooted at.
+    #[must_use]
+    pub fn storage_root(&self) -> &Path {
+        self.storage.root()
     }
 }
 
@@ -82,23 +90,20 @@ impl Platform for Sdl3Platform {
             return Ok(());
         }
         let sdl = ::sdl3::init().map_err(PlatformError::sdl)?;
-        self.input.events = Some(sdl.event_pump().map_err(PlatformError::sdl)?);
-        if let Ok(gamepad) = sdl.gamepad() {
-            for id in gamepad.gamepads().unwrap_or_default() {
-                if let Ok(opened) = gamepad.open(id) {
-                    self.input.gamepads.push(opened);
-                }
-            }
-        }
+        self.input.attach(&sdl)?;
         self.sdl = Some(sdl);
+        if !self.storage_root_override
+            && let Some(root) = crate::user_data_dir()
+        {
+            self.storage = FsStorage::new(root);
+        }
         SDL3_INIT_COUNT.fetch_add(1, Ordering::Relaxed);
         self.initialized = true;
         Ok(())
     }
 
     fn shutdown(&mut self) -> Result<(), PlatformError> {
-        self.input.events = None;
-        self.input.gamepads.clear();
+        self.input.detach();
         self.sdl = None;
         self.initialized = false;
         Ok(())
@@ -329,114 +334,373 @@ impl AudioDevice for Sdl3Audio {
     }
 }
 
-/// SDL3 input source polling the keyboard and any opened gamepads.
+/// Digital trigger threshold in raw SDL axis units, equivalent to the upstream 0.3 deadzone.
+pub const TRIGGER_DEADZONE: i16 = 9830;
+
+/// Plain gamepad button snapshot for [`gamepad_state`], decoupled from SDL types so the mapping
+/// can be unit-tested without initializing SDL.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GamepadButtons {
+    /// North face button.
+    pub north: bool,
+    /// East face button.
+    pub east: bool,
+    /// South face button.
+    pub south: bool,
+    /// West face button.
+    pub west: bool,
+    /// Back/select button.
+    pub back: bool,
+    /// Guide button.
+    pub guide: bool,
+    /// Start button.
+    pub start: bool,
+    /// Left shoulder button.
+    pub left_shoulder: bool,
+    /// Right shoulder button.
+    pub right_shoulder: bool,
+    /// D-pad up.
+    pub dpad_up: bool,
+    /// D-pad down.
+    pub dpad_down: bool,
+    /// D-pad left.
+    pub dpad_left: bool,
+    /// D-pad right.
+    pub dpad_right: bool,
+    /// Left trigger held past [`TRIGGER_DEADZONE`].
+    pub trigger_left: bool,
+    /// Right trigger held past [`TRIGGER_DEADZONE`].
+    pub trigger_right: bool,
+}
+
+/// Converts plain button/axis data into the shared [`retro_input::GamepadState`].
+///
+/// The mapping mirrors the decompilation's `[Controller 1]` defaults: A/B/C/X are the
+/// south/east/north/west faces, Y/Z are the left/right triggers and L/R the shoulders. Upstream
+/// binds Select to the guide button; this port also accepts Back so pads without an exposed guide
+/// button can select. D-pad bits map straight to directions and the raw left stick is passed
+/// through, letting [`retro_input::InputMappings::apply`] derive stick directions with the shared
+/// deadzone.
+#[must_use]
+pub fn gamepad_state(
+    connected: bool,
+    buttons: GamepadButtons,
+    axis_x: i16,
+    axis_y: i16,
+) -> retro_input::GamepadState {
+    use retro_input::ButtonState;
+
+    let mut held = ButtonState::NONE;
+    let mut set = |pressed: bool, flag: ButtonState| {
+        if pressed {
+            held.insert(flag);
+        }
+    };
+    set(buttons.south, ButtonState::A);
+    set(buttons.east, ButtonState::B);
+    set(buttons.north, ButtonState::C);
+    set(buttons.west, ButtonState::X);
+    set(buttons.trigger_left, ButtonState::Y);
+    set(buttons.trigger_right, ButtonState::Z);
+    set(buttons.left_shoulder, ButtonState::L);
+    set(buttons.right_shoulder, ButtonState::R);
+    set(buttons.start, ButtonState::START);
+    set(buttons.guide || buttons.back, ButtonState::SELECT);
+    set(buttons.dpad_up, ButtonState::UP);
+    set(buttons.dpad_down, ButtonState::DOWN);
+    set(buttons.dpad_left, ButtonState::LEFT);
+    set(buttons.dpad_right, ButtonState::RIGHT);
+
+    retro_input::GamepadState {
+        connected,
+        held,
+        axis_x,
+        axis_y,
+    }
+}
+
+/// Reads one open SDL gamepad into the shared plain-data model.
+fn read_gamepad(gamepad: &Gamepad) -> retro_input::GamepadState {
+    let buttons = GamepadButtons {
+        north: gamepad.button(Button::North),
+        east: gamepad.button(Button::East),
+        south: gamepad.button(Button::South),
+        west: gamepad.button(Button::West),
+        back: gamepad.button(Button::Back),
+        guide: gamepad.button(Button::Guide),
+        start: gamepad.button(Button::Start),
+        left_shoulder: gamepad.button(Button::LeftShoulder),
+        right_shoulder: gamepad.button(Button::RightShoulder),
+        dpad_up: gamepad.button(Button::DPadUp),
+        dpad_down: gamepad.button(Button::DPadDown),
+        dpad_left: gamepad.button(Button::DPadLeft),
+        dpad_right: gamepad.button(Button::DPadRight),
+        trigger_left: gamepad.axis(Axis::TriggerLeft) > TRIGGER_DEADZONE,
+        trigger_right: gamepad.axis(Axis::TriggerRight) > TRIGGER_DEADZONE,
+    };
+    gamepad_state(
+        true,
+        buttons,
+        gamepad.axis(Axis::LeftX),
+        gamepad.axis(Axis::LeftY),
+    )
+}
+
+/// Copies the SDL keyboard state into a scancode-indexed boolean array.
+fn keyboard_array(keyboard: &KeyboardState<'_>) -> Vec<bool> {
+    let mut keys = vec![false; retro_input::KEY_COUNT];
+    for (scancode, pressed) in keyboard.scancodes() {
+        if let Some(slot) = keys.get_mut(scancode.to_i32() as usize) {
+            *slot = pressed;
+        }
+    }
+    keys
+}
+
+/// One finger currently touching the window.
+struct ActiveTouch {
+    finger_id: u64,
+    x: f32,
+    y: f32,
+}
+
+/// Logical screen width touches are scaled to (`SCREEN_XSIZE`).
+pub const TOUCH_SCREEN_XSIZE: i16 = 424;
+/// Logical screen height touches are scaled to (`SCREEN_YSIZE`).
+pub const TOUCH_SCREEN_YSIZE: i16 = 240;
+
+/// Scales a normalized `0..=1` SDL finger coordinate into logical screen pixels.
+///
+/// Upstream assigns `touchX = finger->x * SCREEN_XSIZE` and `touchY = finger->y * SCREEN_YSIZE`
+/// (`RetroEngine.cpp:119-122`), so scripts see `CheckTouchRect`-style logical coordinates rather
+/// than a full `i16` range.
+fn normalize_touch(value: f32, size: i16) -> i16 {
+    if !value.is_finite() {
+        return 0;
+    }
+    (value.clamp(0.0, 1.0) * f32::from(size)).round() as i16
+}
+
+fn open_into(
+    subsystem: &GamepadSubsystem,
+    gamepads: &mut [Option<Gamepad>; retro_input::PLAYER_COUNT],
+    id: JoystickId,
+) {
+    if gamepads
+        .iter()
+        .flatten()
+        .any(|gamepad| gamepad.id().ok() == Some(id))
+    {
+        return;
+    }
+    if let Some(slot) = gamepads.iter_mut().find(|slot| slot.is_none())
+        && let Ok(opened) = subsystem.open(id)
+    {
+        *slot = Some(opened);
+    }
+}
+
+fn close_from(gamepads: &mut [Option<Gamepad>; retro_input::PLAYER_COUNT], id: JoystickId) {
+    let slot = gamepads.iter_mut().find(|slot| {
+        slot.as_ref()
+            .and_then(|gamepad| gamepad.id().ok())
+            .is_some_and(|current| current == id)
+    });
+    if let Some(slot) = slot {
+        *slot = None;
+    }
+}
+
+fn upsert_touch(touches: &mut Vec<ActiveTouch>, finger_id: u64, x: f32, y: f32) {
+    if let Some(touch) = touches
+        .iter_mut()
+        .find(|touch| touch.finger_id == finger_id)
+    {
+        touch.x = x;
+        touch.y = y;
+    } else if touches.len() < retro_input::MAX_TOUCHES {
+        touches.push(ActiveTouch { finger_id, x, y });
+    }
+}
+
+/// SDL3 input source polling the keyboard, hot-plugged gamepads and touches each frame.
+///
+/// [`InputSource::poll_raw`] returns the raw device state without any `Settings.ini` mapping;
+/// [`InputMappings`](retro_input::InputMappings) turns it into per-player
+/// [`InputState`](retro_input::InputState) values. `poll` keeps the legacy single-player
+/// [`InputState`] for the existing engine host. With no window focus, no gamepads and no touch
+/// devices this simply reports everything released.
 pub struct Sdl3Input {
     events: Option<::sdl3::EventPump>,
-    gamepads: Vec<Gamepad>,
+    subsystem: Option<GamepadSubsystem>,
+    gamepads: [Option<Gamepad>; retro_input::PLAYER_COUNT],
+    keys: Vec<bool>,
+    touches: Vec<ActiveTouch>,
     quit: Arc<AtomicBool>,
     state: InputState,
 }
 
-impl InputSource for Sdl3Input {
-    fn poll(&mut self) -> InputState {
-        let Some(events) = self.events.as_mut() else {
-            return InputState::new();
+impl Sdl3Input {
+    fn new(quit: Arc<AtomicBool>) -> Self {
+        Self {
+            events: None,
+            subsystem: None,
+            gamepads: std::array::from_fn(|_| None),
+            keys: Vec::new(),
+            touches: Vec::new(),
+            quit,
+            state: InputState::new(),
+        }
+    }
+
+    /// Starts the event pump, opens every attached gamepad and prepares the key array.
+    fn attach(&mut self, sdl: &::sdl3::Sdl) -> Result<(), PlatformError> {
+        self.events = Some(sdl.event_pump().map_err(PlatformError::sdl)?);
+        self.keys = vec![false; retro_input::KEY_COUNT];
+        if let Ok(subsystem) = sdl.gamepad() {
+            if let Ok(ids) = subsystem.gamepads() {
+                for id in ids {
+                    open_into(&subsystem, &mut self.gamepads, id);
+                }
+            }
+            self.subsystem = Some(subsystem);
+        }
+        Ok(())
+    }
+
+    /// Releases the event pump, gamepads and the gamepad subsystem handle.
+    fn detach(&mut self) {
+        self.events = None;
+        self.subsystem = None;
+        self.gamepads = std::array::from_fn(|_| None);
+        self.keys.clear();
+        self.touches.clear();
+    }
+
+    /// Drains SDL events and refreshes the keyboard array. Safe to call when uninitialized.
+    fn refresh(&mut self) {
+        let Self {
+            events,
+            subsystem,
+            gamepads,
+            keys,
+            touches,
+            quit,
+            ..
+        } = self;
+        let Some(events) = events.as_mut() else {
+            return;
         };
         for event in events.poll_iter() {
-            if let Event::Quit { .. } = event {
-                self.quit.store(true, Ordering::Relaxed);
+            match event {
+                Event::Quit { .. } => quit.store(true, Ordering::Relaxed),
+                Event::GamepadAdded { which, .. } => {
+                    if let Some(subsystem) = subsystem.as_ref() {
+                        open_into(subsystem, gamepads, which);
+                    }
+                }
+                Event::GamepadRemoved { which, .. } => close_from(gamepads, which),
+                Event::FingerDown {
+                    finger_id, x, y, ..
+                }
+                | Event::FingerMotion {
+                    finger_id, x, y, ..
+                } => {
+                    upsert_touch(touches, finger_id, x, y);
+                }
+                Event::FingerUp { finger_id, .. } | Event::FingerCanceled { finger_id, .. } => {
+                    touches.retain(|touch| touch.finger_id != finger_id);
+                }
+                _ => {}
             }
         }
         let keyboard = events.keyboard_state();
+        *keys = keyboard_array(&keyboard);
+    }
+
+    /// Per-slot gamepad state read from every connected gamepad.
+    fn gamepad_states(&self) -> [retro_input::GamepadState; retro_input::PLAYER_COUNT] {
+        std::array::from_fn(|index| {
+            self.gamepads
+                .get(index)
+                .and_then(Option::as_ref)
+                .filter(|gamepad| gamepad.connected())
+                .map_or_else(retro_input::GamepadState::default, read_gamepad)
+        })
+    }
+
+    fn poll_raw_inner(&mut self) -> RawInput {
+        self.refresh();
+        if self.events.is_none() {
+            return RawInput::default();
+        }
+        let mut touches = [retro_input::TouchPoint::default(); retro_input::MAX_TOUCHES];
+        let count = self.touches.len().min(retro_input::MAX_TOUCHES);
+        for (index, touch) in self
+            .touches
+            .iter()
+            .take(retro_input::MAX_TOUCHES)
+            .enumerate()
+        {
+            touches[index] = retro_input::TouchPoint {
+                down: true,
+                x: normalize_touch(touch.x, TOUCH_SCREEN_XSIZE),
+                y: normalize_touch(touch.y, TOUCH_SCREEN_YSIZE),
+            };
+        }
+        RawInput {
+            keys: self.keys.clone(),
+            gamepads: self.gamepad_states(),
+            touches,
+            touch_count: count as u8,
+        }
+    }
+}
+
+impl InputSource for Sdl3Input {
+    fn poll(&mut self) -> InputState {
+        self.refresh();
+        if self.events.is_none() {
+            return InputState::new();
+        }
+        let key = |scancode: Scancode| {
+            self.keys
+                .get(scancode.to_i32() as usize)
+                .copied()
+                .unwrap_or(false)
+        };
         let mut state = InputState::new();
         state.connected = true;
-        state.up =
-            keyboard.is_scancode_pressed(Scancode::Up) || keyboard.is_scancode_pressed(Scancode::W);
-        state.down = keyboard.is_scancode_pressed(Scancode::Down)
-            || keyboard.is_scancode_pressed(Scancode::S);
-        state.left = keyboard.is_scancode_pressed(Scancode::Left)
-            || keyboard.is_scancode_pressed(Scancode::A);
-        state.right = keyboard.is_scancode_pressed(Scancode::Right)
-            || keyboard.is_scancode_pressed(Scancode::D);
-        state.a = keyboard.is_scancode_pressed(Scancode::Space)
-            || keyboard.is_scancode_pressed(Scancode::Z);
-        state.b = keyboard.is_scancode_pressed(Scancode::X);
-        state.c = keyboard.is_scancode_pressed(Scancode::C);
-        state.start = keyboard.is_scancode_pressed(Scancode::Return)
-            || keyboard.is_scancode_pressed(Scancode::Escape);
-        for gamepad in &self.gamepads {
+        state.up = key(Scancode::Up) || key(Scancode::W);
+        state.down = key(Scancode::Down) || key(Scancode::S);
+        state.left = key(Scancode::Left) || key(Scancode::A);
+        state.right = key(Scancode::Right) || key(Scancode::D);
+        state.a = key(Scancode::Space) || key(Scancode::Z);
+        state.b = key(Scancode::X);
+        state.c = key(Scancode::C);
+        state.start = key(Scancode::Return) || key(Scancode::Escape);
+        for gamepad in &self.gamepad_states() {
+            if !gamepad.connected {
+                continue;
+            }
+            use retro_input::ButtonState;
+            let held = gamepad.held.union(gamepad.directions());
             state.connected = true;
-            state.up |= gamepad.button(Button::DPadUp);
-            state.down |= gamepad.button(Button::DPadDown);
-            state.left |= gamepad.button(Button::DPadLeft);
-            state.right |= gamepad.button(Button::DPadRight);
-            state.a |= gamepad.button(Button::South);
-            state.b |= gamepad.button(Button::East);
-            state.c |= gamepad.button(Button::North);
-            state.start |= gamepad.button(Button::Start);
+            state.up |= held.contains(ButtonState::UP);
+            state.down |= held.contains(ButtonState::DOWN);
+            state.left |= held.contains(ButtonState::LEFT);
+            state.right |= held.contains(ButtonState::RIGHT);
+            state.a |= held.contains(ButtonState::A);
+            state.b |= held.contains(ButtonState::B);
+            state.c |= held.contains(ButtonState::C);
+            state.start |= held.contains(ButtonState::START);
         }
         self.state = state;
         self.state
     }
-}
 
-/// Filesystem-backed user storage rooted at a base directory.
-#[derive(Debug)]
-pub struct FsStorage {
-    root: PathBuf,
-}
-
-impl FsStorage {
-    /// Creates storage rooted at `root`.
-    #[must_use]
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-
-    /// The storage root.
-    #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-}
-
-impl Storage for FsStorage {
-    fn read(&self, path: &str) -> Result<Vec<u8>, PlatformError> {
-        Ok(std::fs::read(self.root.join(path))?)
-    }
-
-    fn write(&mut self, path: &str, data: &[u8]) -> Result<(), PlatformError> {
-        let full = self.root.join(path);
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(full, data)?;
-        Ok(())
-    }
-
-    fn exists(&self, path: &str) -> bool {
-        self.root.join(path).exists()
-    }
-
-    fn list(&self, dir: &str) -> Result<Vec<String>, PlatformError> {
-        let full = self.root.join(dir);
-        if !full.exists() {
-            return Ok(Vec::new());
-        }
-        let mut entries = Vec::new();
-        for entry in std::fs::read_dir(full)? {
-            entries.push(entry?.file_name().to_string_lossy().into_owned());
-        }
-        entries.sort();
-        Ok(entries)
-    }
-
-    fn remove(&mut self, path: &str) -> Result<(), PlatformError> {
-        match std::fs::remove_file(self.root.join(path)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+    fn poll_raw(&mut self) -> RawInput {
+        self.poll_raw_inner()
     }
 }
 
@@ -491,19 +755,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fs_storage_round_trips() {
-        let root = std::env::temp_dir().join(format!("retro-platform-test-{}", std::process::id()));
-        let mut storage = FsStorage::new(&root);
-        storage.write("nested/save.dat", b"data").unwrap();
-        assert!(storage.exists("nested/save.dat"));
-        assert_eq!(storage.read("nested/save.dat").unwrap(), b"data");
-        assert_eq!(storage.list("nested").unwrap(), vec!["save.dat"]);
-        storage.remove("nested/save.dat").unwrap();
-        assert!(!storage.exists("nested/save.dat"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn sdl3_lifecycle_init_shutdown_reinit() {
         let _guard = crate::platform_test_lock();
         let before = init_count();
@@ -528,5 +779,172 @@ mod tests {
         let mut platform = Sdl3Platform::new();
         platform.shutdown().unwrap();
         assert!(!platform.is_initialized());
+    }
+
+    #[test]
+    fn sdl3_storage_root_uses_the_pref_path_unless_overridden() {
+        let _guard = crate::platform_test_lock();
+        let mut platform = Sdl3Platform::new();
+        platform.set_storage_root("/tmp/retro-platform-explicit");
+        platform.init().unwrap();
+        assert_eq!(
+            platform.storage_root(),
+            Path::new("/tmp/retro-platform-explicit"),
+            "an explicit root survives init"
+        );
+        platform.shutdown().unwrap();
+
+        let mut platform = Sdl3Platform::new();
+        platform.init().unwrap();
+        if let Some(root) = crate::user_data_dir() {
+            assert_eq!(
+                platform.storage_root(),
+                root,
+                "init roots storage at the SDL preferred path"
+            );
+        }
+        platform.shutdown().unwrap();
+    }
+
+    #[test]
+    fn touch_normalization_uses_logical_screen_pixels() {
+        assert_eq!(normalize_touch(0.0, TOUCH_SCREEN_XSIZE), 0);
+        assert_eq!(normalize_touch(0.5, TOUCH_SCREEN_XSIZE), 212);
+        assert_eq!(normalize_touch(1.0, TOUCH_SCREEN_XSIZE), 424);
+        assert_eq!(normalize_touch(0.5, TOUCH_SCREEN_YSIZE), 120);
+        assert_eq!(normalize_touch(1.0, TOUCH_SCREEN_YSIZE), 240);
+        assert_eq!(normalize_touch(f32::NAN, TOUCH_SCREEN_XSIZE), 0);
+        assert_eq!(normalize_touch(f32::INFINITY, TOUCH_SCREEN_YSIZE), 0);
+        assert_eq!(normalize_touch(4.0, TOUCH_SCREEN_XSIZE), 424);
+        assert_eq!(normalize_touch(-1.0, TOUCH_SCREEN_YSIZE), 0);
+    }
+
+    #[test]
+    fn gamepad_state_maps_upstream_defaults() {
+        use retro_input::ButtonState;
+
+        let all_buttons = GamepadButtons {
+            north: true,
+            east: true,
+            south: true,
+            west: true,
+            back: false,
+            guide: true,
+            start: true,
+            left_shoulder: true,
+            right_shoulder: true,
+            dpad_up: true,
+            dpad_down: true,
+            dpad_left: true,
+            dpad_right: true,
+            trigger_left: true,
+            trigger_right: true,
+        };
+        let state = gamepad_state(true, all_buttons, -20_000, 10_000);
+        assert!(state.connected);
+        assert_eq!(state.axis_x, -20_000);
+        assert_eq!(state.axis_y, 10_000);
+        assert_eq!(
+            state.held,
+            ButtonState::A
+                | ButtonState::B
+                | ButtonState::C
+                | ButtonState::X
+                | ButtonState::Y
+                | ButtonState::Z
+                | ButtonState::L
+                | ButtonState::R
+                | ButtonState::START
+                | ButtonState::SELECT
+                | ButtonState::UP
+                | ButtonState::DOWN
+                | ButtonState::LEFT
+                | ButtonState::RIGHT
+        );
+
+        let back_only = GamepadButtons {
+            back: true,
+            ..GamepadButtons::default()
+        };
+        assert!(
+            gamepad_state(true, back_only, 0, 0)
+                .held
+                .contains(ButtonState::SELECT)
+        );
+
+        let idle = gamepad_state(false, GamepadButtons::default(), 0, 0);
+        assert!(!idle.connected);
+        assert!(idle.held.is_empty());
+    }
+
+    #[test]
+    fn vk_mapping_agrees_with_sdl_scancodes() {
+        for (vk, scancode) in [
+            (0x26, Scancode::Up),
+            (0x28, Scancode::Down),
+            (0x25, Scancode::Left),
+            (0x27, Scancode::Right),
+            (0x41, Scancode::A),
+            (0x53, Scancode::S),
+            (0x44, Scancode::D),
+            (0x51, Scancode::Q),
+            (0x57, Scancode::W),
+            (0x45, Scancode::E),
+            (0x0D, Scancode::Return),
+            (0x09, Scancode::Tab),
+            (0x20, Scancode::Space),
+        ] {
+            assert_eq!(
+                retro_input::vk_to_scancode(vk),
+                Some(scancode.to_i32() as u32),
+                "vk {vk:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn fabricated_key_arrays_map_through_sdl_scancodes() {
+        use retro_format_v4::Settings;
+        use retro_input::{Button, GamepadState, InputMappings};
+        use std::str::FromStr;
+
+        let settings = Settings::from_str("[Keyboard Map 1]\nup=0x26\nbuttonA=0x41\n").unwrap();
+        let mappings = InputMappings::from_settings(&settings);
+        let mut keys = vec![false; retro_input::KEY_COUNT];
+        keys[Scancode::A.to_i32() as usize] = true;
+        keys[Scancode::Up.to_i32() as usize] = true;
+
+        let state = mappings.apply(0, &keys, &GamepadState::default());
+        assert!(state.is_held(Button::A));
+        assert!(state.is_held(Button::Up));
+        assert!(state.is_pressed(Button::A));
+
+        keys[Scancode::A.to_i32() as usize] = false;
+        let state = mappings.apply(0, &keys, &GamepadState::default());
+        assert!(!state.is_held(Button::A));
+        assert!(!state.is_pressed(Button::A));
+        assert!(state.is_held(Button::Up));
+    }
+
+    #[test]
+    fn sdl3_input_without_init_is_idle() {
+        let mut input = Sdl3Input::new(Arc::new(AtomicBool::new(false)));
+        assert_eq!(input.poll(), InputState::new());
+        let raw = input.poll_raw();
+        assert_eq!(raw, RawInput::default());
+        assert!(!raw.has_gamepad());
+    }
+
+    #[test]
+    #[ignore = "requires an SDL3 environment with event support"]
+    fn sdl3_input_live_poll_does_not_panic() {
+        let _guard = crate::platform_test_lock();
+        let mut platform = Sdl3Platform::new();
+        platform.init().unwrap();
+        let raw = platform.input().poll_raw();
+        assert_eq!(raw.keys.len(), retro_input::KEY_COUNT);
+        let _ = platform.input().poll();
+        platform.shutdown().unwrap();
+        assert_eq!(platform.input().poll_raw(), RawInput::default());
     }
 }

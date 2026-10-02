@@ -17,8 +17,10 @@ use retro_scene::{
     StageState, TYPEGROUP_COUNT, TypeGroupList,
 };
 
+use crate::audio::AudioState;
 use crate::profile::EngineSettings;
 use crate::rng::GlibcRand;
+use crate::save::SaveState;
 
 /// Number of tile layers upstream keeps (`LAYER_COUNT`).
 pub const LAYER_COUNT: usize = 9;
@@ -38,6 +40,8 @@ pub const TEXT_DATA_COUNT: usize = 0x2800;
 pub const TEXT_ENTRY_COUNT: usize = 0x200;
 /// Number of font characters upstream keeps (`FONTCHAR_COUNT`).
 pub const FONT_CHAR_COUNT: usize = 0x400;
+/// Number of simultaneous touch points upstream keeps (`touchDown[8]`).
+pub const TOUCH_COUNT: usize = 8;
 
 /// One glyph of the legacy v4 bitmap font (`FontCharacter`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
@@ -266,6 +270,10 @@ pub struct EngineState {
     pub input: InputState,
     /// Key-press input state.
     pub input_press: InputState,
+    /// SFX/music tables, lazy asset loading and the output device.
+    pub audio: AudioState,
+    /// Persistent save RAM and the backing storage.
+    pub save: SaveState,
     /// Currently playing music track id.
     pub music_track: i32,
     /// `menu1.selection`.
@@ -417,12 +425,14 @@ impl EngineState {
             object_borders: [0x80, 424 + 0x80, 0x20, 424 + 0x20],
             input: InputState::default(),
             input_press: InputState::default(),
+            audio: AudioState::empty(),
+            save: SaveState::in_memory(),
             music_track: 0,
             menu1_selection: 0,
             menu2_selection: 0,
-            touch_down: vec![0; 4],
-            touch_x: vec![0; 4],
-            touch_y: vec![0; 4],
+            touch_down: vec![0; TOUCH_COUNT],
+            touch_x: vec![0; TOUCH_COUNT],
+            touch_y: vec![0; TOUCH_COUNT],
             animations: Vec::new(),
             animation_ids: BTreeMap::new(),
             animation_sheet_ids: Vec::new(),

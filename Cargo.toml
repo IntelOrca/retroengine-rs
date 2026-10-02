@@ -39,13 +39,14 @@ retro-image = { path = "crates/retro-image" }
 retro-input = { path = "crates/retro-input" }
 retro-io = { path = "crates/retro-io" }
 retro-parity = { path = "crates/retro-parity" }
-retro-platform = { path = "crates/retro-platform" }
+retro-platform = { path = "crates/retro-platform", default-features = false }
 retro-render = { path = "crates/retro-render" }
 retro-scene = { path = "crates/retro-scene" }
 retro-script = { path = "crates/retro-script" }
 
 blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
+lewton = "0.10"
 png = "0.17"
 sdl3 = { version = "=0.20.0", default-features = false }
 sdl3-sys = { version = "=0.7.1", default-features = false }

@@ -2,19 +2,25 @@
 //! headlessly (with optional PNG frame dumps) or windowed through SDL3.
 #![forbid(unsafe_code)]
 
+pub mod audio;
 pub mod cli;
 pub mod error;
 pub mod host;
+pub mod input;
 pub mod loader;
 pub mod profile;
 pub mod rng;
 pub mod runtime;
+pub mod save;
 pub mod state;
 
+pub use audio::AudioState;
 pub use cli::{Args, ResolvedAssets, backend_for, resolve_assets, resolve_scene_name, run};
 pub use error::EngineError;
+pub use input::EngineInput;
 pub use profile::{EngineSettings, RuntimeProfile};
 pub use runtime::{DEFAULT_RNG_SEED, Engine, RunOutcome, ScriptRuntime};
+pub use save::{SaveError, SaveState, SaveStore, seed_memory_storage, seed_storage_from_source};
 pub use state::EngineState;
 
 /// Builds a deterministic RGB565 test pattern used as the M0 parity artifact.

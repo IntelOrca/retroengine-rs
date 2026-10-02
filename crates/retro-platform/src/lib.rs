@@ -6,8 +6,10 @@ pub mod error;
 pub mod headless;
 #[cfg(feature = "sdl3")]
 pub mod sdl3;
+pub mod storage;
 
 pub use error::PlatformError;
+pub use storage::FsStorage;
 
 /// The engine steps at a fixed 60 Hz.
 pub const TARGET_FPS: u64 = 60;
@@ -211,6 +213,38 @@ pub trait AudioDevice {
     fn close(&mut self) -> Result<(), PlatformError>;
 }
 
+/// Raw device state captured by one input poll, free of backend-specific types.
+///
+/// Backends that support it return this from [`InputSource::poll_raw`]. The [`RawInput::keys`]
+/// slice is indexed by SDL scancode number (`0..retro_input::KEY_COUNT`); use
+/// [`RawInput::key_down`] for a bounds-checked lookup. Gamepads are already normalized to
+/// [`retro_input::GamepadState`] and can be fed to [`retro_input::InputMappings::apply`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RawInput {
+    /// Keyboard state indexed by SDL scancode number.
+    pub keys: Vec<bool>,
+    /// Gamepad state per player slot, in slot order.
+    pub gamepads: [retro_input::GamepadState; retro_input::PLAYER_COUNT],
+    /// Active touch points; only the first [`RawInput::touch_count`] entries are valid.
+    pub touches: [retro_input::TouchPoint; retro_input::MAX_TOUCHES],
+    /// Number of active touch points.
+    pub touch_count: u8,
+}
+
+impl RawInput {
+    /// Whether the given SDL scancode is held, treating unknown scancodes as released.
+    #[must_use]
+    pub fn key_down(&self, scancode: u32) -> bool {
+        self.keys.get(scancode as usize).copied().unwrap_or(false)
+    }
+
+    /// Whether any gamepad slot is connected.
+    #[must_use]
+    pub fn has_gamepad(&self) -> bool {
+        self.gamepads.iter().any(|gamepad| gamepad.connected)
+    }
+}
+
 /// A pollable source of versioned input state.
 pub trait InputSource {
     /// Version of the input state produced by this source.
@@ -219,6 +253,13 @@ pub trait InputSource {
     }
     /// Polls the current input state.
     fn poll(&mut self) -> InputState;
+    /// Polls raw per-slot device state through the shared [`retro_input`] model.
+    ///
+    /// Backends without a native implementation (and uninitialized ones) return an empty
+    /// [`RawInput`]; callers must treat that as "no devices".
+    fn poll_raw(&mut self) -> RawInput {
+        RawInput::default()
+    }
 }
 
 /// User-file storage.
@@ -233,6 +274,43 @@ pub trait Storage {
     fn list(&self, dir: &str) -> Result<Vec<String>, PlatformError>;
     /// Removes a file.
     fn remove(&mut self, path: &str) -> Result<(), PlatformError>;
+    /// Renames `from` to `to`, replacing `to` when it already exists.
+    ///
+    /// Backends with an atomic native rename override this so callers can write a temporary file
+    /// and swap it in without a window where the destination is missing or truncated. The default
+    /// implementation reads the source, writes the destination and removes the source, which is
+    /// sufficient for in-memory storage but not crash-safe.
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), PlatformError> {
+        let data = self.read(from)?;
+        self.write(to, &data)?;
+        self.remove(from)
+    }
+}
+
+impl Storage for Box<dyn Storage> {
+    fn read(&self, path: &str) -> Result<Vec<u8>, PlatformError> {
+        (**self).read(path)
+    }
+
+    fn write(&mut self, path: &str, data: &[u8]) -> Result<(), PlatformError> {
+        (**self).write(path, data)
+    }
+
+    fn exists(&self, path: &str) -> bool {
+        (**self).exists(path)
+    }
+
+    fn list(&self, dir: &str) -> Result<Vec<String>, PlatformError> {
+        (**self).list(dir)
+    }
+
+    fn remove(&mut self, path: &str) -> Result<(), PlatformError> {
+        (**self).remove(path)
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), PlatformError> {
+        (**self).rename(from, to)
+    }
 }
 
 /// Fixed-step frame clock.
@@ -245,6 +323,23 @@ pub trait Clock {
     fn advance_frame(&mut self);
     /// Blocks until the next frame is due.
     fn sleep_until_next_frame(&self) -> Result<(), PlatformError>;
+}
+
+/// Returns the preferred per-user data directory for the engine.
+///
+/// With the SDL3 feature this is `SDL_GetPrefPath("retroengine-rs", "retroengine")` (the same
+/// location the windowed backend writes user data to); without it there is no OS preference and
+/// `None` is returned. Callers should fall back to their own directory or in-memory storage.
+#[must_use]
+pub fn user_data_dir() -> Option<std::path::PathBuf> {
+    #[cfg(feature = "sdl3")]
+    {
+        ::sdl3::filesystem::get_pref_path("retroengine-rs", "retroengine").ok()
+    }
+    #[cfg(not(feature = "sdl3"))]
+    {
+        None
+    }
 }
 
 /// Number of times the SDL3 backend has initialized SDL in this process.

@@ -39,6 +39,12 @@ pub enum EngineError {
     /// A scene name could not be resolved.
     #[error("unknown scene '{0}' (no matching stage folder or GameConfig scene)")]
     UnknownScene(String),
+    /// The scripted input file could not be parsed.
+    #[error("input error: {0}")]
+    Input(String),
+    /// User data storage could not be opened.
+    #[error("save error: {0}")]
+    Save(#[from] crate::save::SaveError),
     /// The detected data family is not supported yet.
     #[error("unsupported data version: {0:?}")]
     UnsupportedVersion(DataVersion),
