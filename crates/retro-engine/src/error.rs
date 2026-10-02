@@ -33,6 +33,9 @@ pub enum EngineError {
     /// A platform backend failed.
     #[error("platform error: {0}")]
     Platform(#[from] retro_platform::PlatformError),
+    /// A filesystem operation failed (frame dumping, save files).
+    #[error("file error: {0}")]
+    File(#[from] std::io::Error),
     /// A scene name could not be resolved.
     #[error("unknown scene '{0}' (no matching stage folder or GameConfig scene)")]
     UnknownScene(String),

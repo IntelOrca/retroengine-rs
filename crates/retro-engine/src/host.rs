@@ -8,12 +8,15 @@
 //! Known gaps (documented, deterministic):
 //!
 //! * `ProcessObjectMovement` is the simplified movement in [`retro_scene::SceneCollision`].
-//! * `BoxCollision2` (upstream's "barely used in S2" variant), `Copy16x16Tile`,
-//!   `Set16x16TileInfo` and the 3D matrix/vertex ops are explicit stubs (see
-//!   [`EngineState::stub_histogram`]); `TouchCollision`, `BoxCollision` and `PlatformCollision`
-//!   are fully ported.
-//! * `stage.deformationData0..3` are not modelled and always read as `0`; the deformation
-//!   tables only feed the software renderer (M4).
+//! * `BoxCollision2` (upstream's "barely used in S2" variant) and the 3D matrix/vertex ops are
+//!   explicit stubs (see [`EngineState::stub_histogram`]); `TouchCollision`, `BoxCollision`,
+//!   `PlatformCollision`, `Get16x16TileInfo`, `Set16x16TileInfo` and `Copy16x16Tile` are fully
+//!   ported.
+//! * `stage.deformationData0..3` live in [`retro_render::RenderState::deform_data`] and are
+//!   written by `SetLayerDeformation`; they feed the tile-layer deformation paths (M4).
+//! * The legacy v4 text system (`LoadFontFile`/`LoadTextFile`/`GetTextInfo`/`DrawText`) and the
+//!   title/HUD number and act-name draws are ported for rev00..rev03; the newer menu ops
+//!   (`DrawMenu`, `SetupMenu`, ...) remain stubs.
 //! * `LoadStage` sets a flag instead of switching scenes mid-frame.
 //! * Save RAM is not loaded or persisted (M5); `ReadSaveRAM` mirrors upstream's "no save file"
 //!   return value by checking for `SData.bin`/`SGame.bin`, and `WriteSaveRAM` reports success
@@ -27,7 +30,7 @@ use retro_scene::collision::{
 use retro_scene::{ENTITY_COUNT, TEMPENTITY_START};
 use retro_script::{Op, ScriptError, ScriptEvent, ScriptHost, VmState};
 
-use crate::state::{ENGINE_MAINGAME, EngineState, LayerState, PARALLAX_COUNT};
+use crate::state::{ENGINE_MAINGAME, EngineState, LayerState, PARALLAX_COUNT, ScriptFrame};
 
 /// First rev03 object variable id (`object.entityPos`).
 const VAR_OBJECT_ENTITY_POS: i32 = 19;
@@ -499,11 +502,17 @@ impl EngineHost<'_> {
         let Ok(file) = AnimationFile::from_bytes(&bytes) else {
             return;
         };
-        self.state
-            .animation_ids
-            .insert(name.to_owned(), self.state.animations.len());
+        // Upstream `LoadAnimationFile` loads every sheet through `AddGraphicsFile` while
+        // reading the animation, so the frame sheet ids are resolved at load time.
+        let sheet_ids: Vec<i32> = file
+            .sheets
+            .iter()
+            .map(|sheet| self.state.load_sprite_sheet(sheet))
+            .collect();
+        let index = self.state.animations.len();
+        self.state.animation_ids.insert(name.to_owned(), index);
         self.state.animations.push(file);
-        let index = self.state.animations.len() - 1;
+        self.state.animation_sheet_ids.push(sheet_ids);
         let type_id = self
             .state
             .entities
@@ -624,15 +633,8 @@ impl ScriptHost for EngineHost<'_> {
             }
             Op::LoadSpriteSheet => {
                 let name = state.script_text.clone();
-                let index = self
-                    .state
-                    .sprite_sheets
-                    .iter()
-                    .position(|candidate| *candidate == name)
-                    .unwrap_or_else(|| {
-                        self.state.sprite_sheets.push(name);
-                        self.state.sprite_sheets.len() - 1
-                    });
+                self.state.record_op("LoadSpriteSheet");
+                let index = self.state.load_sprite_sheet(&name);
                 let type_id = self
                     .state
                     .entities
@@ -640,14 +642,204 @@ impl ScriptHost for EngineHost<'_> {
                     .map(|entity| usize::from(entity.type_id));
                 if let Some(entry) = type_id.and_then(|type_id| self.state.objects.get_mut(type_id))
                 {
-                    entry.sprite_sheet_id = index as i32;
+                    entry.sprite_sheet_id = index;
                 }
-                self.state.record_op("LoadSpriteSheet");
+            }
+            Op::RemoveSpriteSheet => {
+                let name = state.script_text.clone();
+                self.state.record_op("RemoveSpriteSheet");
+                self.state.remove_sprite_sheet(&name);
             }
             Op::LoadAnimation => {
                 let name = state.script_text.clone();
                 self.state.record_op("LoadAnimation");
                 self.load_animation(&name);
+            }
+            Op::SpriteFrame => {
+                self.state.record_op("SpriteFrame");
+                if state.current_event == ScriptEvent::Setup {
+                    self.state.add_script_frame(ScriptFrame {
+                        pivot_x: operands[0],
+                        pivot_y: operands[1],
+                        width: operands[2],
+                        height: operands[3],
+                        spr_x: operands[4],
+                        spr_y: operands[5],
+                    });
+                }
+            }
+            Op::EditFrame => {
+                self.state.record_op("EditFrame");
+                self.state.edit_script_frame(
+                    operands[0],
+                    ScriptFrame {
+                        pivot_x: operands[1],
+                        pivot_y: operands[2],
+                        width: operands[3],
+                        height: operands[4],
+                        spr_x: operands[5],
+                        spr_y: operands[6],
+                    },
+                );
+            }
+            Op::LoadPalette => {
+                let name = state.script_text.clone();
+                self.state.record_op("LoadPalette");
+                self.load_palette(&name, operands[1], operands[2], operands[3], operands[4]);
+            }
+            Op::RotatePalette => {
+                self.state.record_op("RotatePalette");
+                self.state.render.palette.rotate_palette(
+                    operands[0],
+                    usize::from(operands[1] as u8),
+                    usize::from(operands[2] as u8),
+                    operands[3] != 0,
+                );
+            }
+            Op::SetScreenFade => {
+                self.state.record_op("SetScreenFade");
+                self.state.render.set_fade(
+                    operands[0],
+                    operands[1],
+                    operands[2],
+                    operands[3] as u16,
+                );
+            }
+            Op::SetActivePalette => {
+                self.state.record_op("SetActivePalette");
+                self.state.render.palette.set_active_palette(
+                    i32::from(operands[0] as u8),
+                    operands[1],
+                    operands[2],
+                );
+            }
+            Op::SetPaletteFade => {
+                self.state.record_op("SetPaletteFade");
+                self.state.render.palette.set_palette_fade(
+                    i32::from(operands[0] as u8),
+                    i32::from(operands[1] as u8),
+                    i32::from(operands[2] as u8),
+                    operands[3] as u16,
+                    operands[4].max(0) as usize,
+                    operands[5].max(0) as usize,
+                );
+            }
+            Op::SetPaletteEntry => {
+                self.state.record_op("SetPaletteEntry");
+                self.state.render.palette.set_entry_packed(
+                    i32::from(operands[0] as u8),
+                    usize::from(operands[1] as u8),
+                    operands[2] as u32,
+                );
+            }
+            Op::GetPaletteEntry => {
+                self.state.record_op("GetPaletteEntry");
+                state.operands[2] =
+                    self.state.render.palette.get_entry_packed(
+                        i32::from(operands[0] as u8),
+                        usize::from(operands[1] as u8),
+                    ) as i32;
+            }
+            Op::CopyPalette => {
+                self.state.record_op("CopyPalette");
+                self.state.render.palette.copy_palette(
+                    i32::from(operands[0] as u8),
+                    usize::from(operands[1] as u8),
+                    i32::from(operands[2] as u8),
+                    usize::from(operands[3] as u8),
+                    usize::from(operands[4] as u8),
+                );
+            }
+            Op::ClearScreen => {
+                self.state.record_op("ClearScreen");
+                self.state.render.clear_screen(operands[0] as u8);
+            }
+            Op::DrawTintRect => {
+                self.state.record_op("DrawTintRect");
+                self.state.render.draw_tint_rect(
+                    operands[0],
+                    operands[1],
+                    operands[2],
+                    operands[3],
+                );
+            }
+            Op::DrawRect => {
+                self.state.record_op("DrawRect");
+                self.state.render.draw_rect(
+                    operands[0],
+                    operands[1],
+                    operands[2],
+                    operands[3],
+                    operands[4],
+                    operands[5],
+                    operands[6],
+                    operands[7],
+                );
+            }
+            Op::DrawSprite => {
+                self.state.record_op("DrawSprite");
+                self.draw_script_sprite(operands[0], SpriteDrawPosition::Entity, 0, 0);
+            }
+            Op::DrawSpriteXY => {
+                self.state.record_op("DrawSpriteXY");
+                self.draw_script_sprite(
+                    operands[0],
+                    SpriteDrawPosition::World,
+                    operands[1],
+                    operands[2],
+                );
+            }
+            Op::DrawSpriteScreenXY => {
+                self.state.record_op("DrawSpriteScreenXY");
+                self.draw_script_sprite(
+                    operands[0],
+                    SpriteDrawPosition::Screen,
+                    operands[1],
+                    operands[2],
+                );
+            }
+            Op::DrawSpriteFX => {
+                self.state.record_op("DrawSpriteFX");
+                self.draw_script_sprite_fx(
+                    operands[0],
+                    operands[1],
+                    SpriteDrawPosition::World,
+                    operands[2],
+                    operands[3],
+                );
+            }
+            Op::DrawSpriteScreenFX => {
+                self.state.record_op("DrawSpriteScreenFX");
+                self.draw_script_sprite_fx(
+                    operands[0],
+                    operands[1],
+                    SpriteDrawPosition::Screen,
+                    operands[2],
+                    operands[3],
+                );
+            }
+            Op::DrawObjectAnimation => {
+                self.state.record_op("DrawObjectAnimation");
+                let slot = self.state.object_entity_pos;
+                let visible = self
+                    .state
+                    .entities
+                    .get(slot)
+                    .is_some_and(|entity| entity.visible != 0);
+                if visible {
+                    self.state.draw_object_animation(slot);
+                }
+            }
+            Op::SetLayerDeformation => {
+                self.state.record_op("SetLayerDeformation");
+                self.set_layer_deformation(
+                    operands[0],
+                    operands[1],
+                    operands[2],
+                    operands[3],
+                    operands[4],
+                    operands[5],
+                );
             }
             Op::GetAnimationByName => {
                 let name = state.script_text.clone();
@@ -976,17 +1168,16 @@ impl ScriptHost for EngineHost<'_> {
                 self.state.record_op("Get16x16TileInfo");
             }
             Op::Set16x16TileInfo => {
-                self.state.record_stub(stub_name(op));
+                self.state.record_op("Set16x16TileInfo");
+                let (chunk_x, chunk_y, chunk) =
+                    self.set_16x16_tile_info(operands[0], operands[1], operands[2], operands[3]);
+                state.operands[4] = chunk_x;
+                state.operands[5] = chunk_y;
+                state.operands[6] = chunk;
             }
             Op::Copy16x16Tile => {
-                self.state.record_stub(stub_name(op));
-            }
-            Op::GetPaletteEntry => {
-                state.operands[2] = 0;
-                self.state.record_stub(stub_name(op));
-            }
-            Op::SetPaletteEntry => {
-                self.state.record_stub(stub_name(op));
+                self.state.record_op("Copy16x16Tile");
+                self.copy_16x16_tile(operands[0], operands[1]);
             }
             Op::ReadSaveRAM => {
                 // No save RAM is loaded yet (M5), but upstream reports false when neither
@@ -1005,10 +1196,66 @@ impl ScriptHost for EngineHost<'_> {
                 self.state.record_stub(stub_name(op));
             }
             Op::GetTextInfo => {
-                state.operands[0] = 0;
-                self.state.record_stub(stub_name(op));
+                self.state.record_op("GetTextInfo");
+                state.operands[0] = self.state.text_info(
+                    usize::try_from(operands[1]).unwrap_or(usize::MAX),
+                    operands[2],
+                    operands[3],
+                    operands[4],
+                );
             }
-            Op::LoadTextFile | Op::LoadFontFile | Op::DrawText | Op::GetVersionNumber => {
+            Op::LoadTextFile => {
+                let path = state.script_text.clone();
+                self.state.record_op("LoadTextFile");
+                self.state.load_text_file(
+                    usize::try_from(operands[0]).unwrap_or(usize::MAX),
+                    &path,
+                    operands[2] != 0,
+                );
+            }
+            Op::LoadFontFile => {
+                let path = state.script_text.clone();
+                self.state.record_op("LoadFontFile");
+                self.state.load_font_file(&path);
+            }
+            Op::DrawText => {
+                self.state.record_op("DrawText");
+                self.state.text_menu_surface_no = self.current_sheet_id();
+                self.draw_bitmap_text(
+                    usize::try_from(operands[0]).unwrap_or(usize::MAX),
+                    operands[1],
+                    operands[2],
+                    operands[3],
+                    operands[4],
+                    operands[5],
+                    operands[6],
+                );
+            }
+            Op::DrawNumbers => {
+                self.state.record_op("DrawNumbers");
+                self.draw_numbers(
+                    operands[0],
+                    operands[1],
+                    operands[2],
+                    operands[3],
+                    operands[4],
+                    operands[5],
+                    operands[6] != 0,
+                );
+            }
+            Op::DrawActName => {
+                self.state.record_op("DrawActName");
+                self.draw_act_name(
+                    operands[0],
+                    operands[1],
+                    operands[2],
+                    operands[3],
+                    operands[4],
+                    operands[5],
+                    operands[6],
+                );
+            }
+            Op::GetVersionNumber => {
                 self.state.record_stub(stub_name(op));
             }
             Op::SetMusicTrack => {
@@ -1038,31 +1285,11 @@ impl ScriptHost for EngineHost<'_> {
             Op::Print => {
                 self.state.record_stub(stub_name(op));
             }
-            Op::ClearScreen
-            | Op::DrawSprite
-            | Op::DrawSpriteXY
-            | Op::DrawSpriteScreenXY
-            | Op::DrawTintRect
-            | Op::DrawNumbers
-            | Op::DrawActName
-            | Op::DrawMenu
-            | Op::DrawRect
-            | Op::DrawSpriteFX
-            | Op::DrawSpriteScreenFX
+            Op::DrawMenu
             | Op::Draw3DScene
-            | Op::DrawObjectAnimation
-            | Op::SpriteFrame
-            | Op::EditFrame
-            | Op::LoadPalette
-            | Op::RotatePalette
-            | Op::SetScreenFade
-            | Op::SetActivePalette
-            | Op::SetPaletteFade
-            | Op::CopyPalette
             | Op::SetupMenu
             | Op::AddMenuEntry
             | Op::EditMenuEntry
-            | Op::RemoveSpriteSheet
             | Op::SetIdentityMatrix
             | Op::MatrixMultiply
             | Op::MatrixTranslateXYZ
@@ -1073,7 +1300,6 @@ impl ScriptHost for EngineHost<'_> {
             | Op::MatrixRotateXYZ
             | Op::MatrixInverse
             | Op::TransformVertices
-            | Op::SetLayerDeformation
             | Op::SetScreenCount
             | Op::SetScreenVertices
             | Op::GetInputDeviceID
@@ -1559,6 +1785,724 @@ impl EngineHost<'_> {
     }
 }
 
+/// Where a script sprite draw takes its position from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpriteDrawPosition {
+    /// `DrawSprite`: the current entity's position.
+    Entity,
+    /// `DrawSpriteXY`: an operand position in 16.16 world space.
+    World,
+    /// `DrawSpriteScreenXY`: an operand position in screen pixels.
+    Screen,
+}
+
+impl EngineHost<'_> {
+    fn current_entity(&self) -> retro_scene::Entity {
+        self.state
+            .entities
+            .get(self.state.object_entity_pos)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn current_sheet_id(&self) -> i32 {
+        let entity = self.current_entity();
+        self.state
+            .objects
+            .get(usize::from(entity.type_id))
+            .map(|entry| entry.sprite_sheet_id)
+            .unwrap_or(0)
+    }
+
+    fn sprite_base(&self, position: SpriteDrawPosition, x: i32, y: i32) -> (i32, i32) {
+        match position {
+            SpriteDrawPosition::Entity => {
+                let entity = self.current_entity();
+                (
+                    (entity.xpos >> 16) - self.state.screen.x_scroll,
+                    (entity.ypos >> 16) - self.state.screen.y_scroll,
+                )
+            }
+            SpriteDrawPosition::World => (
+                (x >> 16) - self.state.screen.x_scroll,
+                (y >> 16) - self.state.screen.y_scroll,
+            ),
+            SpriteDrawPosition::Screen => (x, y),
+        }
+    }
+
+    /// `DrawSprite`/`DrawSpriteXY`/`DrawSpriteScreenXY`.
+    fn draw_script_sprite(
+        &mut self,
+        frame_index: i32,
+        position: SpriteDrawPosition,
+        x: i32,
+        y: i32,
+    ) {
+        let frame = self.state.script_frame(frame_index);
+        let (base_x, base_y) = self.sprite_base(position, x, y);
+        let sheet = self.current_sheet_id();
+        self.state.render.draw_sprite(
+            sheet,
+            base_x + frame.pivot_x,
+            base_y + frame.pivot_y,
+            frame.width,
+            frame.height,
+            frame.spr_x,
+            frame.spr_y,
+        );
+    }
+
+    /// `DrawSpriteFX`/`DrawSpriteScreenFX`.
+    fn draw_script_sprite_fx(
+        &mut self,
+        frame_index: i32,
+        fx: i32,
+        position: SpriteDrawPosition,
+        x: i32,
+        y: i32,
+    ) {
+        let frame = self.state.script_frame(frame_index);
+        let entity = self.current_entity();
+        let (base_x, base_y) = self.sprite_base(position, x, y);
+        let sheet = self.current_sheet_id();
+        match fx {
+            0 => self.state.render.draw_sprite_scaled(
+                sheet,
+                entity.direction,
+                base_x,
+                base_y,
+                -frame.pivot_x,
+                -frame.pivot_y,
+                entity.scale,
+                entity.scale,
+                frame.width,
+                frame.height,
+                frame.spr_x,
+                frame.spr_y,
+            ),
+            1 => self.state.render.draw_sprite_rotated(
+                sheet,
+                entity.direction,
+                base_x,
+                base_y,
+                -frame.pivot_x,
+                -frame.pivot_y,
+                frame.spr_x,
+                frame.spr_y,
+                frame.width,
+                frame.height,
+                entity.rotation,
+            ),
+            2 => self.state.render.draw_sprite_rotozoom(
+                sheet,
+                entity.direction,
+                base_x,
+                base_y,
+                -frame.pivot_x,
+                -frame.pivot_y,
+                frame.spr_x,
+                frame.spr_y,
+                frame.width,
+                frame.height,
+                entity.rotation,
+                entity.scale,
+            ),
+            3 => {
+                let draw_x = base_x + frame.pivot_x;
+                let draw_y = base_y + frame.pivot_y;
+                match entity.ink_effect {
+                    0 => self.state.render.draw_sprite(
+                        sheet,
+                        draw_x,
+                        draw_y,
+                        frame.width,
+                        frame.height,
+                        frame.spr_x,
+                        frame.spr_y,
+                    ),
+                    1 => self.state.render.draw_blended_sprite(
+                        sheet,
+                        draw_x,
+                        draw_y,
+                        frame.width,
+                        frame.height,
+                        frame.spr_x,
+                        frame.spr_y,
+                    ),
+                    2 => self.state.render.draw_alpha_blended_sprite(
+                        sheet,
+                        draw_x,
+                        draw_y,
+                        frame.width,
+                        frame.height,
+                        frame.spr_x,
+                        frame.spr_y,
+                        entity.alpha,
+                    ),
+                    3 => self.state.render.draw_additive_blended_sprite(
+                        sheet,
+                        draw_x,
+                        draw_y,
+                        frame.width,
+                        frame.height,
+                        frame.spr_x,
+                        frame.spr_y,
+                        entity.alpha,
+                    ),
+                    4 => self.state.render.draw_subtractive_blended_sprite(
+                        sheet,
+                        draw_x,
+                        draw_y,
+                        frame.width,
+                        frame.height,
+                        frame.spr_x,
+                        frame.spr_y,
+                        entity.alpha,
+                    ),
+                    _ => {}
+                }
+            }
+            4 => {
+                // Upstream only uses the tint mask under `INK_ALPHA` (`Script.cpp:4778`).
+                if entity.ink_effect == 2 {
+                    self.state.render.draw_scaled_tint_mask(
+                        sheet,
+                        entity.direction,
+                        base_x,
+                        base_y,
+                        -frame.pivot_x,
+                        -frame.pivot_y,
+                        entity.scale,
+                        entity.scale,
+                        frame.width,
+                        frame.height,
+                        frame.spr_x,
+                        frame.spr_y,
+                    );
+                } else {
+                    self.state.render.draw_sprite_scaled(
+                        sheet,
+                        entity.direction,
+                        base_x,
+                        base_y,
+                        -frame.pivot_x,
+                        -frame.pivot_y,
+                        entity.scale,
+                        entity.scale,
+                        frame.width,
+                        frame.height,
+                        frame.spr_x,
+                        frame.spr_y,
+                    );
+                }
+            }
+            5 => {
+                let (draw_x, draw_y, direction) = match entity.direction {
+                    1 => (
+                        base_x - frame.width - frame.pivot_x,
+                        base_y + frame.pivot_y,
+                        retro_render::FLIP_X,
+                    ),
+                    2 => (
+                        base_x + frame.pivot_x,
+                        base_y - frame.height - frame.pivot_y,
+                        retro_render::FLIP_Y,
+                    ),
+                    3 => (
+                        base_x - frame.width - frame.pivot_x,
+                        base_y - frame.height - frame.pivot_y,
+                        retro_render::FLIP_XY,
+                    ),
+                    _ => (
+                        base_x + frame.pivot_x,
+                        base_y + frame.pivot_y,
+                        retro_render::FLIP_NONE,
+                    ),
+                };
+                self.state.render.draw_sprite_flipped(
+                    sheet,
+                    draw_x,
+                    draw_y,
+                    frame.width,
+                    frame.height,
+                    frame.spr_x,
+                    frame.spr_y,
+                    direction,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// `LoadPalette`: reads `Data/Palettes/<name>` and writes `start..end` into a bank.
+    fn load_palette(
+        &mut self,
+        name: &str,
+        palette_id: i32,
+        start_palette_index: i32,
+        start_index: i32,
+        end_index: i32,
+    ) {
+        let path = format!("Data/Palettes/{name}");
+        let bytes = self.state.source.read(&path).ok();
+        let Some(bytes) = bytes else {
+            return;
+        };
+        let Ok(palette) = retro_format_v4::Palette::from_bytes(&bytes) else {
+            return;
+        };
+        let colors: Vec<[u8; 3]> = (start_index..end_index)
+            .map(|index| {
+                usize::try_from(index)
+                    .ok()
+                    .and_then(|index| palette.colors.get(index).copied())
+                    .unwrap_or([0, 0, 0])
+            })
+            .collect();
+        if colors.is_empty() {
+            return;
+        }
+        // Upstream `LoadPalette` maps 0 and out-of-range ids to the active bank.
+        let bank = if palette_id > 0 && palette_id < retro_render::PALETTE_BANKS as i32 {
+            palette_id
+        } else {
+            retro_render::ACTIVE_PALETTE
+        };
+        self.state.render.palette.set_bank_entries(
+            bank,
+            usize::try_from(start_palette_index)
+                .unwrap_or(0)
+                .min(retro_render::PALETTE_COLORS - 1),
+            &colors,
+        );
+    }
+
+    /// `SetLayerDeformation`.
+    fn set_layer_deformation(
+        &mut self,
+        selected_def: i32,
+        wave_length: i32,
+        wave_width: i32,
+        wave_type: i32,
+        y_pos: i32,
+        wave_size: i32,
+    ) {
+        let Ok(table) = usize::try_from(selected_def) else {
+            return;
+        };
+        if table >= 4 {
+            return;
+        }
+        let wave_length = wave_length.max(1);
+        let shift = 9;
+        if wave_type == 1 {
+            for (id, offset) in (y_pos.max(0)..).zip(0..wave_size.max(0)) {
+                let angle = ((offset << 9) / wave_length) & 0x1FF;
+                let value = wave_width.wrapping_mul(self.state.math.sin512(angle)) >> shift;
+                if let Ok(id) = usize::try_from(id)
+                    && let Some(slot) = self.state.render.deform_data[table].get_mut(id)
+                {
+                    *slot = value;
+                }
+            }
+        } else {
+            let mut id = 0i32;
+            let mut angle_index = 0i32;
+            while angle_index < 0x200 * 0x100 {
+                let angle = (angle_index / wave_length) & 0x1FF;
+                let mut value = wave_width.wrapping_mul(self.state.math.sin512(angle)) >> shift;
+                if value >= wave_width {
+                    value = wave_width - 1;
+                }
+                if let Ok(id) = usize::try_from(id)
+                    && let Some(slot) = self.state.render.deform_data[table].get_mut(id)
+                {
+                    *slot = value;
+                }
+                id += 1;
+                angle_index += 0x200;
+            }
+        }
+        // Upstream mirrors the first `DEFORM_STORE` entries into the tail so the deformation
+        // pointer can run past the wave length (`Scene.cpp:1450-1462`).
+        let data = &mut self.state.render.deform_data[table];
+        for index in retro_render::DEFORM_STORE..retro_render::DEFORM_COUNT {
+            if let Some(source) = data.get(index - retro_render::DEFORM_STORE).copied()
+                && let Some(slot) = data.get_mut(index)
+            {
+                *slot = source;
+            }
+        }
+    }
+
+    /// `Set16x16TileInfo`: writes chunk metadata and returns `(chunkX, chunkY, chunk)` for the
+    /// script operand outputs.
+    fn set_16x16_tile_info(&mut self, value: i32, x: i32, y: i32, info: i32) -> (i32, i32, i32) {
+        let chunk_x = x >> 7;
+        let chunk_y = y >> 7;
+        let base = i32::from(
+            self.state
+                .layers
+                .first()
+                .map(|layer| layer.entry(chunk_x, chunk_y))
+                .unwrap_or(0),
+        ) << 6;
+        let chunk = base + ((x & 0x7F) >> 4) + 8 * ((y & 0x7F) >> 4);
+        match info {
+            TILEINFO_INDEX => {
+                if let Some(entry) = usize::try_from(chunk)
+                    .ok()
+                    .and_then(|index| self.state.render.tiles.chunks.get_mut(index))
+                {
+                    entry.gfx_data_pos = value << 8;
+                }
+            }
+            TILEINFO_DIRECTION => {
+                if let Some(entry) = usize::try_from(chunk)
+                    .ok()
+                    .and_then(|index| self.state.render.tiles.chunks.get_mut(index))
+                {
+                    entry.direction = value as u8;
+                }
+            }
+            TILEINFO_VISUALPLANE => {
+                if let Some(entry) = usize::try_from(chunk)
+                    .ok()
+                    .and_then(|index| self.state.render.tiles.chunks.get_mut(index))
+                {
+                    entry.visual_plane = value as u8;
+                }
+            }
+            TILEINFO_SOLIDITYA | TILEINFO_SOLIDITYB => {
+                if let Some(entry) = usize::try_from(chunk)
+                    .ok()
+                    .and_then(|index| self.state.collision.as_mut()?.tiles.entries.get_mut(index))
+                {
+                    if info == TILEINFO_SOLIDITYA {
+                        entry.collision_flag_a = value as u8;
+                    } else {
+                        entry.collision_flag_b = value as u8;
+                    }
+                }
+            }
+            TILEINFO_FLAGSA | TILEINFO_ANGLEA => {
+                let tile_index = usize::try_from(chunk)
+                    .ok()
+                    .and_then(|index| self.state.collision.as_ref()?.tiles.entries.get(index))
+                    .map(|tile| usize::from(tile.tile_index))
+                    .unwrap_or(0);
+                if let Some(entry) = self
+                    .state
+                    .collision
+                    .as_mut()
+                    .and_then(|collision| collision.masks.planes[1].tiles.get_mut(tile_index))
+                {
+                    if info == TILEINFO_FLAGSA {
+                        entry.flags = value as u8;
+                    } else {
+                        entry.angle = value as u32;
+                    }
+                }
+            }
+            _ => {}
+        }
+        (chunk_x, chunk_y, chunk)
+    }
+
+    /// `Copy16x16Tile`: copies one 256-byte 16x16 tile (`Scene.hpp:254-260`).
+    fn copy_16x16_tile(&mut self, dest: i32, src: i32) {
+        const TILE_BYTES: usize = 256;
+        let (Ok(dest), Ok(src)) = (usize::try_from(dest), usize::try_from(src)) else {
+            return;
+        };
+        let (Some(dest_start), Some(src_start)) =
+            (dest.checked_mul(TILE_BYTES), src.checked_mul(TILE_BYTES))
+        else {
+            return;
+        };
+        let Some(source) = self
+            .state
+            .render
+            .tiles
+            .pixels
+            .get(src_start..src_start + TILE_BYTES)
+        else {
+            return;
+        };
+        let source: Vec<u8> = source.to_vec();
+        if let Some(target) = self
+            .state
+            .render
+            .tiles
+            .pixels
+            .get_mut(dest_start..dest_start + TILE_BYTES)
+        {
+            target.copy_from_slice(&source);
+        }
+    }
+
+    /// `DrawNumbers`: draws `digits` decimal digits of `value` right-to-left at `(x, y)`.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_numbers(
+        &mut self,
+        frame_base: i32,
+        mut x: i32,
+        y: i32,
+        value: i32,
+        digits: i32,
+        spacing: i32,
+        fixed_width: bool,
+    ) {
+        let sheet = self.current_sheet_id();
+        let mut remaining = digits;
+        let mut divisor = 10i32;
+        if fixed_width {
+            while remaining > 0 {
+                let frame_id = (value % divisor) / (divisor / 10) + frame_base;
+                let frame = self.state.script_frame(frame_id);
+                self.state.render.draw_sprite(
+                    sheet,
+                    frame.pivot_x + x,
+                    frame.pivot_y + y,
+                    frame.width,
+                    frame.height,
+                    frame.spr_x,
+                    frame.spr_y,
+                );
+                x = x.wrapping_sub(spacing);
+                divisor = divisor.wrapping_mul(10);
+                remaining -= 1;
+            }
+        } else {
+            let mut extra = 10i32;
+            if value != 0 {
+                extra = 10i32.wrapping_mul(value);
+            }
+            while remaining > 0 {
+                if extra >= divisor {
+                    let frame_id = (value % divisor) / (divisor / 10) + frame_base;
+                    let frame = self.state.script_frame(frame_id);
+                    self.state.render.draw_sprite(
+                        sheet,
+                        frame.pivot_x + x,
+                        frame.pivot_y + y,
+                        frame.width,
+                        frame.height,
+                        frame.spr_x,
+                        frame.spr_y,
+                    );
+                }
+                x = x.wrapping_sub(spacing);
+                divisor = divisor.wrapping_mul(10);
+                remaining -= 1;
+            }
+        }
+    }
+
+    /// `DrawActName`: draws the act title card words from `titleCardText`.
+    ///
+    /// Modes match `Script.cpp:4506`: 0 draws word 1 right-aligned, 1 draws word 1 left-aligned
+    /// and 2 draws word 2 from `titleCardWord2`. `lowercase` shifts the frame base by 26 after
+    /// the first glyph so the second half of the frame list supplies lowercase letters.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_act_name(
+        &mut self,
+        mut frame_base: i32,
+        mut x: i32,
+        y: i32,
+        mode: i32,
+        lowercase: i32,
+        space_width: i32,
+        spacing: i32,
+    ) {
+        let title = self.state.scene.title.clone();
+        let text = title.as_bytes();
+        let normalize = |byte: u8, mode: i32| -> i32 {
+            let mut character = i32::from(byte);
+            if character == b' ' as i32 {
+                character = if mode == 2 { 0 } else { -1 };
+            } else if character == b'-' as i32 {
+                character = 0;
+            }
+            if (i32::from(b'0')..=i32::from(b'9')).contains(&character) {
+                character -= 22;
+            }
+            if character > i32::from(b'9') && character < i32::from(b'f') {
+                character -= i32::from(b'A');
+            }
+            character
+        };
+        match mode {
+            0 => {
+                // Find the last character of word 1, then draw backwards from the right edge.
+                let mut char_id = 0usize;
+                while let Some(next) = text.get(char_id + 1)
+                    && *next != b'-'
+                    && *next != 0
+                {
+                    char_id += 1;
+                }
+                let mut index = char_id as i32;
+                while index >= 0 {
+                    let Some(byte) = usize::try_from(index)
+                        .ok()
+                        .and_then(|index| text.get(index))
+                        .copied()
+                    else {
+                        break;
+                    };
+                    let character = normalize(byte, mode);
+                    if character <= -1 {
+                        x = x.wrapping_sub(space_width + spacing);
+                    } else {
+                        let frame = self.state.script_frame(character + frame_base);
+                        let sheet = self.current_sheet_id();
+                        x = x.wrapping_sub(frame.width + spacing);
+                        self.state.render.draw_sprite(
+                            sheet,
+                            x + frame.pivot_x,
+                            y + frame.pivot_y,
+                            frame.width,
+                            frame.height,
+                            frame.spr_x,
+                            frame.spr_y,
+                        );
+                    }
+                    index -= 1;
+                }
+            }
+            1 | 2 => {
+                let mut char_id = if mode == 2 {
+                    usize::try_from(self.state.title_card_word2()).unwrap_or(usize::MAX)
+                } else {
+                    0
+                };
+                if lowercase == 1 && text.get(char_id).copied().unwrap_or(0) != 0 {
+                    let byte = text.get(char_id).copied().unwrap_or(0);
+                    let character = normalize(byte, mode);
+                    x = self.draw_act_left(character + frame_base, x, y, space_width, spacing);
+                    frame_base += 26;
+                    char_id += 1;
+                }
+                while let Some(byte) = text.get(char_id).copied() {
+                    if byte == 0 || (mode == 1 && byte == b'-') {
+                        break;
+                    }
+                    let character = normalize(byte, mode);
+                    x = self.draw_act_left(character + frame_base, x, y, space_width, spacing);
+                    char_id += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Draws one left-aligned act-name glyph and returns the advanced x position.
+    fn draw_act_left(
+        &mut self,
+        frame_id: i32,
+        x: i32,
+        y: i32,
+        space_width: i32,
+        spacing: i32,
+    ) -> i32 {
+        if frame_id <= -1 {
+            return x.wrapping_add(space_width + spacing);
+        }
+        let frame = self.state.script_frame(frame_id);
+        let sheet = self.current_sheet_id();
+        self.state.render.draw_sprite(
+            sheet,
+            x + frame.pivot_x,
+            y + frame.pivot_y,
+            frame.width,
+            frame.height,
+            frame.spr_x,
+            frame.spr_y,
+        );
+        x.wrapping_add(frame.width + spacing)
+    }
+
+    /// `DrawBitmapText`: draws a text menu row range with the legacy bitmap font.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_bitmap_text(
+        &mut self,
+        menu_index: usize,
+        x_pos: i32,
+        y_pos: i32,
+        scale: i32,
+        spacing: i32,
+        row_start: i32,
+        mut row_count: i32,
+    ) {
+        let sheet = self.state.text_menu_surface_no;
+        let (row_count_max, rows) = match self.state.text_menus.get(menu_index) {
+            Some(menu) => (
+                menu.row_count,
+                menu.entry_start
+                    .iter()
+                    .zip(menu.entry_size.iter())
+                    .map(|(start, size)| (*start, *size))
+                    .collect::<Vec<_>>(),
+            ),
+            None => return,
+        };
+        if row_count < 0 {
+            row_count = row_count_max;
+        }
+        if row_start + row_count > row_count_max {
+            row_count = row_count_max - row_start;
+        }
+        let mut y = y_pos << 9;
+        let mut row = row_start;
+        while row_count > 0 {
+            let mut x = x_pos << 9;
+            let (start, size) = rows
+                .get(usize::try_from(row).unwrap_or(usize::MAX))
+                .copied()
+                .unwrap_or((0, 0));
+            for index in 0..size {
+                let character = self
+                    .state
+                    .text_menus
+                    .get(menu_index)
+                    .and_then(|menu| {
+                        usize::try_from(start + index)
+                            .ok()
+                            .and_then(|i| menu.text_data.get(i))
+                    })
+                    .copied()
+                    .unwrap_or(0) as usize;
+                let font = self
+                    .state
+                    .font_characters
+                    .get(character)
+                    .copied()
+                    .unwrap_or_default();
+                self.state.render.draw_sprite_scaled(
+                    sheet,
+                    retro_render::FLIP_NONE,
+                    x >> 9,
+                    y >> 9,
+                    -font.pivot_x,
+                    -font.pivot_y,
+                    scale,
+                    scale,
+                    font.width,
+                    font.height,
+                    font.src_x,
+                    font.src_y,
+                );
+                x = x.wrapping_add(font.x_advance.wrapping_mul(scale));
+            }
+            y = y.wrapping_add(spacing.wrapping_mul(scale));
+            row += 1;
+            row_count -= 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1652,6 +2596,7 @@ mod tests {
                 platform: PlatformMode::Origins,
                 revision: V4Revision::Rev03,
                 force_scripts: false,
+                dim_limit_frames: 18000,
             },
             minimal_game_config(),
             "Zone01".to_owned(),
@@ -1922,5 +2867,436 @@ mod tests {
         assert_eq!(vm_state.check_result, 1);
         assert_eq!(host.state.entities.get(1).unwrap().ypos, 84 << 16);
         assert_eq!(host.state.op_histogram.get("BoxCollisionTest"), Some(&1));
+    }
+
+    fn animation_state() -> EngineState {
+        use retro_format_v4::{Animation, AnimationFile, AnimationFrame};
+
+        let mut state = test_state(false);
+        let frame = |x: u8| AnimationFrame {
+            sheet_index: 0,
+            sheet: String::new(),
+            hitbox_id: 0,
+            x,
+            y: 0,
+            width: 16,
+            height: 16,
+            pivot_x: 0,
+            pivot_y: 0,
+        };
+        let file = AnimationFile {
+            sheets: Vec::new(),
+            animations: vec![
+                Animation {
+                    name: "Idle".to_owned(),
+                    frame_count: 3,
+                    playback_frame_count: 3,
+                    speed: 0x10,
+                    loop_point: 1,
+                    rotation_style: 0,
+                    frames: vec![frame(0), frame(16), frame(32)],
+                },
+                Animation {
+                    name: "Walk".to_owned(),
+                    frame_count: 2,
+                    playback_frame_count: 2,
+                    speed: 0x20,
+                    loop_point: 0,
+                    rotation_style: 0,
+                    frames: vec![frame(0), frame(16)],
+                },
+            ],
+            hitboxes: Vec::new(),
+        };
+        state.animations.push(file);
+        state.animation_sheet_ids.push(Vec::new());
+        state
+            .objects
+            .push("Animated", Vec::new(), Default::default());
+        if let Some(entry) = state.objects.get_mut(1) {
+            entry.animation_file = Some(0);
+        }
+        state.object_frames.resize(state.objects.len(), Vec::new());
+        state.entities.reset_object_entity(0, 1, 0, 0, 0);
+        state.object_entity_pos = 0;
+        state
+    }
+
+    #[test]
+    fn process_animation_steps_frames_and_loops_like_upstream() {
+        let mut state = animation_state();
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        // Default speed 0 uses the animation speed 0x10; a frame advances every 15 calls.
+        for step in 1..=15 {
+            host.engine_op(Op::ProcessAnimation, &mut vm_state).unwrap();
+            let entity = host.state.entities.get(0).unwrap();
+            let expected = i32::from(step == 15);
+            assert_eq!(entity.frame, expected as u8, "step {step}");
+            assert_eq!(entity.animation_timer, (step * 0x10) % 0xF0, "timer {step}");
+        }
+        // Frame 3 is out of range and loops back to the loop point (1).
+        for _ in 0..30 {
+            host.engine_op(Op::ProcessAnimation, &mut vm_state).unwrap();
+        }
+        assert_eq!(host.state.entities.get(0).unwrap().frame, 1);
+    }
+
+    #[test]
+    fn process_animation_switching_animation_resets_phase() {
+        let mut state = animation_state();
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        for _ in 0..20 {
+            host.engine_op(Op::ProcessAnimation, &mut vm_state).unwrap();
+        }
+        assert_eq!(host.state.entities.get(0).unwrap().frame, 1);
+        host.state.entities.get_mut(0).unwrap().animation = 1;
+        host.engine_op(Op::ProcessAnimation, &mut vm_state).unwrap();
+        let entity = host.state.entities.get(0).unwrap();
+        assert_eq!(entity.prev_animation, 1);
+        assert_eq!(entity.frame, 0);
+        assert_eq!(entity.animation_timer, 0);
+        assert_eq!(entity.animation_speed, 0);
+    }
+
+    #[test]
+    fn sprite_frame_and_edit_frame_build_the_object_frame_list() {
+        let mut state = test_state(false);
+        state.objects.push("Test", Vec::new(), Default::default());
+        state.entities.reset_object_entity(7, 1, 0, 0, 0);
+        state.object_entity_pos = 7;
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState {
+            current_event: ScriptEvent::Setup,
+            ..VmState::default()
+        };
+        for (pivot, spr) in [(1, 10), (2, 20)] {
+            vm_state.operands[0] = pivot;
+            vm_state.operands[1] = -pivot;
+            vm_state.operands[2] = 16;
+            vm_state.operands[3] = 16;
+            vm_state.operands[4] = spr;
+            vm_state.operands[5] = spr + 1;
+            host.engine_op(Op::SpriteFrame, &mut vm_state).unwrap();
+        }
+        assert_eq!(host.state.script_frame(1).spr_x, 20);
+        vm_state.operands[0] = 0;
+        vm_state.operands[1] = 5;
+        vm_state.operands[2] = 6;
+        vm_state.operands[3] = 7;
+        vm_state.operands[4] = 8;
+        vm_state.operands[5] = 9;
+        vm_state.operands[6] = 10;
+        host.engine_op(Op::EditFrame, &mut vm_state).unwrap();
+        assert_eq!(
+            host.state.script_frame(0),
+            ScriptFrame {
+                pivot_x: 5,
+                pivot_y: 6,
+                width: 7,
+                height: 8,
+                spr_x: 9,
+                spr_y: 10
+            }
+        );
+
+        // Outside the setup event `SpriteFrame` is ignored.
+        vm_state.current_event = ScriptEvent::Main;
+        vm_state.operands[0] = 3;
+        host.engine_op(Op::SpriteFrame, &mut vm_state).unwrap();
+        assert_eq!(host.state.object_frames[1].len(), 2);
+    }
+
+    #[test]
+    fn palette_ops_route_into_the_software_palette() {
+        let mut state = test_state(false);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 0;
+        vm_state.operands[1] = 3;
+        vm_state.operands[2] = 0x11_22_33;
+        host.engine_op(Op::SetPaletteEntry, &mut vm_state).unwrap();
+        vm_state.operands[2] = 0;
+        host.engine_op(Op::GetPaletteEntry, &mut vm_state).unwrap();
+        assert_eq!(vm_state.operands[2], 0x11_22_33);
+
+        vm_state.operands[0] = 4;
+        vm_state.operands[1] = 60;
+        vm_state.operands[2] = 0xFF;
+        host.engine_op(Op::SetActivePalette, &mut vm_state).unwrap();
+        assert_eq!(host.state.render.palette.line_buffer[60], 4);
+        vm_state.operands[0] = 0;
+        vm_state.operands[1] = 4;
+        vm_state.operands[2] = 0;
+        host.engine_op(Op::GetPaletteEntry, &mut vm_state).unwrap();
+        assert_eq!(vm_state.operands[2], 0, "active bank has no entry 3 yet");
+    }
+
+    #[test]
+    fn draw_rect_and_tint_rect_touch_the_framebuffer() {
+        let mut state = test_state(false);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 0;
+        vm_state.operands[1] = 0;
+        vm_state.operands[2] = 4;
+        vm_state.operands[3] = 2;
+        vm_state.operands[4] = 255;
+        vm_state.operands[5] = 0;
+        vm_state.operands[6] = 0;
+        vm_state.operands[7] = 255;
+        host.engine_op(Op::DrawRect, &mut vm_state).unwrap();
+        assert_eq!(host.state.render.framebuffer.get(3, 1), 0xF800);
+        vm_state.operands[0] = 0;
+        vm_state.operands[1] = 0;
+        vm_state.operands[2] = 1;
+        vm_state.operands[3] = 1;
+        host.engine_op(Op::DrawTintRect, &mut vm_state).unwrap();
+        assert_eq!(host.state.render.framebuffer.get(0, 0), 0x8410);
+        assert_eq!(host.state.render.framebuffer.get(3, 1), 0xF800);
+    }
+
+    #[test]
+    fn set_screen_fade_draws_on_the_next_stage_draw() {
+        let mut state = test_state(false);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 0;
+        vm_state.operands[1] = 0;
+        vm_state.operands[2] = 0;
+        vm_state.operands[3] = 0xFF;
+        host.engine_op(Op::SetScreenFade, &mut vm_state).unwrap();
+        assert_eq!(host.state.render.fade_mode, 1);
+        assert_eq!(host.state.render.fade_a, 0xFF);
+        host.state.render.draw_fade();
+        assert_eq!(host.state.render.framebuffer.get(0, 0), 0x0000);
+    }
+
+    /// Registers a second object type with a sheet and frame list, ready for sprite ops.
+    fn sprite_state(frame_count: usize) -> EngineState {
+        let mut state = test_state(false);
+        state
+            .objects
+            .push("SpriteObject", Vec::new(), Default::default());
+        state.object_frames.resize(state.objects.len(), Vec::new());
+        state.object_frames[1] = (0..frame_count)
+            .map(|index| ScriptFrame {
+                pivot_x: 0,
+                pivot_y: 0,
+                width: 1,
+                height: 1,
+                spr_x: index as i32,
+                spr_y: 0,
+            })
+            .collect();
+        if let Some(entry) = state.objects.get_mut(1) {
+            entry.sprite_sheet_id = 0;
+        }
+        state
+            .render
+            .surfaces
+            .push(retro_render::Surface::from_indexed(
+                frame_count.max(1) as u16,
+                1,
+                vec![1; frame_count.max(1)],
+            ));
+        state.render.palette.set_bank_entry(0, 1, 255, 0, 0);
+        state.entities.reset_object_entity(0, 1, 0, 0, 0);
+        state.object_entity_pos = 0;
+        state
+    }
+
+    #[test]
+    fn copy_16x16_tile_copies_the_whole_256_byte_tile() {
+        let mut state = test_state(false);
+        let mut source = vec![0u8; retro_render::TILE_SET_16_SIZE];
+        for (offset, byte) in source[256..512].iter_mut().enumerate() {
+            *byte = (offset % 251) as u8 + 1;
+        }
+        state.render.tiles.pixels = source;
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 2;
+        vm_state.operands[1] = 1;
+        host.engine_op(Op::Copy16x16Tile, &mut vm_state).unwrap();
+        let pixels = &host.state.render.tiles.pixels;
+        assert_eq!(&pixels[512..768], &pixels[256..512]);
+        assert_ne!(pixels[512], 0);
+    }
+
+    #[test]
+    fn set_16x16_tile_info_updates_chunk_metadata_and_outputs() {
+        let mut state = test_state(false);
+        state.render.tiles.chunks = vec![retro_render::ChunkEntry::default(); 1];
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 2;
+        vm_state.operands[1] = 0;
+        vm_state.operands[2] = 0;
+        vm_state.operands[3] = TILEINFO_INDEX;
+        host.engine_op(Op::Set16x16TileInfo, &mut vm_state).unwrap();
+        assert_eq!(vm_state.operands[4], 0, "chunkX");
+        assert_eq!(vm_state.operands[5], 0, "chunkY");
+        assert_eq!(vm_state.operands[6], 0, "chunk");
+        assert_eq!(host.state.render.tiles.chunks[0].gfx_data_pos, 2 << 8);
+
+        vm_state.operands[0] = 3;
+        vm_state.operands[3] = TILEINFO_DIRECTION;
+        host.engine_op(Op::Set16x16TileInfo, &mut vm_state).unwrap();
+        assert_eq!(host.state.render.tiles.chunks[0].direction, 3);
+        vm_state.operands[0] = 1;
+        vm_state.operands[3] = TILEINFO_VISUALPLANE;
+        host.engine_op(Op::Set16x16TileInfo, &mut vm_state).unwrap();
+        assert_eq!(host.state.render.tiles.chunks[0].visual_plane, 1);
+        assert!(host.state.stub_histogram.is_empty());
+    }
+
+    #[test]
+    fn draw_numbers_uses_the_script_frame_list() {
+        let mut state = sprite_state(10);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 0; // frame base
+        vm_state.operands[1] = 4; // x
+        vm_state.operands[2] = 2; // y
+        vm_state.operands[3] = 7; // value
+        vm_state.operands[4] = 1; // digits
+        vm_state.operands[5] = 8; // spacing
+        vm_state.operands[6] = 0; // auto width
+        host.engine_op(Op::DrawNumbers, &mut vm_state).unwrap();
+        assert_eq!(host.state.render.framebuffer.get(4, 2), 0xF800);
+        assert_eq!(host.state.render.framebuffer.get(3, 2), 0);
+        assert_eq!(host.state.op_histogram.get("DrawNumbers"), Some(&1));
+    }
+
+    #[test]
+    fn draw_act_name_renders_title_card_letters() {
+        let mut state = sprite_state(2);
+        state.scene.title = "AB".to_owned();
+        state.entities.get_mut(0).unwrap().visible = 1;
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 0;
+        vm_state.operands[1] = 0;
+        vm_state.operands[2] = 0;
+        vm_state.operands[3] = 1; // mode 1: word 1 left aligned
+        vm_state.operands[4] = 0; // uppercase only
+        vm_state.operands[5] = 8;
+        vm_state.operands[6] = 0;
+        host.engine_op(Op::DrawActName, &mut vm_state).unwrap();
+        assert_eq!(host.state.render.framebuffer.get(0, 0), 0xF800);
+        assert_eq!(host.state.render.framebuffer.get(1, 0), 0xF800);
+        assert_eq!(host.state.op_histogram.get("DrawActName"), Some(&1));
+    }
+
+    #[test]
+    fn fx_tint_only_masks_under_alpha_ink() {
+        // INK_ALPHA (2) tints the framebuffer under opaque pixels.
+        let mut state = sprite_state(1);
+        state.entities.get_mut(0).unwrap().ink_effect = 2;
+        state.render.framebuffer.set(0, 0, 0x07E0);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 0; // frame
+        vm_state.operands[1] = 4; // FX_TINT
+        vm_state.operands[2] = 0; // x << 16
+        vm_state.operands[3] = 0; // y << 16
+        host.engine_op(Op::DrawSpriteFX, &mut vm_state).unwrap();
+        assert_eq!(
+            host.state.render.framebuffer.get(0, 0),
+            host.state.render.lookup.tint(0x07E0)
+        );
+
+        // INK_BLEND (1) uses the palette blit instead.
+        let mut state = sprite_state(1);
+        state.entities.get_mut(0).unwrap().ink_effect = 1;
+        state.render.framebuffer.set(0, 0, 0x07E0);
+        let mut host = EngineHost { state: &mut state };
+        host.engine_op(Op::DrawSpriteFX, &mut vm_state).unwrap();
+        assert_eq!(host.state.render.framebuffer.get(0, 0), 0xF800);
+    }
+
+    #[test]
+    fn set_layer_deformation_mirrors_the_store_tail() {
+        let mut state = test_state(false);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 0; // DEFORM_FG
+        vm_state.operands[1] = 8; // wave length
+        vm_state.operands[2] = 10; // wave width
+        vm_state.operands[3] = 0; // wave type
+        vm_state.operands[4] = 0;
+        vm_state.operands[5] = 0;
+        host.engine_op(Op::SetLayerDeformation, &mut vm_state)
+            .unwrap();
+        let data = &host.state.render.deform_data[0];
+        assert!(data[..256].iter().any(|value| *value != 0));
+        for index in retro_render::DEFORM_STORE..retro_render::DEFORM_COUNT {
+            assert_eq!(data[index], data[index - retro_render::DEFORM_STORE]);
+        }
+    }
+
+    #[test]
+    fn text_ops_load_a_font_text_and_draw_glyphs() {
+        let mut state = sprite_state(1);
+        // Upstream indexes `fontCharacterList` by the text-data value, so the record for 'A'
+        // (65) must live at index 65.
+        let mut font = vec![0u8; 65 * 20];
+        for id in [65u32, 66] {
+            font.extend_from_slice(&id.to_le_bytes());
+            font.extend_from_slice(&0u16.to_le_bytes()); // src x
+            font.extend_from_slice(&0u16.to_le_bytes()); // src y
+            font.extend_from_slice(&1u16.to_le_bytes()); // width
+            font.extend_from_slice(&1u16.to_le_bytes()); // height
+            font.extend_from_slice(&[0, 0, 0, 0, 1, 0, 0, 0]); // pivots, advance, unused
+        }
+        let mut source = MemorySource::new();
+        source.insert("Data/Game/Font.bin", font);
+        source.insert("Data/Game/Text.bin", b"A\rB".to_vec());
+        state.source = Arc::new(source);
+
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState {
+            script_text: "Data/Game/Font.bin".to_owned(),
+            ..VmState::default()
+        };
+        host.engine_op(Op::LoadFontFile, &mut vm_state).unwrap();
+        assert_eq!(host.state.font_characters[65].id, 65);
+        assert_eq!(host.state.font_characters[65].x_advance, 1);
+
+        vm_state.script_text = "Data/Game/Text.bin".to_owned();
+        vm_state.operands[0] = 0;
+        vm_state.operands[2] = 0;
+        host.engine_op(Op::LoadTextFile, &mut vm_state).unwrap();
+        // `rowCount` is a true row count upstream: `LoadTextFile` bumps it on every `\r` and
+        // then once more before returning (`Text.cpp:98,226-238`), and `DrawBitmapText`
+        // iterates `rowStart..rowStart+rowCount` (`Drawing.cpp:4381-4399`). `"A\rB"` therefore
+        // has two rows, not a last index of one.
+        assert_eq!(host.state.text_menus[0].row_count, 2);
+        assert_eq!(host.state.text_menus[0].text_data, vec![65, 66]);
+        vm_state.operands[1] = 0;
+        vm_state.operands[2] = 0; // TEXTINFO_TEXTDATA
+        vm_state.operands[3] = 1;
+        vm_state.operands[4] = 0;
+        host.engine_op(Op::GetTextInfo, &mut vm_state).unwrap();
+        assert_eq!(vm_state.operands[0], 66);
+        vm_state.operands[2] = 1; // TEXTINFO_TEXTSIZE
+        host.engine_op(Op::GetTextInfo, &mut vm_state).unwrap();
+        assert_eq!(vm_state.operands[0], 1);
+        vm_state.operands[2] = 2; // TEXTINFO_ROWCOUNT
+        host.engine_op(Op::GetTextInfo, &mut vm_state).unwrap();
+        assert_eq!(vm_state.operands[0], 2);
+
+        vm_state.operands[0] = 0;
+        vm_state.operands[1] = 0;
+        vm_state.operands[2] = 0;
+        vm_state.operands[3] = 512;
+        vm_state.operands[4] = 4;
+        vm_state.operands[5] = 0;
+        vm_state.operands[6] = -1;
+        host.engine_op(Op::DrawText, &mut vm_state).unwrap();
+        assert_eq!(host.state.render.framebuffer.get(0, 0), 0xF800);
+        assert_eq!(host.state.render.framebuffer.get(0, 4), 0xF800);
     }
 }

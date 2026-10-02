@@ -1888,8 +1888,10 @@ fn starts_with_token(text: &str, token: &str) -> bool {
     find_token(text, token) == Some(0)
 }
 
-/// Port of upstream `ConvertStringToInteger`.
-fn parse_int(text: &str) -> Option<i32> {
+/// Port of upstream `ConvertStringToInteger`: parses an optional sign, `0x`/`0b`/`0o` base
+/// prefixes and hex digit values exactly like the engine's `ParseScriptFile` helper.
+#[must_use]
+pub fn parse_int(text: &str) -> Option<i32> {
     let bytes = text.as_bytes();
     let first = *bytes.first()?;
     if first != b'+' && !first.is_ascii_digit() && first != b'-' {
