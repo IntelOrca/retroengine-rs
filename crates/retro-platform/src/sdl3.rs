@@ -1,6 +1,6 @@
 //! SDL3 backend providing a real window, streaming RGB565 texture, audio stream and device input.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -39,6 +39,7 @@ pub struct Sdl3Platform {
     initialized: bool,
     input: Sdl3Input,
     storage: FsStorage,
+    storage_root_override: bool,
     clock: SystemClock,
     sdl: Option<::sdl3::Sdl>,
 }
@@ -51,14 +52,25 @@ impl Sdl3Platform {
             initialized: false,
             input: Sdl3Input::new(Arc::new(AtomicBool::new(false))),
             storage: FsStorage::new("retroengine-user"),
+            storage_root_override: false,
             clock: SystemClock::new(),
             sdl: None,
         }
     }
 
     /// Overrides the root directory used by [`Storage`].
+    ///
+    /// An explicit override also survives [`Platform::init`]; otherwise `init` roots the storage
+    /// at [`crate::user_data_dir`] (the SDL preferred path) when one is available.
     pub fn set_storage_root(&mut self, root: impl Into<PathBuf>) {
         self.storage = FsStorage::new(root);
+        self.storage_root_override = true;
+    }
+
+    /// The directory [`Storage`] is rooted at.
+    #[must_use]
+    pub fn storage_root(&self) -> &Path {
+        self.storage.root()
     }
 }
 
@@ -80,6 +92,11 @@ impl Platform for Sdl3Platform {
         let sdl = ::sdl3::init().map_err(PlatformError::sdl)?;
         self.input.attach(&sdl)?;
         self.sdl = Some(sdl);
+        if !self.storage_root_override
+            && let Some(root) = crate::user_data_dir()
+        {
+            self.storage = FsStorage::new(root);
+        }
         SDL3_INIT_COUNT.fetch_add(1, Ordering::Relaxed);
         self.initialized = true;
         Ok(())
@@ -447,12 +464,21 @@ struct ActiveTouch {
     y: f32,
 }
 
-/// Scales a normalized `0..=1` SDL finger coordinate into the `i16` touch space.
-fn normalize_touch(value: f32) -> i16 {
+/// Logical screen width touches are scaled to (`SCREEN_XSIZE`).
+pub const TOUCH_SCREEN_XSIZE: i16 = 424;
+/// Logical screen height touches are scaled to (`SCREEN_YSIZE`).
+pub const TOUCH_SCREEN_YSIZE: i16 = 240;
+
+/// Scales a normalized `0..=1` SDL finger coordinate into logical screen pixels.
+///
+/// Upstream assigns `touchX = finger->x * SCREEN_XSIZE` and `touchY = finger->y * SCREEN_YSIZE`
+/// (`RetroEngine.cpp:119-122`), so scripts see `CheckTouchRect`-style logical coordinates rather
+/// than a full `i16` range.
+fn normalize_touch(value: f32, size: i16) -> i16 {
     if !value.is_finite() {
         return 0;
     }
-    (value.clamp(0.0, 1.0) * f32::from(i16::MAX)).round() as i16
+    (value.clamp(0.0, 1.0) * f32::from(size)).round() as i16
 }
 
 fn open_into(
@@ -618,8 +644,8 @@ impl Sdl3Input {
         {
             touches[index] = retro_input::TouchPoint {
                 down: true,
-                x: normalize_touch(touch.x),
-                y: normalize_touch(touch.y),
+                x: normalize_touch(touch.x, TOUCH_SCREEN_XSIZE),
+                y: normalize_touch(touch.y, TOUCH_SCREEN_YSIZE),
             };
         }
         RawInput {
@@ -753,6 +779,44 @@ mod tests {
         let mut platform = Sdl3Platform::new();
         platform.shutdown().unwrap();
         assert!(!platform.is_initialized());
+    }
+
+    #[test]
+    fn sdl3_storage_root_uses_the_pref_path_unless_overridden() {
+        let _guard = crate::platform_test_lock();
+        let mut platform = Sdl3Platform::new();
+        platform.set_storage_root("/tmp/retro-platform-explicit");
+        platform.init().unwrap();
+        assert_eq!(
+            platform.storage_root(),
+            Path::new("/tmp/retro-platform-explicit"),
+            "an explicit root survives init"
+        );
+        platform.shutdown().unwrap();
+
+        let mut platform = Sdl3Platform::new();
+        platform.init().unwrap();
+        if let Some(root) = crate::user_data_dir() {
+            assert_eq!(
+                platform.storage_root(),
+                root,
+                "init roots storage at the SDL preferred path"
+            );
+        }
+        platform.shutdown().unwrap();
+    }
+
+    #[test]
+    fn touch_normalization_uses_logical_screen_pixels() {
+        assert_eq!(normalize_touch(0.0, TOUCH_SCREEN_XSIZE), 0);
+        assert_eq!(normalize_touch(0.5, TOUCH_SCREEN_XSIZE), 212);
+        assert_eq!(normalize_touch(1.0, TOUCH_SCREEN_XSIZE), 424);
+        assert_eq!(normalize_touch(0.5, TOUCH_SCREEN_YSIZE), 120);
+        assert_eq!(normalize_touch(1.0, TOUCH_SCREEN_YSIZE), 240);
+        assert_eq!(normalize_touch(f32::NAN, TOUCH_SCREEN_XSIZE), 0);
+        assert_eq!(normalize_touch(f32::INFINITY, TOUCH_SCREEN_YSIZE), 0);
+        assert_eq!(normalize_touch(4.0, TOUCH_SCREEN_XSIZE), 424);
+        assert_eq!(normalize_touch(-1.0, TOUCH_SCREEN_YSIZE), 0);
     }
 
     #[test]

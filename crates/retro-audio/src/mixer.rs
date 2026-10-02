@@ -5,6 +5,19 @@
 //! free or same-sound channel, and every mixed frame is accumulated in `i32`, clamped to
 //! `i16` and emitted as `f32`. Music streams are decoded up front and stepped through with
 //! a fixed-point source cursor so looping matches `ov_pcm_seek(loopPoint)`.
+//!
+//! # Deliberate deviations from upstream
+//!
+//! * When all sixteen voices are busy upstream reads `sfxChannels[-1]` (undefined behaviour);
+//!   this port instead steals channels round-robin starting at slot 0
+//!   ([`Mixer::play_sfx`]).
+//! * Upstream's `ProcessAudioPlayback` clamps `sizeof(mix_buffer)` entries per iteration even
+//!   when only `samples_to_do` were mixed, re-clamping stale accumulator data; this port clamps
+//!   exactly the frames produced by [`Mixer::mix_frame`].
+//! * Upstream has no per-voice volume (`PlaySfx` only sets the loop flag and pan; `sfxVolume`
+//!   scales every voice at mix time). [`Mixer::play_sfx`]'s `volume` argument is a non-upstream
+//!   extension used by the engine; it is applied before the global `sfxVolume` and each step
+//!   truncates toward zero, so a per-voice volume can differ from upstream by a sample unit.
 
 use blake3::Hasher;
 
@@ -131,16 +144,36 @@ impl Mixer {
         }
     }
 
-    /// Sets the music volume as a normalized `0.0..=1.0` value (`SetMusicVolume`/`bgmVolume`
-    /// upstream, where 1.0 maps to `MAX_VOLUME`).
+    /// Sets the music volume as a normalized `0.0..=1.0` value (`bgmVolume` from
+    /// `Settings.ini`, where 1.0 maps to `MAX_VOLUME`).
     pub fn set_stream_volume(&mut self, volume: f32) {
         self.stream_volume = normalized_volume(volume);
     }
 
-    /// Sets the SFX volume as a normalized `0.0..=1.0` value (`SetGameVolumes`/`sfxVolume`
-    /// upstream, where 1.0 maps to `MAX_VOLUME`).
+    /// Sets the SFX volume as a normalized `0.0..=1.0` value (`sfxVolume` from `Settings.ini`,
+    /// where 1.0 maps to `MAX_VOLUME`).
     pub fn set_sfx_volume(&mut self, volume: f32) {
         self.sfx_volume = normalized_volume(volume);
+    }
+
+    /// Sets the music volume directly in upstream `0..=MAX_VOLUME` units (`SetMusicVolume`,
+    /// the script-visible `music.volume`).
+    pub fn set_stream_volume_level(&mut self, volume: u8) {
+        self.stream_volume = volume.min(MAX_VOLUME);
+    }
+
+    /// Sets the SFX volume directly in upstream `0..=MAX_VOLUME` units (`SetGameVolumes`,
+    /// the script-visible `engine.sfxVolume`).
+    pub fn set_sfx_volume_level(&mut self, volume: u8) {
+        self.sfx_volume = volume.min(MAX_VOLUME);
+    }
+
+    /// Current music stream position in source PCM frames (`musicPosition` / `ov_pcm_tell`).
+    ///
+    /// Returns `0` while no stream is playing; a paused stream keeps its position.
+    #[must_use]
+    pub fn stream_position(&self) -> usize {
+        (self.stream_position >> 32) as usize
     }
 
     /// Returns the music volume in upstream `0..=MAX_VOLUME` units.
@@ -902,6 +935,35 @@ mod tests {
             mixer.load_stream(b"RIFF....".to_vec()),
             Err(AudioError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn volume_levels_and_stream_position_are_script_visible() {
+        let mut mixer = Mixer::new();
+        mixer.set_stream_volume_level(40);
+        assert_eq!(mixer.stream_volume(), 40);
+        mixer.set_stream_volume_level(200);
+        assert_eq!(
+            mixer.stream_volume(),
+            MAX_VOLUME,
+            "clamped like SetMusicVolume"
+        );
+        mixer.set_sfx_volume_level(0);
+        assert_eq!(mixer.sfx_volume(), 0);
+        mixer.set_sfx_volume_level(MAX_VOLUME + 1);
+        assert_eq!(mixer.sfx_volume(), MAX_VOLUME);
+
+        assert_eq!(mixer.stream_position(), 0, "no stream playing");
+        let id = mixer.load_stream(TONE.to_vec()).unwrap();
+        mixer.play_stream(id, 0);
+        let mut out = vec![0.0f32; 128];
+        mixer.mix_frame(&mut out, 64);
+        let position = mixer.stream_position();
+        assert!(position > 0, "position {position}");
+        mixer.pause_stream();
+        let paused = mixer.stream_position();
+        mixer.mix_frame(&mut out, 32);
+        assert_eq!(mixer.stream_position(), paused, "pause holds position");
     }
 
     #[test]
