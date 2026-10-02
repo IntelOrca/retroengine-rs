@@ -115,16 +115,49 @@ pub fn backend_for(args: &Args) -> BackendKind {
     }
 }
 
+/// Message emitted when frame-loop flags are passed before the loop is wired.
+pub const FRAME_LOOP_PENDING_NOTICE: &str = "note: the frame loop is not wired until M3; M0 only validates arguments and prints the resolved configuration";
+
+/// Resolved engine startup configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunReport {
+    /// The validated asset folder.
+    pub assets: ResolvedAssets,
+    /// The backend selected for this run.
+    pub backend: BackendKind,
+    /// User-facing notices about features that are not wired up yet.
+    pub notices: Vec<String>,
+}
+
+/// Validates arguments and builds the resolved configuration without running the engine.
+pub fn resolve_run(args: &Args) -> Result<RunReport, EngineError> {
+    let assets = resolve_assets(&args.assets_dir)?;
+    let backend = backend_for(args);
+    let mut notices = Vec::new();
+    if args.headless || args.frames > 0 || args.input.is_some() || args.dump_frames.is_some() {
+        notices.push(FRAME_LOOP_PENDING_NOTICE.to_owned());
+    }
+    Ok(RunReport {
+        assets,
+        backend,
+        notices,
+    })
+}
+
 /// Parses arguments, validates the asset folder and prints the resolved configuration.
 pub fn run(args: &Args) -> Result<(), EngineError> {
-    let resolved = resolve_assets(&args.assets_dir)?;
-    let backend = backend_for(args);
+    let report = resolve_run(args)?;
+    print_report(args, &report);
+    Ok(())
+}
+
+fn print_report(args: &Args, report: &RunReport) {
     println!("retro-engine {}", env!("CARGO_PKG_VERSION"));
-    println!("assets dir: {}", resolved.root.display());
-    println!("game config: {}", resolved.game_config.display());
+    println!("assets dir: {}", report.assets.root.display());
+    println!("game config: {}", report.assets.game_config.display());
     println!("scene: {}", args.scene.as_deref().unwrap_or("<default>"));
     println!("act: {}", args.act);
-    println!("backend: {}", backend.name());
+    println!("backend: {}", report.backend.name());
     if args.frames == 0 {
         println!("frames: unlimited");
     } else {
@@ -140,7 +173,9 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     if let Some(dir) = &args.dump_frames {
         println!("dump frames: {}", dir.display());
     }
-    Ok(())
+    for notice in &report.notices {
+        println!("{notice}");
+    }
 }
 
 #[cfg(test)]
@@ -248,5 +283,48 @@ mod tests {
         .unwrap();
         run(&args).unwrap();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn frame_loop_flags_emit_m3_notice() {
+        let root = temp_assets("notice", true);
+        let base = root.to_str().unwrap();
+        for extra in [
+            vec!["--headless"],
+            vec!["--frames", "3"],
+            vec!["--input", "replay.bin"],
+            vec!["--dump-frames", "out"],
+        ] {
+            let mut argv = vec!["retro-engine", base];
+            argv.extend(extra);
+            let args = Args::try_parse_from(argv).unwrap();
+            let report = resolve_run(&args).unwrap();
+            assert!(
+                report.notices.iter().any(|n| n.contains("M3")),
+                "expected an M3 notice for {args:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plain_validation_run_has_no_notices() {
+        let root = temp_assets("no-notice", true);
+        let args = Args::try_parse_from(["retro-engine", root.to_str().unwrap()]).unwrap();
+        let report = resolve_run(&args).unwrap();
+        assert!(report.notices.is_empty());
+        assert_eq!(report.backend, BackendKind::Sdl3);
+        assert_eq!(report.assets.root, root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_run_rejects_invalid_assets() {
+        let root = std::env::temp_dir().join("retro-engine-cli-resolve-missing");
+        let args = Args::try_parse_from(["retro-engine", root.to_str().unwrap()]).unwrap();
+        assert!(matches!(
+            resolve_run(&args),
+            Err(EngineError::MissingAssets(_))
+        ));
     }
 }
