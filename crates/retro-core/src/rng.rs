@@ -13,6 +13,9 @@ pub struct GlibcRand {
 const DEG: usize = 31;
 const SEP: usize = 3;
 
+/// Number of state words in a [`GlibcRand`] snapshot.
+pub const GLIBC_STATE_WORDS: usize = DEG;
+
 impl GlibcRand {
     /// Seeds the generator exactly like glibc's `srandom`.
     #[must_use]
@@ -51,6 +54,18 @@ impl GlibcRand {
         self.fptr = (self.fptr + 1) % DEG;
         self.rptr = (self.rptr + 1) % DEG;
         (value >> 1) as i32
+    }
+
+    /// Returns the raw feedback state, for hashing and snapshots.
+    #[must_use]
+    pub fn state(&self) -> &[u32; GLIBC_STATE_WORDS] {
+        &self.state
+    }
+
+    /// Returns the `(front, rear)` ring-buffer pointers, for hashing and snapshots.
+    #[must_use]
+    pub fn pointers(&self) -> (usize, usize) {
+        (self.fptr, self.rptr)
     }
 }
 
@@ -158,6 +173,21 @@ mod tests {
             let value = rng.next();
             assert!((0..=i32::MAX).contains(&value));
         }
+    }
+
+    #[test]
+    fn glibc_state_snapshot_tracks_the_stream() {
+        let mut first = GlibcRand::new(7);
+        let mut second = GlibcRand::new(7);
+        assert_eq!(first.state(), second.state());
+        assert_eq!(first.pointers(), second.pointers());
+        let before = *first.state();
+        first.next();
+        assert_ne!(*first.state(), before);
+        assert_ne!(first.state(), second.state());
+        second.next();
+        assert_eq!(first.state(), second.state());
+        assert_eq!(first.pointers(), second.pointers());
     }
 
     #[test]

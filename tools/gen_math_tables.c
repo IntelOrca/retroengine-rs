@@ -8,6 +8,7 @@
 static int sinM7[0x200], cosM7[0x200];
 static int sin512[0x200], cos512[0x200];
 static int sin256[0x100], cos256[0x100];
+static unsigned char arcTan256[0x100 * 0x100];
 
 static void print_array(FILE *f, const char *name, const int *a, int n)
 {
@@ -16,6 +17,17 @@ static void print_array(FILE *f, const char *name, const int *a, int n)
         if (i % 16 == 0)
             fprintf(f, "\n    ");
         fprintf(f, "%d, ", a[i]);
+    }
+    fprintf(f, "\n];\n\n");
+}
+
+static void print_u8_array(FILE *f, const char *name, const unsigned char *a, int n)
+{
+    fprintf(f, "pub static %s: [u8; %d] = [", name, n);
+    for (int i = 0; i < n; ++i) {
+        if (i % 16 == 0)
+            fprintf(f, "\n    ");
+        fprintf(f, "%u, ", (unsigned)a[i]);
     }
     fprintf(f, "\n];\n\n");
 }
@@ -58,6 +70,15 @@ int main(int argc, char **argv)
         cos256[i] = cos512[i * 2] >> 1;
     }
 
+    // `CalculateTrigAngles` in RSDKv4/Math.cpp fills the byte table as
+    // `arcTan256LookupTable[Y + X * 0x100] = atan2f(Y, X) * 40.743664f`.
+    for (int Y = 0; Y < 0x100; ++Y) {
+        for (int X = 0; X < 0x100; ++X) {
+            float angle     = atan2f((float)Y, (float)X);
+            arcTan256[Y + X * 0x100] = (unsigned char)(angle * 40.743664f);
+        }
+    }
+
     FILE *f = fopen(argv[1], "w");
     if (!f) {
         perror(argv[1]);
@@ -71,6 +92,7 @@ int main(int argc, char **argv)
     print_array(f, "COS_512_LOOKUP", cos512, 0x200);
     print_array(f, "SIN_256_LOOKUP", sin256, 0x100);
     print_array(f, "COS_256_LOOKUP", cos256, 0x100);
+    print_u8_array(f, "ARC_TAN_256_LOOKUP", arcTan256, 0x100 * 0x100);
     fclose(f);
     return 0;
 }

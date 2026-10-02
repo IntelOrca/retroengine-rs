@@ -295,6 +295,44 @@ impl Vm {
             .get(function)
             .map(|entry| (entry.code_pos, entry.jump_pos))
             .ok_or(ScriptError::BadFunction)?;
+        self.run(host, entry_code, entry_jump, state, instruction_limit)
+    }
+
+    /// Executes an object-script event by its absolute code/jump table entry points.
+    ///
+    /// This is how the engine runs `ObjectScript` events, which are not part of the function
+    /// table. `code_pos` and `jump_pos` are absolute positions into [`ScriptFile::code`] /
+    /// [`ScriptFile::jump_table`].
+    pub fn call_at(
+        &mut self,
+        host: &mut dyn ScriptHost,
+        code_pos: u32,
+        jump_pos: u32,
+        state: &mut VmState,
+    ) -> Result<(), ScriptError> {
+        self.run(host, code_pos, jump_pos, state, DEFAULT_INSTRUCTION_LIMIT)
+    }
+
+    /// Executes an entry point with an explicit instruction budget.
+    pub fn call_at_with_limit(
+        &mut self,
+        host: &mut dyn ScriptHost,
+        code_pos: u32,
+        jump_pos: u32,
+        state: &mut VmState,
+        instruction_limit: u64,
+    ) -> Result<(), ScriptError> {
+        self.run(host, code_pos, jump_pos, state, instruction_limit)
+    }
+
+    fn run(
+        &mut self,
+        host: &mut dyn ScriptHost,
+        entry_code: u32,
+        entry_jump: u32,
+        state: &mut VmState,
+        instruction_limit: u64,
+    ) -> Result<(), ScriptError> {
         self.validate_entry(entry_code)?;
         self.validate_entry(entry_jump)?;
 
@@ -1549,6 +1587,28 @@ mod tests {
         vm.call(&mut MockHost::default(), 0, &mut state).unwrap();
         assert_eq!(state.temp[0], 22);
         assert_eq!(vm.file().code[23], 5);
+    }
+
+    #[test]
+    fn call_at_runs_an_absolute_object_entry_point() {
+        // Entry at word 6: Add(temp0, 7); End. The words before it are unreachable junk.
+        let mut asm = Asm::default();
+        asm.int(9999);
+        asm.int(9999);
+        asm.int(9999);
+        asm.op("Add").var(0).int(7);
+        asm.op("End");
+        let file = asm.file(Vec::new());
+        let mut vm = Vm::new(file);
+        let mut state = VmState::default();
+        let mut host = MockHost::default();
+        vm.call_at(&mut host, 6, 0, &mut state).unwrap();
+        assert_eq!(state.temp[0], 7);
+
+        assert!(matches!(
+            vm.call_at(&mut host, 9999, 0, &mut state),
+            Err(ScriptError::BadFunction)
+        ));
     }
 
     #[test]

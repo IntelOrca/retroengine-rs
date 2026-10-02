@@ -1,10 +1,23 @@
-//! Command line interface and asset folder validation.
+//! Command line interface for the headless engine.
+//!
+//! M3 runs the real scene loop without rendering: settings/configs/scripts/scenes are loaded,
+//! startup and update events execute at 60 Hz for `--frames` frames (600 by default) and a
+//! BLAKE3 state hash is printed, either once at the end or per frame with
+//! `--hash-every-frame`.
 
-use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::Parser;
-use retro_platform::{BackendKind, PlatformError};
+use retro_io::DirSource;
+use retro_platform::BackendKind;
+
+use crate::EngineError;
+use crate::loader;
+use crate::runtime::Engine;
+
+/// Number of frames run when `--frames` is omitted or `0`.
+pub const DEFAULT_FRAMES: u64 = 600;
 
 /// Command line arguments for the engine binary.
 #[derive(Debug, Parser)]
@@ -16,27 +29,31 @@ use retro_platform::{BackendKind, PlatformError};
 pub struct Args {
     /// Path to an unpacked RSDK asset folder (e.g. assets/S1)
     pub assets_dir: PathBuf,
-    /// Scene to start, e.g. GHZ
+    /// Scene to start: a stage folder (`Zone01`) or a GameConfig scene name
     #[arg(long)]
     pub scene: Option<String>,
-    /// Act number to start
-    #[arg(long, default_value_t = 1)]
-    pub act: u32,
+    /// Act id to start (numeric, or a stage id such as `B`); defaults to the
+    /// GameConfig entry's id
+    #[arg(long)]
+    pub act: Option<String>,
     /// Run without a window using the deterministic headless backend
     #[arg(long)]
     pub headless: bool,
-    /// Number of frames to run (0 means unlimited)
+    /// Number of frames to run (0 means the 600-frame default)
     #[arg(long, default_value_t = 0)]
     pub frames: u64,
-    /// Scripted input file to replay
+    /// Scripted input file to replay (input replay lands in M5; accepted but unused)
     #[arg(long)]
     pub input: Option<PathBuf>,
-    /// Directory to dump presented frames into
+    /// Directory to dump presented frames into (rendering lands in M4; accepted but unused)
     #[arg(long)]
     pub dump_frames: Option<PathBuf>,
     /// RNG seed
     #[arg(long)]
     pub seed: Option<u32>,
+    /// Print one `frame,hash` line per frame instead of only the final hash
+    #[arg(long)]
+    pub hash_every_frame: bool,
 }
 
 /// A validated unpacked asset folder.
@@ -48,45 +65,13 @@ pub struct ResolvedAssets {
     pub game_config: PathBuf,
 }
 
-/// Errors raised while resolving or running the engine.
-#[derive(Debug)]
-pub enum EngineError {
-    /// The assets directory does not exist.
-    MissingAssets(PathBuf),
-    /// The assets directory has no `Data/Game/GameConfig.bin`.
-    MissingGameConfig(PathBuf),
-    /// A platform backend failed.
-    Platform(PlatformError),
-}
-
-impl fmt::Display for EngineError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingAssets(path) => {
-                write!(f, "assets directory does not exist: {}", path.display())
-            }
-            Self::MissingGameConfig(path) => write!(
-                f,
-                "not an unpacked RSDK asset folder, missing: {}",
-                path.display()
-            ),
-            Self::Platform(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for EngineError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Platform(error) => Some(error),
-            _ => None,
-        }
-    }
-}
-
-impl From<PlatformError> for EngineError {
-    fn from(error: PlatformError) -> Self {
-        Self::Platform(error)
+/// Resolves the requested backend.
+#[must_use]
+pub fn backend_for(args: &Args) -> BackendKind {
+    if args.headless {
+        BackendKind::Headless
+    } else {
+        BackendKind::Sdl3
     }
 }
 
@@ -105,77 +90,90 @@ pub fn resolve_assets(root: &Path) -> Result<ResolvedAssets, EngineError> {
     })
 }
 
-/// Resolves the requested backend.
-#[must_use]
-pub fn backend_for(args: &Args) -> BackendKind {
-    if args.headless {
-        BackendKind::Headless
-    } else {
-        BackendKind::Sdl3
-    }
-}
-
-/// Message emitted when frame-loop flags are passed before the loop is wired.
-pub const FRAME_LOOP_PENDING_NOTICE: &str = "note: the frame loop is not wired until M3; M0 only validates arguments and prints the resolved configuration";
-
-/// Resolved engine startup configuration.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RunReport {
-    /// The validated asset folder.
-    pub assets: ResolvedAssets,
-    /// The backend selected for this run.
-    pub backend: BackendKind,
-    /// User-facing notices about features that are not wired up yet.
-    pub notices: Vec<String>,
-}
-
-/// Validates arguments and builds the resolved configuration without running the engine.
-pub fn resolve_run(args: &Args) -> Result<RunReport, EngineError> {
-    let assets = resolve_assets(&args.assets_dir)?;
-    let backend = backend_for(args);
-    let mut notices = Vec::new();
-    if args.headless || args.frames > 0 || args.input.is_some() || args.dump_frames.is_some() {
-        notices.push(FRAME_LOOP_PENDING_NOTICE.to_owned());
-    }
-    Ok(RunReport {
-        assets,
-        backend,
-        notices,
-    })
-}
-
-/// Parses arguments, validates the asset folder and prints the resolved configuration.
+/// Parses arguments, loads the requested scene and runs the headless frame loop.
 pub fn run(args: &Args) -> Result<(), EngineError> {
-    let report = resolve_run(args)?;
-    print_report(args, &report);
+    let assets = resolve_assets(&args.assets_dir)?;
+    let source = DirSource::new(&assets.root)?;
+    let seed = args.seed.unwrap_or(crate::rng::DEFAULT_SEED);
+    let mut engine = Engine::load(
+        Arc::new(source),
+        args.scene.as_deref(),
+        args.act.as_deref(),
+        seed,
+    )?;
+    let (folder, act) = engine.stage_info();
+    let folder = folder.to_owned();
+    let act = act.to_owned();
+
+    println!("retro-engine {}", env!("CARGO_PKG_VERSION"));
+    println!("assets dir: {}", assets.root.display());
+    println!("game config: {}", assets.game_config.display());
+    println!("game: {}", engine.game_title());
+    println!("scene: {folder} act {act}");
+    println!("profile: {}", engine.settings().profile.name());
+    println!("backend: {}", backend_for(args).name());
+    if !args.headless {
+        println!("note: the SDL3 window/present path lands in M4; running the headless loop");
+    }
+    let frames = if args.frames == 0 {
+        DEFAULT_FRAMES
+    } else {
+        args.frames
+    };
+    println!("frames: {frames}");
+    println!("seed: {seed}");
+    if let Some(input) = &args.input {
+        println!(
+            "note: input replay is not wired until M5; {} is ignored (no keys pressed)",
+            input.display()
+        );
+    }
+    if let Some(dir) = &args.dump_frames {
+        println!(
+            "note: frame dumping requires the M4 renderer; {} is ignored",
+            dir.display()
+        );
+    }
+
+    let outcome = engine.run_frames(frames, args.hash_every_frame)?;
+    if args.hash_every_frame {
+        for (frame, hash) in &outcome.frame_hashes {
+            println!("{frame},{hash}");
+        }
+    } else {
+        println!("hash: {}", outcome.final_hash);
+    }
+    report_histograms(&engine);
     Ok(())
 }
 
-fn print_report(args: &Args, report: &RunReport) {
-    println!("retro-engine {}", env!("CARGO_PKG_VERSION"));
-    println!("assets dir: {}", report.assets.root.display());
-    println!("game config: {}", report.assets.game_config.display());
-    println!("scene: {}", args.scene.as_deref().unwrap_or("<default>"));
-    println!("act: {}", args.act);
-    println!("backend: {}", report.backend.name());
-    if args.frames == 0 {
-        println!("frames: unlimited");
+fn report_histograms(engine: &Engine) {
+    let unknown = engine.stub_histogram();
+    let known: Vec<String> = engine
+        .op_histogram()
+        .iter()
+        .filter(|(name, _)| !unknown.contains_key(*name))
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect();
+    println!("ported-ops: {}", known.join(" "));
+    if unknown.is_empty() {
+        println!("stubbed-ops: <none>");
     } else {
-        println!("frames: {}", args.frames);
+        let stubs: Vec<String> = unknown
+            .iter()
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect();
+        println!("stubbed-ops: {}", stubs.join(" "));
     }
-    match args.seed {
-        Some(seed) => println!("seed: {seed}"),
-        None => println!("seed: <random>"),
-    }
-    if let Some(input) = &args.input {
-        println!("input: {}", input.display());
-    }
-    if let Some(dir) = &args.dump_frames {
-        println!("dump frames: {}", dir.display());
-    }
-    for notice in &report.notices {
-        println!("{notice}");
-    }
+}
+
+/// Resolves the scene using the loaded GameConfig (exposed for tests and tooling).
+pub fn resolve_scene_name(
+    game_config: &retro_format_v4::GameConfig,
+    requested: Option<&str>,
+    act: Option<&str>,
+) -> Result<(String, String), EngineError> {
+    loader::resolve_scene(game_config, requested, act)
 }
 
 #[cfg(test)]
@@ -198,10 +196,11 @@ mod tests {
     fn parses_required_assets_dir() {
         let args = Args::try_parse_from(["retro-engine", "/tmp/assets"]).unwrap();
         assert_eq!(args.assets_dir, PathBuf::from("/tmp/assets"));
-        assert_eq!(args.act, 1);
+        assert_eq!(args.act, None);
         assert!(!args.headless);
         assert_eq!(args.frames, 0);
         assert!(args.scene.is_none());
+        assert!(!args.hash_every_frame);
     }
 
     #[test]
@@ -222,15 +221,17 @@ mod tests {
             "out",
             "--seed",
             "7",
+            "--hash-every-frame",
         ])
         .unwrap();
         assert_eq!(args.scene.as_deref(), Some("GHZ"));
-        assert_eq!(args.act, 2);
+        assert_eq!(args.act.as_deref(), Some("2"));
         assert!(args.headless);
         assert_eq!(args.frames, 3);
         assert_eq!(args.input, Some(PathBuf::from("replay.bin")));
         assert_eq!(args.dump_frames, Some(PathBuf::from("out")));
         assert_eq!(args.seed, Some(7));
+        assert!(args.hash_every_frame);
         assert_eq!(backend_for(&args), BackendKind::Headless);
     }
 
@@ -268,63 +269,5 @@ mod tests {
         let root = std::env::temp_dir().join("retro-engine-cli-definitely-missing");
         let error = resolve_assets(&root).unwrap_err();
         assert!(matches!(error, EngineError::MissingAssets(_)));
-    }
-
-    #[test]
-    fn run_prints_and_succeeds() {
-        let root = temp_assets("run", true);
-        let args = Args::try_parse_from([
-            "retro-engine",
-            root.to_str().unwrap(),
-            "--headless",
-            "--frames",
-            "3",
-        ])
-        .unwrap();
-        run(&args).unwrap();
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn frame_loop_flags_emit_m3_notice() {
-        let root = temp_assets("notice", true);
-        let base = root.to_str().unwrap();
-        for extra in [
-            vec!["--headless"],
-            vec!["--frames", "3"],
-            vec!["--input", "replay.bin"],
-            vec!["--dump-frames", "out"],
-        ] {
-            let mut argv = vec!["retro-engine", base];
-            argv.extend(extra);
-            let args = Args::try_parse_from(argv).unwrap();
-            let report = resolve_run(&args).unwrap();
-            assert!(
-                report.notices.iter().any(|n| n.contains("M3")),
-                "expected an M3 notice for {args:?}"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn plain_validation_run_has_no_notices() {
-        let root = temp_assets("no-notice", true);
-        let args = Args::try_parse_from(["retro-engine", root.to_str().unwrap()]).unwrap();
-        let report = resolve_run(&args).unwrap();
-        assert!(report.notices.is_empty());
-        assert_eq!(report.backend, BackendKind::Sdl3);
-        assert_eq!(report.assets.root, root);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn resolve_run_rejects_invalid_assets() {
-        let root = std::env::temp_dir().join("retro-engine-cli-resolve-missing");
-        let args = Args::try_parse_from(["retro-engine", root.to_str().unwrap()]).unwrap();
-        assert!(matches!(
-            resolve_run(&args),
-            Err(EngineError::MissingAssets(_))
-        ));
     }
 }
