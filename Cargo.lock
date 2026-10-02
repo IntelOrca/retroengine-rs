@@ -293,7 +293,14 @@ dependencies = [
  "blake3",
  "clap",
  "retro-core",
+ "retro-format",
+ "retro-format-v4",
+ "retro-io",
  "retro-platform",
+ "retro-scene",
+ "retro-script",
+ "serde",
+ "thiserror",
 ]
 
 [[package]]
@@ -303,6 +310,11 @@ version = "0.1.0"
 [[package]]
 name = "retro-format"
 version = "0.1.0"
+dependencies = [
+ "retro-format-v4",
+ "retro-io",
+ "serde",
+]
 
 [[package]]
 name = "retro-format-v4"
@@ -355,6 +367,11 @@ version = "0.1.0"
 [[package]]
 name = "retro-scene"
 version = "0.1.0"
+dependencies = [
+ "retro-format-v4",
+ "retro-script",
+ "serde",
+]
 
 [[package]]
 name = "retro-script"
