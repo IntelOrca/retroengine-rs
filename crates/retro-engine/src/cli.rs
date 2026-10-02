@@ -18,7 +18,7 @@ use retro_platform::{AudioDesc, BackendKind, FsStorage, Storage, WindowDesc};
 use crate::EngineError;
 use crate::loader;
 use crate::runtime::Engine;
-use crate::save::seed_memory_storage;
+use crate::save::{seed_memory_storage, seed_storage_from_source};
 
 /// Number of frames run when `--frames` is omitted or `0`.
 pub const DEFAULT_FRAMES: u64 = 600;
@@ -67,8 +67,8 @@ pub struct Args {
     /// Disable audio output; mixing and `--audio-hash` output are unchanged
     #[arg(long)]
     pub mute: bool,
-    /// Directory to persist user data (save RAM) in; headless otherwise uses in-memory storage
-    /// seeded from the shipped SData.bin/SGame.bin
+    /// Directory to persist user data (save RAM) in; seeded from the shipped SData.bin/SGame.bin
+    /// on first run. Headless without it uses in-memory storage
     #[arg(long)]
     pub user_dir: Option<PathBuf>,
 }
@@ -109,18 +109,26 @@ pub fn resolve_assets(root: &Path) -> Result<ResolvedAssets, EngineError> {
 
 /// Resolves the user-data storage for this run.
 ///
-/// `--user-dir` always wins. Headless runs otherwise use in-memory storage seeded with the
+/// `--user-dir` always wins. Headless runs without it use in-memory storage seeded with the
 /// shipped `SData.bin`/`SGame.bin` so they stay deterministic and never write files; windowed
-/// runs use the SDL preferred path.
-fn save_storage(args: &Args, source: &Arc<dyn DataSource>) -> Box<dyn Storage> {
+/// runs use the SDL preferred path. Real directory storages are seeded from the asset folder on
+/// first run (when they hold no save yet) so windowed and headless agree.
+fn save_storage(
+    args: &Args,
+    source: &Arc<dyn DataSource>,
+) -> Result<Box<dyn Storage>, EngineError> {
     if let Some(dir) = &args.user_dir {
-        return Box::new(FsStorage::new(dir));
+        let mut storage = FsStorage::new(dir);
+        seed_storage_from_source(&mut storage, source.as_ref())?;
+        return Ok(Box::new(storage));
     }
     if args.headless {
-        return Box::new(seed_memory_storage(source.as_ref()));
+        return Ok(Box::new(seed_memory_storage(source.as_ref())));
     }
     let root = retro_platform::user_data_dir().unwrap_or_else(|| PathBuf::from("retroengine-user"));
-    Box::new(FsStorage::new(root))
+    let mut storage = FsStorage::new(root);
+    seed_storage_from_source(&mut storage, source.as_ref())?;
+    Ok(Box::new(storage))
 }
 
 /// Parses arguments, loads the requested scene and runs the frame loop.
@@ -131,7 +139,7 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
 
     let mut platform = retro_platform::create(backend_for(args))?;
     platform.init()?;
-    let storage = save_storage(args, &source);
+    let storage = save_storage(args, &source)?;
     let mut engine = Engine::load_with(
         Arc::clone(&source),
         args.scene.as_deref(),

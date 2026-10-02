@@ -14,8 +14,9 @@
 //! `WriteSaveRAMData`'s `useSGame` default (`RSDKv4/Userdata.cpp` @ a7f5195).
 //!
 //! The shipped v4 asset trees only contain `SGame.bin`, so they load through the fallback and
-//! write back to `SGame.bin`. Both layouts round-trip byte-exactly because the loaded
-//! [`SaveFileKind`] is preserved.
+//! write back to `SGame.bin`. Full-size files round-trip byte-exactly because the loaded
+//! [`SaveFileKind`] is preserved; writes always emit the full `SAVEDATA_SIZE` image, so a short
+//! loaded file is zero-padded on its next write (upstream's fixed `saveRAM` write).
 //!
 //! # Achievements
 //!
@@ -30,9 +31,9 @@
 
 use retro_format_v4::FormatError;
 use retro_format_v4::userdata::{
-    ACHIEVEMENT_FILE_SLOTS, Achievement, Achievements, SaveFileKind, SaveRam,
+    ACHIEVEMENT_FILE_SLOTS, Achievement, Achievements, SAVE_RAM_BYTES, SaveFileKind, SaveRam,
 };
-use retro_io::DataSource;
+use retro_io::{DataSource, IoError};
 use retro_platform::headless::MemoryStorage;
 use retro_platform::{PlatformError, Storage};
 
@@ -45,6 +46,9 @@ pub enum SaveError {
     /// The storage backend failed.
     #[error("user data storage error: {0}")]
     Storage(#[from] PlatformError),
+    /// The asset source failed while seeding shipped user data.
+    #[error("user data source error: {0}")]
+    Io(#[from] IoError),
     /// An existing user data file could not be parsed.
     #[error("user data format error: {0}")]
     Format(#[from] FormatError),
@@ -107,7 +111,8 @@ impl<S: Storage> SaveStore<S> {
     /// but is malformed (length not a multiple of four, or more than
     /// [`SAVE_RAM_WORDS`](retro_format_v4::userdata::SAVE_RAM_WORDS) words)
     /// returns [`SaveError::Format`] and leaves the previous in-memory state untouched. Short
-    /// files are accepted exactly like the engine's unchecked `fRead`.
+    /// files are accepted exactly like the engine's unchecked `fRead`, with the missing words
+    /// read as zero; writes always persist the full `SAVEDATA_SIZE` bytes.
     pub fn load_save_ram(&mut self) -> Result<bool, SaveError> {
         let (bytes, kind) = if self.storage.exists(SaveRam::MODERN_SAVE_PATH) {
             (
@@ -119,13 +124,15 @@ impl<S: Storage> SaveStore<S> {
         } else {
             self.save_ram = SaveRam::zeroed();
             self.save_kind = SaveFileKind::SData;
-            self.save_persisted = self.save_ram.to_bytes();
+            self.save_persisted = self.padded_save_bytes();
             return Ok(false);
         };
         let ram = SaveRam::from_bytes(&bytes)?;
         self.save_ram = ram;
         self.save_kind = kind;
-        self.save_persisted = bytes;
+        // The persisted form is always the padded 32768-byte image, so a short file does not
+        // leave the store permanently dirty.
+        self.save_persisted = self.padded_save_bytes();
         Ok(true)
     }
 
@@ -149,14 +156,17 @@ impl<S: Storage> SaveStore<S> {
     /// Writes the save RAM back to the file it was loaded from (`SData.bin` when nothing was
     /// loaded, mirroring `useSGame == false`).
     ///
-    /// The bytes are first written to `<path>.tmp` and then renamed over the target. On failure
-    /// the temporary file is removed best-effort and the previous user data is left untouched.
+    /// The full `SAVEDATA_SIZE` image (32768 bytes) is always written, zero-padding a short
+    /// in-memory RAM exactly like upstream's fixed `int saveRAM[SAVEDATA_SIZE]` write
+    /// (`Userdata.cpp:183`). The bytes are first written to `<path>.tmp` and then renamed over
+    /// the target; on failure the temporary file is removed best-effort and the previous user
+    /// data is left untouched.
     pub fn write_save_ram(&mut self) -> Result<(), SaveError> {
         let path = match self.save_kind {
             SaveFileKind::SGame => SaveRam::SAVE_PATH,
             SaveFileKind::SData => SaveRam::MODERN_SAVE_PATH,
         };
-        let bytes = self.save_ram.to_bytes();
+        let bytes = self.padded_save_bytes();
         self.write_atomic(path, &bytes)?;
         self.save_persisted = bytes;
         Ok(())
@@ -220,8 +230,15 @@ impl<S: Storage> SaveStore<S> {
     /// written bytes.
     #[must_use]
     pub fn dirty(&self) -> bool {
-        self.save_ram.to_bytes() != self.save_persisted
+        self.padded_save_bytes() != self.save_persisted
             || self.achievements.to_bytes() != self.achievements_persisted
+    }
+
+    /// The on-disk save image: the in-memory words zero-padded to `SAVEDATA_SIZE * 4` bytes.
+    fn padded_save_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.save_ram.to_bytes();
+        bytes.resize(SAVE_RAM_BYTES, 0);
+        bytes
     }
 
     fn write_atomic(&mut self, path: &str, bytes: &[u8]) -> Result<(), SaveError> {
@@ -267,6 +284,30 @@ pub fn seed_memory_storage(source: &dyn DataSource) -> MemoryStorage {
         }
     }
     storage
+}
+
+/// Copies the shipped save RAM (`SData.bin`/`SGame.bin`) into `storage` when it has none yet.
+///
+/// Windowed runs (SDL pref path) and headless `--user-dir` runs start with an empty directory,
+/// while upstream keeps its saves next to the game data (`gamePath`). Seeding the store on first
+/// run makes those runs agree with the deterministic headless default; an existing save is never
+/// overwritten. Returns whether anything was copied.
+pub fn seed_storage_from_source(
+    storage: &mut dyn Storage,
+    source: &dyn DataSource,
+) -> Result<bool, SaveError> {
+    if storage.exists(SaveRam::MODERN_SAVE_PATH) || storage.exists(SaveRam::SAVE_PATH) {
+        return Ok(false);
+    }
+    let mut copied = false;
+    for path in [SaveRam::MODERN_SAVE_PATH, SaveRam::SAVE_PATH] {
+        if source.exists(path) {
+            let bytes = source.read(path)?;
+            storage.write(path, &bytes)?;
+            copied = true;
+        }
+    }
+    Ok(copied)
 }
 
 /// Engine-facing save RAM: a boxed [`SaveStore`] plus the last storage/format error.
@@ -623,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn short_save_files_round_trip_like_upstream() {
+    fn short_save_files_are_padded_to_savedata_size_on_write() {
         let short = pattern_bytes(3);
         let storage = seeded_storage(SaveRam::SAVE_PATH, &short);
         let mut store = SaveStore::open(storage.clone()).unwrap();
@@ -631,9 +672,25 @@ mod tests {
         assert!(store.load_save_ram().unwrap());
         assert!(!store.save_ram().is_full());
         assert_eq!(store.save_ram().words.len(), 3);
+        assert!(!store.dirty(), "a freshly loaded short file is not dirty");
+
         store.write_save_ram().unwrap();
-        assert_eq!(store.storage.read(SaveRam::SAVE_PATH).unwrap(), short);
+        let written = store.storage.read(SaveRam::SAVE_PATH).unwrap();
+        assert_eq!(
+            written.len(),
+            retro_format_v4::userdata::SAVE_RAM_BYTES,
+            "writes always persist SAVEDATA_SIZE"
+        );
+        assert_eq!(&written[..short.len()], short.as_slice());
+        assert!(written[short.len()..].iter().all(|byte| *byte == 0));
         assert!(!store.dirty());
+
+        // Reloading sees a full zero-padded RAM.
+        let mut reloaded = SaveStore::open(storage).unwrap();
+        assert!(reloaded.load_save_ram().unwrap());
+        assert!(reloaded.save_ram().is_full());
+        assert_eq!(reloaded.save_ram().to_bytes(), written);
+        assert!(!reloaded.dirty());
     }
 
     #[test]
@@ -759,6 +816,37 @@ mod tests {
         );
         assert_eq!(storage.read(SaveRam::SAVE_PATH).unwrap(), pattern_bytes(3));
         assert!(!storage.exists(Achievements::PATH));
+    }
+
+    #[test]
+    fn seed_storage_copies_shipped_save_only_when_empty() {
+        let mut source = retro_io::MemorySource::new();
+        source.insert(SaveRam::SAVE_PATH, pattern_bytes(2));
+
+        let mut storage = MemoryStorage::new();
+        assert!(
+            seed_storage_from_source(&mut storage, &source).unwrap(),
+            "an empty store is seeded"
+        );
+        assert_eq!(storage.read(SaveRam::SAVE_PATH).unwrap(), pattern_bytes(2));
+
+        // A store that already has a save is left untouched.
+        let mut existing = MemoryStorage::new();
+        existing
+            .write(SaveRam::MODERN_SAVE_PATH, &pattern_bytes(5))
+            .unwrap();
+        assert!(!seed_storage_from_source(&mut existing, &source).unwrap());
+        assert_eq!(
+            existing.read(SaveRam::MODERN_SAVE_PATH).unwrap(),
+            pattern_bytes(5)
+        );
+        assert!(!existing.exists(SaveRam::SAVE_PATH));
+
+        // No shipped save means nothing to copy.
+        let empty_source = retro_io::MemorySource::new();
+        let mut untouched = MemoryStorage::new();
+        assert!(!seed_storage_from_source(&mut untouched, &empty_source).unwrap());
+        assert!(untouched.is_empty());
     }
 
     #[test]

@@ -40,6 +40,8 @@ pub const TEXT_DATA_COUNT: usize = 0x2800;
 pub const TEXT_ENTRY_COUNT: usize = 0x200;
 /// Number of font characters upstream keeps (`FONTCHAR_COUNT`).
 pub const FONT_CHAR_COUNT: usize = 0x400;
+/// Number of simultaneous touch points upstream keeps (`touchDown[8]`).
+pub const TOUCH_COUNT: usize = 8;
 
 /// One glyph of the legacy v4 bitmap font (`FontCharacter`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
@@ -428,9 +430,9 @@ impl EngineState {
             music_track: 0,
             menu1_selection: 0,
             menu2_selection: 0,
-            touch_down: vec![0; 4],
-            touch_x: vec![0; 4],
-            touch_y: vec![0; 4],
+            touch_down: vec![0; TOUCH_COUNT],
+            touch_x: vec![0; TOUCH_COUNT],
+            touch_y: vec![0; TOUCH_COUNT],
             animations: Vec::new(),
             animation_ids: BTreeMap::new(),
             animation_sheet_ids: Vec::new(),

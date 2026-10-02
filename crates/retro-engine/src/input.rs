@@ -93,10 +93,27 @@ impl EngineInput {
         self.states = match &mut self.mode {
             InputMode::Null(_) => idle_states(),
             InputMode::Scripted(scripted) => scripted.poll(),
-            InputMode::Platform => std::array::from_fn(|index| {
-                self.mappings
-                    .apply(index as u8, &self.raw.keys, &self.raw.gamepads[index])
-            }),
+            InputMode::Platform => {
+                let mut states = std::array::from_fn(|index| {
+                    self.mappings
+                        .apply(index as u8, &self.raw.keys, &self.raw.gamepads[index])
+                });
+                // Touches are global upstream (`touchDown[8]`); attach the raw points to slot 0,
+                // which `apply_players` aggregates into the engine's touchscreen arrays.
+                let count = usize::from(self.raw.touch_count).min(retro_input::MAX_TOUCHES);
+                let points: Vec<(i16, i16)> = self
+                    .raw
+                    .touches
+                    .iter()
+                    .take(count)
+                    .filter(|touch| touch.down)
+                    .map(|touch| (touch.x, touch.y))
+                    .collect();
+                if let Some(first) = states.first_mut() {
+                    first.set_touches(&points);
+                }
+                states
+            }
         };
         self.states
     }
@@ -350,29 +367,77 @@ select=0x9\n";
         assert!(state.input.button_a);
         assert!(!state.input_press.right);
         assert!(state.input_press.button_a);
-        assert_eq!(state.touch_down, vec![1, 1, 1, 0]);
-        assert_eq!(state.touch_x, vec![10, 30, 50, 0]);
-        assert_eq!(state.touch_y, vec![20, 40, 60, 0]);
+        assert_eq!(state.touch_down, vec![1, 1, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(state.touch_x, vec![10, 30, 50, 0, 0, 0, 0, 0]);
+        assert_eq!(state.touch_y, vec![20, 40, 60, 0, 0, 0, 0, 0]);
 
         // Idle players clear the remaining slots.
         apply_players(&mut state, &idle_states());
-        assert_eq!(state.touch_down, vec![0, 0, 0, 0]);
+        assert_eq!(state.touch_down, vec![0; crate::state::TOUCH_COUNT]);
         assert!(!state.input.right);
     }
 
     #[test]
-    fn touches_are_capped_at_the_engine_slot_count() {
+    fn touches_fill_the_eight_engine_slots_and_are_capped() {
         let mut state = test_state();
         let mut player = InputState::new(0);
         player.set_touches(&[(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)]);
-        let players = [
-            player,
-            InputState::new(1),
-            InputState::new(2),
-            InputState::new(3),
-        ];
+        let mut second = InputState::new(1);
+        second.set_touches(&[(7, 7), (8, 8)]);
+        let mut third = InputState::new(2);
+        third.set_touches(&[(9, 9)]);
+        let players = [player, second, third, InputState::new(3)];
         apply_players(&mut state, &players);
-        assert_eq!(state.touch_down, vec![1, 1, 1, 1]);
-        assert_eq!(state.touch_x, vec![1, 2, 3, 4]);
+        assert_eq!(state.touch_down, vec![1; crate::state::TOUCH_COUNT]);
+        assert_eq!(state.touch_x, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(state.touch_y, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn platform_input_attaches_raw_touches_to_slot_zero() {
+        let mut input = EngineInput::new(&settings());
+        input.set_platform();
+        let mut raw = RawInput {
+            keys: vec![false; retro_input::KEY_COUNT],
+            ..RawInput::default()
+        };
+        raw.touches[0] = retro_input::TouchPoint {
+            down: true,
+            x: 120,
+            y: 80,
+        };
+        raw.touches[1] = retro_input::TouchPoint {
+            down: true,
+            x: 300,
+            y: 200,
+        };
+        raw.touch_count = 2;
+        input.set_raw(raw);
+
+        let states = input.poll();
+        assert_eq!(states[0].touch_count, 2);
+        assert_eq!(
+            states[0].touch(0),
+            Some(retro_input::TouchPoint {
+                down: true,
+                x: 120,
+                y: 80
+            })
+        );
+        assert_eq!(
+            states[0].touch(1),
+            Some(retro_input::TouchPoint {
+                down: true,
+                x: 300,
+                y: 200
+            })
+        );
+        assert_eq!(states[1].touch_count, 0, "touches are global, not per slot");
+
+        let mut state = test_state();
+        apply_players(&mut state, &states);
+        assert_eq!(state.touch_down[..2], [1, 1]);
+        assert_eq!(state.touch_x[..2], [120, 300]);
+        assert_eq!(state.touch_y[..2], [80, 200]);
     }
 }

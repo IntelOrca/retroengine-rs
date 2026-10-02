@@ -127,8 +127,8 @@ impl AudioState {
 
     /// Enables capture of every mixed sample in [`AudioState::captured_pcm`].
     ///
-    /// Capture is only filled on the local-mixer path (no device, or muted with a device): the
-    /// windowed submit path hashes the samples but does not retain them.
+    /// The engine always mixes locally before submitting, so capture works with or without a
+    /// device and with or without muting.
     pub fn set_capture(&mut self, capture: bool) {
         self.capture = capture;
         if !capture {
@@ -165,16 +165,38 @@ impl AudioState {
         &mut self.mixer
     }
 
-    /// Music volume in upstream `0..=100` units.
+    /// Music volume in upstream `0..=100` units (`music.volume`).
     #[must_use]
-    pub fn stream_volume(&self) -> u8 {
+    pub fn music_volume(&self) -> u8 {
         self.mixer.stream_volume()
     }
 
-    /// SFX volume in upstream `0..=100` units.
+    /// Sets the music volume in upstream `0..=100` units (`music.volume` / `SetMusicVolume`).
+    ///
+    /// Upstream keeps `masterVolume` (`music.volume`) and `bgmVolume` (from `Settings.ini`)
+    /// separately and mixes with their product; this port keeps a single stream-volume field, so
+    /// a script write replaces the settings volume instead of scaling it.
+    pub fn set_music_volume_level(&mut self, volume: i32) {
+        self.mixer
+            .set_stream_volume_level(volume.clamp(0, i32::from(MAX_VOLUME)) as u8);
+    }
+
+    /// Music stream position in source PCM frames (`music.position`).
+    #[must_use]
+    pub fn music_position(&self) -> usize {
+        self.mixer.stream_position()
+    }
+
+    /// SFX volume in upstream `0..=100` units (`engine.sfxVolume`).
     #[must_use]
     pub fn sfx_volume(&self) -> u8 {
         self.mixer.sfx_volume()
+    }
+
+    /// Sets the SFX volume in upstream `0..=100` units (`engine.sfxVolume` / `SetGameVolumes`).
+    pub fn set_sfx_volume_level(&mut self, volume: i32) {
+        self.mixer
+            .set_sfx_volume_level(volume.clamp(0, i32::from(MAX_VOLUME)) as u8);
     }
 
     /// Number of SFX slots built from the configs.
@@ -215,14 +237,16 @@ impl AudioState {
 
     /// `PlayMusic`: loads (once) and starts the stream stored on `track`.
     ///
-    /// A track without a file stops the current music, like upstream.
-    pub fn play_music(&mut self, track: i32) {
+    /// A track without a file or whose stream fails to load stops the current music, like
+    /// upstream, and returns `false`. Returns `true` only when a stream actually started, which
+    /// is when upstream sets `trackID`.
+    pub fn play_music(&mut self, track: i32) -> bool {
         let Some(index) = usize::try_from(track)
             .ok()
             .filter(|index| *index < TRACK_COUNT)
         else {
             self.stop_music();
-            return;
+            return false;
         };
         if self
             .tracks
@@ -231,11 +255,11 @@ impl AudioState {
             .is_none()
         {
             self.stop_music();
-            return;
+            return false;
         }
         let Some(id) = self.ensure_stream(index) else {
             self.stop_music();
-            return;
+            return false;
         };
         let info = self.tracks.get(index).cloned().unwrap_or_default();
         if info.looping {
@@ -243,6 +267,7 @@ impl AudioState {
         } else {
             self.mixer.play_stream(id, -1);
         }
+        true
     }
 
     /// `StopMusic`.
@@ -264,13 +289,13 @@ impl AudioState {
     ///
     /// An empty file stops the music; the `ratio` operand is accepted by the host but does not
     /// affect the deterministic mixer.
-    pub fn swap_music_track(&mut self, track: i32, file: &str, loop_point: i32) {
+    pub fn swap_music_track(&mut self, track: i32, file: &str, loop_point: i32) -> bool {
         if file.is_empty() {
             self.stop_music();
-            return;
+            return false;
         }
         self.set_track(track, file, true, loop_point);
-        self.play_music(track);
+        self.play_music(track)
     }
 
     /// `PlaySfx`: loads (once) and starts the sound effect on a voice channel.
@@ -304,34 +329,25 @@ impl AudioState {
         }
     }
 
-    /// Mixes one engine tick and returns the sample hash.
+    /// Mixes one engine tick on the single mixer and returns the sample hash.
     ///
-    /// With a device attached the samples are submitted through [`AudioEngine`] unless muted;
-    /// without one they are mixed locally (and captured when enabled). All paths advance the same
-    /// mixer by [`FRAMES_PER_TICK`] frames and hash the same sample stream.
+    /// With a device attached the mixed samples are submitted through [`AudioEngine`] unless
+    /// muted; the submitted buffer is exactly the hashed buffer, so device playback, `--mute`
+    /// and headless runs all agree.
     pub fn tick(&mut self) -> [u8; 32] {
         self.scratch.resize(FRAMES_PER_TICK * CHANNELS, 0.0);
-        let hash = if let Some(device) = self.device.as_mut() {
-            if self.muted {
-                device
-                    .mixer_mut()
-                    .mix_frame(&mut self.scratch, FRAMES_PER_TICK)
-            } else {
-                match device.tick() {
-                    Ok(hash) => hash,
-                    Err(_) => {
-                        // The device was lost mid-run: fall back to the local mixer so the
-                        // frame loop keeps running; the mixer state is already advanced.
-                        self.device = None;
-                        self.mixer.mix_frame(&mut self.scratch, FRAMES_PER_TICK)
-                    }
-                }
-            }
-        } else {
-            self.mixer.mix_frame(&mut self.scratch, FRAMES_PER_TICK)
-        };
+        // Always mix on the single engine mixer; the device (when attached and unmuted) receives
+        // exactly the buffer that was hashed, so windowed and headless audio are identical.
+        let hash = self.mixer.mix_frame(&mut self.scratch, FRAMES_PER_TICK);
         if self.capture {
             self.captured.extend_from_slice(&self.scratch);
+        }
+        if !self.muted
+            && let Some(device) = self.device.as_mut()
+            && device.submit(&self.scratch).is_err()
+        {
+            // The device was lost mid-run: keep mixing locally for the rest of the frame loop.
+            self.device = None;
         }
         self.last_hash = hash;
         hash
@@ -603,7 +619,100 @@ mod tests {
             &stage_config(Vec::new()),
             &settings,
         );
-        assert_eq!(state.stream_volume(), 50);
+        assert_eq!(state.music_volume(), 50);
         assert_eq!(state.sfx_volume(), 25);
+    }
+
+    #[test]
+    fn music_volume_and_position_are_script_writable() {
+        let (mut state, _) = state_with_sfx();
+        assert_eq!(state.music_volume(), 80, "default streamVolume is 0.8");
+        state.set_music_volume_level(40);
+        assert_eq!(state.music_volume(), 40);
+        state.set_music_volume_level(-5);
+        assert_eq!(state.music_volume(), 0);
+        state.set_music_volume_level(1000);
+        assert_eq!(state.music_volume(), 100);
+        state.set_sfx_volume_level(25);
+        assert_eq!(state.sfx_volume(), 25);
+        assert_eq!(state.music_position(), 0);
+    }
+
+    #[test]
+    fn play_music_reports_whether_the_stream_loaded() {
+        let (mut state, _) = state_with_sfx();
+        state.set_track(0, "Missing.ogg", true, 0);
+        assert!(!state.play_music(0), "a missing stream must report failure");
+        assert!(!state.swap_music_track(1, "Missing.ogg", 0));
+        assert!(state.track_file(0).is_some(), "track metadata is kept");
+    }
+
+    #[test]
+    fn device_attached_output_is_non_silent_and_matches_the_hash() {
+        use retro_platform::headless::HeadlessPlatform;
+        use retro_platform::{AudioDesc, Platform};
+
+        let mut platform = HeadlessPlatform::new();
+        platform.init().unwrap();
+        let device = platform
+            .open_audio(AudioDesc::stereo(SAMPLE_RATE))
+            .expect("headless audio device");
+
+        let (mut local, _) = state_with_sfx();
+        let (mut attached, _) = state_with_sfx();
+        attached.set_device(AudioEngine::new(device).unwrap());
+        for state in [&mut local, &mut attached] {
+            state.play_sfx(0, false);
+            state.set_capture(true);
+        }
+
+        let mut hashes = Vec::new();
+        for _ in 0..4 {
+            let local_hash = local.tick();
+            let attached_hash = attached.tick();
+            assert_eq!(
+                local_hash, attached_hash,
+                "device path must not change the mix"
+            );
+            hashes.push(local_hash);
+        }
+        assert_ne!(hashes[0], [0u8; 32]);
+        assert_eq!(
+            platform.captured_pcm(),
+            attached.captured_pcm(),
+            "the device received exactly the hashed buffer"
+        );
+        assert!(
+            platform.captured_pcm().iter().any(|sample| *sample != 0.0),
+            "device output must be non-silent"
+        );
+        assert_eq!(local.captured_pcm(), attached.captured_pcm());
+    }
+
+    #[test]
+    fn muted_device_receives_nothing_but_hashes_identically() {
+        use retro_platform::headless::HeadlessPlatform;
+        use retro_platform::{AudioDesc, Platform};
+
+        let mut platform = HeadlessPlatform::new();
+        platform.init().unwrap();
+        let device = platform
+            .open_audio(AudioDesc::stereo(SAMPLE_RATE))
+            .expect("headless audio device");
+
+        let (mut local, _) = state_with_sfx();
+        let (mut muted, _) = state_with_sfx();
+        muted.set_device(AudioEngine::new(device).unwrap());
+        muted.set_muted(true);
+        for state in [&mut local, &mut muted] {
+            state.play_sfx(0, false);
+        }
+        for _ in 0..4 {
+            assert_eq!(local.tick(), muted.tick());
+        }
+        assert!(
+            platform.captured_pcm().is_empty(),
+            "muted output must not be submitted"
+        );
     }
 }
