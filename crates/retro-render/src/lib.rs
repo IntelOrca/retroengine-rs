@@ -22,7 +22,9 @@ pub use layers::{
 };
 pub use lookup::LookupTables;
 pub use palette::{ACTIVE_PALETTE, PALETTE_BANKS, PALETTE_COLORS, PaletteState};
-pub use state::{DEFORM_COUNT, RenderState, SURFACE_COUNT, TileSet, new_layers, new_parallax};
+pub use state::{
+    DEFORM_COUNT, DEFORM_STORE, RenderState, SURFACE_COUNT, TileSet, new_layers, new_parallax,
+};
 pub use surface::Surface;
 
 /// `SCREEN_YSIZE`.
@@ -218,6 +220,77 @@ mod tests {
     }
 
     #[test]
+    fn mirrored_scaled_blit_starts_at_the_last_source_pixel() {
+        let palette = two_color_palette();
+        let lookup = LookupTables::new();
+        let surface = Surface::from_indexed(3, 1, vec![1, 2, 3]); // red, green, blue
+        let mut framebuffer = Framebuffer::new(3, 1);
+        canvas(&mut framebuffer, &palette, &lookup)
+            .draw_sprite_scaled(&surface, FLIP_X, 0, 0, 0, 0, 512, 512, 3, 1, 0, 0);
+        assert_eq!(framebuffer.get(0, 0), 0x001F, "mirrored run starts at blue");
+        assert_eq!(framebuffer.get(1, 0), 0x07E0);
+        assert_eq!(framebuffer.get(2, 0), 0xF800);
+    }
+
+    #[test]
+    fn mirrored_scaled_tint_mask_starts_at_the_last_source_pixel() {
+        let palette = two_color_palette();
+        let lookup = LookupTables::new();
+        let surface = Surface::from_indexed(3, 1, vec![1, 0, 1]); // opaque, transparent, opaque
+        let mut framebuffer = Framebuffer::new(3, 1);
+        framebuffer.clear(0xF800);
+        canvas(&mut framebuffer, &palette, &lookup)
+            .draw_scaled_tint_mask(&surface, FLIP_X, 0, 0, 0, 0, 512, 512, 3, 1, 0, 0);
+        // Mirrored cursor starts at index 2 (opaque), then 1 (transparent), then 0 (opaque).
+        assert_eq!(framebuffer.get(0, 0), lookup.tint(0xF800));
+        assert_eq!(framebuffer.get(1, 0), 0xF800, "transparent middle stays");
+        assert_eq!(framebuffer.get(2, 0), lookup.tint(0xF800));
+    }
+
+    #[test]
+    fn rotated_blit_uses_power_of_two_row_stride() {
+        let mut palette = PaletteState::new();
+        for index in 1..=9u8 {
+            palette.set_entry(0, usize::from(index), index * 20, 0, 0);
+        }
+        let lookup = LookupTables::new();
+        let surface = Surface::from_indexed(3, 3, (1..=9).collect());
+        let mut framebuffer = Framebuffer::new(3, 3);
+        canvas(&mut framebuffer, &palette, &lookup)
+            .draw_sprite_rotated(&surface, FLIP_NONE, 0, 0, 0, 0, 0, 0, 3, 3, 0);
+        let color = |index: u8| rgb888_to_rgb565(index * 20, 0, 0);
+        // `width_shift` for a 3-wide surface is 1, so row 1 samples offset 1<<1 = 2, not 3.
+        assert_eq!(framebuffer.get(0, 0), color(1));
+        assert_eq!(framebuffer.get(2, 0), color(3));
+        assert_eq!(framebuffer.get(0, 1), color(3));
+        assert_eq!(framebuffer.get(1, 1), color(4));
+        assert_eq!(framebuffer.get(2, 2), color(7));
+    }
+
+    #[test]
+    fn dimming_matches_the_flip_screen_state_machine() {
+        let mut render = RenderState::new(4, 4);
+        assert_eq!(
+            render.dim_limit, -1,
+            "display dimming is disabled by default"
+        );
+        assert_eq!(render.dim_amount(), 1.0);
+
+        render.dim_timer = 0;
+        render.dim_limit = 100;
+        render.dim_percent = 0.5;
+        render.process_dimming();
+        assert!((render.dim_percent - 0.55).abs() < 1e-6);
+
+        render.dim_timer = 200;
+        render.dim_percent = 0.5;
+        render.process_dimming();
+        assert!((render.dim_percent - 0.45).abs() < 1e-6);
+        render.dim_max = 0.5;
+        assert!((render.dim_amount() - 0.225).abs() < 1e-6);
+    }
+
+    #[test]
     fn clear_screen_uses_active_palette_index() {
         let palette = two_color_palette();
         let lookup = LookupTables::new();
@@ -377,6 +450,49 @@ mod tests {
         for y in 0..16 {
             assert_eq!(render.framebuffer.get(0, y), 0xF800, "y={y}");
             assert_eq!(render.framebuffer.get(1, y), 0, "second column stays blank");
+        }
+    }
+
+    #[test]
+    fn vertical_layer_first_partial_tile_uses_the_sub_tile_row() {
+        let palette = two_color_palette();
+        let mut render = RenderState::new(2, 32);
+        render.palette = palette;
+        // Column 0 is index 1 (red) at tile row 5 and index 2 (green) everywhere else.
+        let mut pixels = vec![0u8; TILE_SET_16_SIZE];
+        for row in 0..16 {
+            pixels[row * 16] = if row == 5 { 1 } else { 2 };
+        }
+        render.tiles.pixels = pixels;
+        render.tiles.chunks = vec![ChunkEntry::default(); 64];
+        let mut layer = LayerState {
+            xsize: 1,
+            ysize: 1,
+            layer_type: LAYER_VSCROLL,
+            ..LayerState::default()
+        };
+        layer.set_entry(0, 0, 0);
+        let mut parallax = ParallaxState::default();
+        layers::draw_v_line_scroll_layer(
+            &mut render,
+            &mut layer,
+            &mut parallax,
+            LayerView {
+                is_background: false,
+                above_mid_point: false,
+                x_scroll_offset: 0,
+                y_scroll_offset: 53,
+            },
+        );
+        // tileY = 53 & 0xF = 5, so the first 11 screen rows sample tile rows 5..15:
+        // screen row 0 is tile row 5 (index 1 = red), screen rows 1..10 are index 2 (green).
+        assert_eq!(
+            render.framebuffer.get(0, 0),
+            0xF800,
+            "screen row 0 samples sub-tile row 5"
+        );
+        for y in 1..11 {
+            assert_eq!(render.framebuffer.get(0, y), 0x07E0, "y={y}");
         }
     }
 }

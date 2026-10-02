@@ -278,6 +278,9 @@ impl Canvas<'_> {
         let mut cursor = cursor;
         let mut rounded_y_pos = rounded_y_pos;
         if direction == FLIP_X {
+            // Upstream starts the mirrored cursor at `widthM1` into the source row
+            // (`Drawing.cpp:3157`).
+            cursor = cursor.wrapping_add(width_m1);
             let mut gfx_pitch = 0i32;
             for row in 0..height {
                 let colors = self.palette.line_colors((true_y_pos + row) as usize);
@@ -304,7 +307,6 @@ impl Canvas<'_> {
                 gfx_pitch = 0;
             }
         } else {
-            let _ = width_m1;
             let mut gfx_pitch = 0i32;
             for row in 0..height {
                 let colors = self.palette.line_colors((true_y_pos + row) as usize);
@@ -376,13 +378,16 @@ impl Canvas<'_> {
             final_scale_y,
             rounded_x_pos,
             rounded_y_pos,
-            width_m1: _,
+            width_m1,
             cursor,
         } = scaled;
         let surface_width = surface.width;
         let mut cursor = cursor;
         let mut rounded_y_pos = rounded_y_pos;
         if direction == FLIP_X {
+            // Upstream starts the mirrored cursor at `widthM1` into the source row
+            // (`Drawing.cpp:2848`).
+            cursor = cursor.wrapping_add(width_m1);
             let mut gfx_pitch = 0i32;
             for row in 0..height {
                 let mut round_x_pos = rounded_x_pos;
@@ -591,7 +596,7 @@ impl Canvas<'_> {
                         && final_y > shift_height
                         && final_y < full_height
                     {
-                        let index = surface.pixel(final_x >> 9, final_y >> 9);
+                        let index = rotated_pixel(surface, final_x, final_y);
                         if index > 0 {
                             self.framebuffer.set(
                                 left + column,
@@ -624,7 +629,7 @@ impl Canvas<'_> {
                         && final_y > shift_height
                         && final_y < full_height
                     {
-                        let index = surface.pixel(final_x >> 9, final_y >> 9);
+                        let index = rotated_pixel(surface, final_x, final_y);
                         if index > 0 {
                             self.framebuffer.set(
                                 left + column,
@@ -727,7 +732,7 @@ impl Canvas<'_> {
                         && final_y > shift_height
                         && final_y < full_height
                     {
-                        let index = surface.pixel(final_x >> 9, final_y >> 9);
+                        let index = rotated_pixel(surface, final_x, final_y);
                         if index > 0 {
                             self.framebuffer.set(
                                 left + column,
@@ -760,7 +765,7 @@ impl Canvas<'_> {
                         && final_y > shift_height
                         && final_y < full_height
                     {
-                        let index = surface.pixel(final_x >> 9, final_y >> 9);
+                        let index = rotated_pixel(surface, final_x, final_y);
                         if index > 0 {
                             self.framebuffer.set(
                                 left + column,
@@ -1192,6 +1197,18 @@ fn rotated_bounds(
         .unwrap_or(0)
         .min(screen_height);
     (left, right, top, bottom)
+}
+
+/// Samples the rotated/rotozoom source cursor with upstream's row stride
+/// `(y << surface.width_shift) + x` (`Drawing.cpp:3362`), i.e. the rounded-down power-of-two
+/// width from `Surface::width_shift`, not the exact surface width.
+fn rotated_pixel(surface: &Surface, final_x: i32, final_y: i32) -> u8 {
+    let x = final_x >> 9;
+    let y = final_y >> 9;
+    let offset = y
+        .wrapping_shl(surface.width_shift.max(0) as u32)
+        .wrapping_add(x);
+    surface.pixel_at_offset(offset)
 }
 
 /// Blends one framebuffer pixel with a source colour through the blend table.

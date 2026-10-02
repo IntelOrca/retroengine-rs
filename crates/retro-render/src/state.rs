@@ -10,8 +10,10 @@ use crate::surface::Surface;
 
 /// Maximum number of resident sprite sheets (`SURFACE_COUNT`).
 pub const SURFACE_COUNT: usize = 24;
+/// Number of deformation entries kept before the mirrored tail (`DEFORM_STORE`).
+pub const DEFORM_STORE: usize = 0x100;
 /// Size of one deformation table (`DEFORM_COUNT`).
-pub const DEFORM_COUNT: usize = 0x100 + 320;
+pub const DEFORM_COUNT: usize = DEFORM_STORE + 320;
 
 /// The 128x128 chunk metadata (`tiles128x128`) plus the normalized 16x16 indexed tileset.
 #[derive(Clone, Default)]
@@ -54,7 +56,9 @@ pub struct RenderState {
     pub fade_a: u16,
     /// Display-only dim timer (`Engine.dimTimer`).
     pub dim_timer: i32,
-    /// Display-only dim limit (`Engine.dimLimit`).
+    /// Display-only dim limit (`Engine.dimLimit`). Defaults to `-1` (disabled): the decomps'
+    /// zero default would decay `dim_percent` to 25% as a display-only overlay, which the
+    /// original-code builds do not do. Natives/mods may set it to enable dimming.
     pub dim_limit: i32,
     /// Display-only dim max (`Engine.dimMax`).
     pub dim_max: f32,
@@ -89,7 +93,7 @@ impl RenderState {
             fade_b: 0,
             fade_a: 0,
             dim_timer: 0,
-            dim_limit: 0,
+            dim_limit: -1,
             dim_max: 1.0,
             dim_percent: 1.0,
         }

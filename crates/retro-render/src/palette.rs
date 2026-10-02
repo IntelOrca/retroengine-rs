@@ -12,8 +12,17 @@ use crate::framebuffer::rgb888_to_rgb565;
 pub const PALETTE_BANKS: usize = 0x8;
 /// Number of colours per bank (`PALETTE_COLOR_COUNT`).
 pub const PALETTE_COLORS: usize = 0x100;
-/// Sentinel palette id meaning "the active bank" (`-1` in upstream).
+/// Sentinel palette id meaning "the active bank" (`-1`; upstream's `byte` parameter makes
+/// `0xFF` equivalent, so both are accepted).
 pub const ACTIVE_PALETTE: i32 = -1;
+/// The byte-truncated form of [`ACTIVE_PALETTE`], as produced by the script ops.
+pub const ACTIVE_PALETTE_BYTE: i32 = 0xFF;
+
+/// Whether a palette id selects the active bank (`-1` or its byte truncation `0xFF`).
+#[must_use]
+pub const fn is_active_palette(palette_index: i32) -> bool {
+    palette_index == ACTIVE_PALETTE || palette_index == ACTIVE_PALETTE_BYTE
+}
 
 /// Eight RGB565/RGB888 palette banks plus the per-line bank selection.
 #[derive(Clone)]
@@ -43,7 +52,7 @@ impl PaletteState {
         if index >= PALETTE_COLORS {
             return;
         }
-        if palette_index == ACTIVE_PALETTE {
+        if is_active_palette(palette_index) {
             let bank = usize::from(self.line_buffer.first().copied().unwrap_or(0));
             self.set_bank_entry(bank, index, r, g, b);
         } else if let Ok(bank) = usize::try_from(palette_index) {
@@ -86,7 +95,7 @@ impl PaletteState {
     /// Resolves a palette id (`-1` means active) to a bank index.
     #[must_use]
     pub fn bank(&self, palette_index: i32) -> Option<usize> {
-        let bank = if palette_index == ACTIVE_PALETTE {
+        let bank = if is_active_palette(palette_index) {
             i32::from(self.line_buffer.first().copied().unwrap_or(0))
         } else {
             palette_index
@@ -263,6 +272,22 @@ mod tests {
         assert_eq!(palette.rgb[3][5], [255, 0, 0]);
         assert_eq!(palette.rgb565[3][5], 0xF800);
         assert_eq!(palette.rgb[0][5], [0, 0, 0]);
+    }
+
+    #[test]
+    fn active_palette_sentinel_accepts_minus_one_and_ff() {
+        let mut palette = PaletteState::new();
+        palette.set_active_palette(4, 0, SCREEN_HEIGHT as i32);
+        palette.set_entry(ACTIVE_PALETTE, 1, 1, 2, 3);
+        palette.set_entry(ACTIVE_PALETTE_BYTE, 2, 4, 5, 6);
+        palette.set_entry_packed(ACTIVE_PALETTE_BYTE, 3, 0x0A_0B_0C);
+        assert_eq!(palette.rgb[4][1], [1, 2, 3]);
+        assert_eq!(palette.rgb[4][2], [4, 5, 6]);
+        assert_eq!(palette.get_entry_packed(ACTIVE_PALETTE, 3), 0x0A_0B_0C);
+        assert_eq!(palette.get_entry_packed(ACTIVE_PALETTE_BYTE, 3), 0x0A_0B_0C);
+        assert!(palette.get_entry_packed(5, 1) == 0, "bank 5 stays empty");
+        assert_eq!(palette.bank(ACTIVE_PALETTE_BYTE), Some(4));
+        assert_eq!(palette.bank(ACTIVE_PALETTE), Some(4));
     }
 
     #[test]

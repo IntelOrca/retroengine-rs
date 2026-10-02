@@ -183,20 +183,29 @@ fn chunk_entry(render: &RenderState, chunk: i32) -> Option<ChunkEntry> {
 }
 
 /// A vertical run of tile pixels: draws `count` pixels down a column.
+///
+/// `tile_y` is the row the run starts at within the 16x16 tile. Upstream only folds it into
+/// the first partial tile of a column (`Drawing.cpp:2046-2082`); the bulk and remaining runs
+/// pass `0`, matching `TILE_SIZE * tileY` with `tileY == 0`.
 #[allow(clippy::too_many_arguments)]
 fn draw_tile_column(
     render: &mut RenderState,
     entry: ChunkEntry,
     tile_x16: i32,
+    tile_y: i32,
     out_col: i32,
     out_row: i32,
     count: i32,
 ) {
+    let row_offset = 16i32.wrapping_mul(tile_y);
     let (base, step) = match entry.direction {
-        FLIP_X => (0xF - tile_x16, 16),
-        FLIP_Y => (tile_x16 + render.framebuffer.height() as i32, -16),
-        FLIP_XY => (0xFF - tile_x16, -16),
-        _ => (tile_x16, 16),
+        FLIP_X => (row_offset + 0xF - tile_x16, 16),
+        FLIP_Y => (
+            tile_x16 + render.framebuffer.height() as i32 - row_offset,
+            -16,
+        ),
+        FLIP_XY => (0xFF - tile_x16 - row_offset, -16),
+        _ => (row_offset + tile_x16, 16),
     };
     let mut cursor = entry.gfx_data_pos.wrapping_add(base);
     let colors: [u16; 256] = *render.palette.line_colors(0);
@@ -317,7 +326,15 @@ pub fn draw_v_line_scroll_layer(
         // First (partial) tile of the column.
         let entry = chunk_entry(render, chunk);
         if let Some(entry) = entry.filter(|entry| entry.visual_plane == above) {
-            draw_tile_column(render, entry, tile_x16, out_col, out_row, first_count);
+            draw_tile_column(
+                render,
+                entry,
+                tile_x16,
+                tile_y,
+                out_col,
+                out_row,
+                first_count,
+            );
         }
         out_row += first_count;
         line_remain -= first_count;
@@ -340,7 +357,7 @@ pub fn draw_v_line_scroll_layer(
             line_remain -= 16;
             let entry = chunk_entry(render, chunk);
             if let Some(entry) = entry.filter(|entry| entry.visual_plane == above) {
-                draw_tile_column(render, entry, tile_x16, out_col, out_row, 16);
+                draw_tile_column(render, entry, tile_x16, 0, out_col, out_row, 16);
             }
             out_row += 16;
             chunk_tile_y += 1;
@@ -364,7 +381,7 @@ pub fn draw_v_line_scroll_layer(
             line_remain -= count;
             let entry = chunk_entry(render, chunk);
             if let Some(entry) = entry.filter(|entry| entry.visual_plane == above) {
-                draw_tile_column(render, entry, tile_x16, out_col, out_row, count);
+                draw_tile_column(render, entry, tile_x16, 0, out_col, out_row, count);
             }
             out_row += count;
         }
