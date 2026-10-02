@@ -12,3 +12,6 @@ SGame.bin
 .idea/
 .vscode/
 *.swp
+
+# Fetched upstream reference sources and binaries for the script oracle.
+tools/script-oracle/.build/
