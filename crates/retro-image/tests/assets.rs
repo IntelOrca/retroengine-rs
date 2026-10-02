@@ -18,6 +18,24 @@ fn palette_bytes(palette: &[[u8; 3]]) -> Vec<u8> {
     palette.iter().flatten().copied().collect()
 }
 
+fn collect_gifs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", dir.display()))
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            collect_gifs(&path, out);
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"))
+        {
+            out.push(path);
+        }
+    }
+}
+
 fn decode_asset(relative: &str) -> retro_image::GifImage {
     let path = format!("{ASSET_ROOT}/{relative}");
     let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("cannot read {path}: {error}"));
@@ -46,6 +64,41 @@ fn check(
     assert_eq!(image.palette.len(), palette_len);
     assert_eq!(blake3_hex(&image.pixels), pixels_hash);
     assert_eq!(blake3_hex(&palette_bytes(&image.palette)), palette_hash);
+}
+
+#[test]
+#[ignore = "requires local Sonic 1/2 asset trees"]
+fn all_corpus_gifs_decode() {
+    let mut paths = Vec::new();
+    for game in ["S1", "S2"] {
+        collect_gifs(
+            &std::path::Path::new(ASSET_ROOT).join(game).join("Data"),
+            &mut paths,
+        );
+    }
+    paths.sort();
+    for path in &paths {
+        let bytes = std::fs::read(path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+        let image = decode_gif(&bytes)
+            .unwrap_or_else(|error| panic!("cannot decode {}: {error}", path.display()));
+        assert!(
+            image.width > 0 && image.height > 0,
+            "{} has zero dimensions",
+            path.display()
+        );
+        assert_eq!(
+            image.pixels.len(),
+            image.width as usize * image.height as usize,
+            "{} pixel count mismatch",
+            path.display()
+        );
+    }
+    println!(
+        "decoded {} GIFs under {ASSET_ROOT}/S1/Data and {ASSET_ROOT}/S2/Data",
+        paths.len()
+    );
+    assert_eq!(paths.len(), 158, "expected the full 158-file S1+S2 corpus");
 }
 
 #[test]
