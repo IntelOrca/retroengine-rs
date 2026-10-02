@@ -259,3 +259,11 @@ pub fn sdl3_init_count() -> usize {
         0
     }
 }
+
+/// Serializes tests that observe or mutate the process-wide SDL initialization state.
+#[cfg(test)]
+pub(crate) fn platform_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}

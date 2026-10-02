@@ -13,9 +13,6 @@ workspace = true
 default = ["sdl3"]
 sdl3 = ["dep:sdl3", "dep:sdl3-sys"]
 
-[dependencies]
-retro-core.workspace = true
-
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 sdl3 = { workspace = true, optional = true, features = [
     "build-from-source-static",

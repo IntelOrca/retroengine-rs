@@ -26,15 +26,19 @@ pub fn init_count() -> usize {
 }
 
 /// SDL3 platform backend.
+///
+/// `init` initializes SDL's core and the event pump only; the video and audio subsystems are
+/// initialized on demand by `create_window` and `open_audio`, so `init` succeeds on machines
+/// without a display or sound device. All SDL handles are owned and released by `shutdown`,
+/// which lets the last `Sdl` handle drop and therefore run `SDL_Quit`, making
+/// `init -> shutdown -> init` safe. Windows and audio devices returned by this backend do not
+/// borrow from the platform, but callers must drop them before calling `shutdown`.
 pub struct Sdl3Platform {
     initialized: bool,
-    sdl: Option<&'static ::sdl3::Sdl>,
-    video: Option<&'static ::sdl3::VideoSubsystem>,
-    audio: Option<::sdl3::AudioSubsystem>,
-    quit: Arc<AtomicBool>,
     input: Sdl3Input,
     storage: FsStorage,
     clock: SystemClock,
+    sdl: Option<::sdl3::Sdl>,
 }
 
 impl Sdl3Platform {
@@ -44,10 +48,6 @@ impl Sdl3Platform {
         let quit = Arc::new(AtomicBool::new(false));
         Self {
             initialized: false,
-            sdl: None,
-            video: None,
-            audio: None,
-            quit: quit.clone(),
             input: Sdl3Input {
                 events: None,
                 gamepads: Vec::new(),
@@ -56,6 +56,7 @@ impl Sdl3Platform {
             },
             storage: FsStorage::new("retroengine-user"),
             clock: SystemClock::new(),
+            sdl: None,
         }
     }
 
@@ -81,10 +82,6 @@ impl Platform for Sdl3Platform {
             return Ok(());
         }
         let sdl = ::sdl3::init().map_err(PlatformError::sdl)?;
-        let sdl: &'static ::sdl3::Sdl = Box::leak(Box::new(sdl));
-        let video = sdl.video().map_err(PlatformError::sdl)?;
-        let video: &'static ::sdl3::VideoSubsystem = Box::leak(Box::new(video));
-        self.audio = Some(sdl.audio().map_err(PlatformError::sdl)?);
         self.input.events = Some(sdl.event_pump().map_err(PlatformError::sdl)?);
         if let Ok(gamepad) = sdl.gamepad() {
             for id in gamepad.gamepads().unwrap_or_default() {
@@ -94,7 +91,6 @@ impl Platform for Sdl3Platform {
             }
         }
         self.sdl = Some(sdl);
-        self.video = Some(video);
         SDL3_INIT_COUNT.fetch_add(1, Ordering::Relaxed);
         self.initialized = true;
         Ok(())
@@ -103,8 +99,6 @@ impl Platform for Sdl3Platform {
     fn shutdown(&mut self) -> Result<(), PlatformError> {
         self.input.events = None;
         self.input.gamepads.clear();
-        self.audio = None;
-        self.video = None;
         self.sdl = None;
         self.initialized = false;
         Ok(())
@@ -115,12 +109,13 @@ impl Platform for Sdl3Platform {
     }
 
     fn create_window(&mut self, desc: WindowDesc) -> Result<Box<dyn Window>, PlatformError> {
-        let video = self.video.ok_or(PlatformError::NotInitialized)?;
+        let sdl = self.sdl.as_ref().ok_or(PlatformError::NotInitialized)?;
         if desc.width == 0 || desc.height == 0 {
             return Err(PlatformError::InvalidArgument(
                 "window dimensions must be non-zero".to_owned(),
             ));
         }
+        let video = sdl.video().map_err(PlatformError::sdl)?;
         let window = video
             .window(&desc.title, desc.width, desc.height)
             .position_centered()
@@ -164,17 +159,18 @@ impl Platform for Sdl3Platform {
             texture,
             width: desc.width,
             height: desc.height,
-            quit: self.quit.clone(),
+            quit: self.input.quit.clone(),
         }))
     }
 
     fn open_audio(&mut self, desc: AudioDesc) -> Result<Box<dyn AudioDevice>, PlatformError> {
-        let audio = self.audio.as_ref().ok_or(PlatformError::NotInitialized)?;
+        let sdl = self.sdl.as_ref().ok_or(PlatformError::NotInitialized)?;
         if desc.channels != 2 {
             return Err(PlatformError::InvalidArgument(
                 "SDL3 audio output is stereo only".to_owned(),
             ));
         }
+        let audio = sdl.audio().map_err(PlatformError::sdl)?;
         let spec = AudioSpec {
             freq: Some(desc.sample_rate as i32),
             channels: Some(desc.channels as i32),
@@ -505,5 +501,32 @@ mod tests {
         storage.remove("nested/save.dat").unwrap();
         assert!(!storage.exists("nested/save.dat"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sdl3_lifecycle_init_shutdown_reinit() {
+        let _guard = crate::platform_test_lock();
+        let before = init_count();
+        let mut platform = Sdl3Platform::new();
+        assert!(!platform.is_initialized());
+
+        platform.init().unwrap();
+        assert!(platform.is_initialized());
+        platform.shutdown().unwrap();
+        assert!(!platform.is_initialized());
+
+        platform.init().unwrap();
+        assert!(platform.is_initialized());
+        platform.shutdown().unwrap();
+        assert!(!platform.is_initialized());
+        assert_eq!(init_count(), before + 2);
+    }
+
+    #[test]
+    fn sdl3_shutdown_without_init_is_safe() {
+        let _guard = crate::platform_test_lock();
+        let mut platform = Sdl3Platform::new();
+        platform.shutdown().unwrap();
+        assert!(!platform.is_initialized());
     }
 }

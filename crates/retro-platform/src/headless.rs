@@ -464,6 +464,8 @@ mod tests {
 
     #[test]
     fn headless_does_not_initialize_sdl() {
+        let _guard = crate::platform_test_lock();
+        let before = crate::sdl3_init_count();
         let mut platform = make_platform();
         let mut window = platform
             .create_window(WindowDesc::new("test", 2, 2))
@@ -471,6 +473,6 @@ mod tests {
         window.present(&[1, 2, 3, 4], 2, 2).unwrap();
         platform.clock().advance_frame();
         let _ = platform.input().poll();
-        assert_eq!(crate::sdl3_init_count(), 0);
+        assert_eq!(crate::sdl3_init_count(), before);
     }
 }
