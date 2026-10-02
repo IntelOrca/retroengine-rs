@@ -17,8 +17,10 @@ use retro_scene::{
     StageState, TYPEGROUP_COUNT, TypeGroupList,
 };
 
+use crate::audio::AudioState;
 use crate::profile::EngineSettings;
 use crate::rng::GlibcRand;
+use crate::save::SaveState;
 
 /// Number of tile layers upstream keeps (`LAYER_COUNT`).
 pub const LAYER_COUNT: usize = 9;
@@ -266,6 +268,10 @@ pub struct EngineState {
     pub input: InputState,
     /// Key-press input state.
     pub input_press: InputState,
+    /// SFX/music tables, lazy asset loading and the output device.
+    pub audio: AudioState,
+    /// Persistent save RAM and the backing storage.
+    pub save: SaveState,
     /// Currently playing music track id.
     pub music_track: i32,
     /// `menu1.selection`.
@@ -417,6 +423,8 @@ impl EngineState {
             object_borders: [0x80, 424 + 0x80, 0x20, 424 + 0x20],
             input: InputState::default(),
             input_press: InputState::default(),
+            audio: AudioState::empty(),
+            save: SaveState::in_memory(),
             music_track: 0,
             menu1_selection: 0,
             menu2_selection: 0,

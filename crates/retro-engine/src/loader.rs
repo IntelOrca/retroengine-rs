@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use retro_format::{DataVersion, detect};
 use retro_format_v4::{
-    Achievements, Backgrounds, CollisionMasks, GameConfig, Scene, StageConfig, TileSheet16,
-    TileSheet128,
+    Achievements, Backgrounds, CollisionMasks, GameConfig, Scene, Settings, StageConfig,
+    TileSheet16, TileSheet128,
 };
 use retro_io::DataSource;
 use retro_scene::strip_spaces;
@@ -49,6 +49,8 @@ pub struct LoadedScripts {
 pub struct LoadedWorld {
     /// Resolved settings.
     pub settings: EngineSettings,
+    /// Parsed `Settings.ini`, kept for the input mappings and audio volumes.
+    pub raw_settings: Settings,
     /// Parsed `GameConfig.bin`.
     pub game_config: GameConfig,
     /// Stage folder (`Zone01`).
@@ -339,6 +341,7 @@ pub fn load_world(
     let scripts = load_scripts(source.as_ref(), &game_config, &stage_config, &settings)?;
     Ok(LoadedWorld {
         settings,
+        raw_settings: detected.settings,
         game_config,
         stage_folder: folder,
         act,

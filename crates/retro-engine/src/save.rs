@@ -7,14 +7,15 @@
 //! # Save RAM
 //!
 //! The canonical file is `SAVE_RAM_WORDS * 4 = 32768` bytes. [`SaveStore::load_save_ram`] reads
-//! [`SaveRam::SAVE_PATH`] (`SGame.bin`) and falls back to [`SaveRam::MODERN_SAVE_PATH`]
-//! (`SData.bin`), remembering which file was used so [`SaveStore::write_save_ram`] updates that
-//! same file (defaulting to `SGame.bin` when nothing was loaded). When neither file exists it
-//! leaves a full zeroed RAM and reports `Ok(false)`, mirroring upstream `ReadSaveRAMData`.
+//! [`SaveRam::MODERN_SAVE_PATH`] (`SData.bin`) first and falls back to [`SaveRam::SAVE_PATH`]
+//! (`SGame.bin`), remembering which file was used so [`SaveStore::write_save_ram`] updates that
+//! same file. When neither file exists it leaves a full zeroed RAM and reports `Ok(false)`,
+//! mirroring upstream `ReadSaveRAMData`; a later write then targets `SData.bin`, matching
+//! `WriteSaveRAMData`'s `useSGame` default (`RSDKv4/Userdata.cpp` @ a7f5195).
 //!
-//! Upstream RSDKv4-Decompilation reads `SData.bin` first; this port is scoped to the v4 asset
-//! trees, which ship `SGame.bin`, and the M5 contract defines `SGame.bin` as the primary file.
-//! Both layouts round-trip byte-exactly because the loaded [`SaveFileKind`] is preserved.
+//! The shipped v4 asset trees only contain `SGame.bin`, so they load through the fallback and
+//! write back to `SGame.bin`. Both layouts round-trip byte-exactly because the loaded
+//! [`SaveFileKind`] is preserved.
 //!
 //! # Achievements
 //!
@@ -31,6 +32,8 @@ use retro_format_v4::FormatError;
 use retro_format_v4::userdata::{
     ACHIEVEMENT_FILE_SLOTS, Achievement, Achievements, SaveFileKind, SaveRam,
 };
+use retro_io::DataSource;
+use retro_platform::headless::MemoryStorage;
 use retro_platform::{PlatformError, Storage};
 
 /// Suffix of the temporary file used to make writes atomic.
@@ -62,6 +65,26 @@ pub struct SaveStore<S: Storage> {
 }
 
 impl<S: Storage> SaveStore<S> {
+    /// Creates a store without probing the backend.
+    ///
+    /// Prefer [`SaveStore::open`] for real storage; this constructor exists for backends whose
+    /// availability is known (the deterministic in-memory backend) and cannot fail.
+    #[must_use]
+    pub fn new(storage: S) -> Self {
+        let save_ram = SaveRam::zeroed();
+        let achievements = zeroed_achievements();
+        let save_persisted = save_ram.to_bytes();
+        let achievements_persisted = achievements.to_bytes();
+        Self {
+            storage,
+            save_ram,
+            save_kind: SaveFileKind::SData,
+            save_persisted,
+            achievements,
+            achievements_persisted,
+        }
+    }
+
     /// Opens user data on `storage`.
     ///
     /// The backend is probed with [`Storage::list`] so unusable storage fails here instead of at
@@ -69,21 +92,16 @@ impl<S: Storage> SaveStore<S> {
     /// and [`SaveStore::load_achievements`].
     pub fn open(storage: S) -> Result<Self, SaveError> {
         storage.list("")?;
-        let save_ram = SaveRam::zeroed();
-        let achievements = zeroed_achievements();
-        let save_persisted = save_ram.to_bytes();
-        let achievements_persisted = achievements.to_bytes();
-        Ok(Self {
-            storage,
-            save_ram,
-            save_kind: SaveFileKind::SGame,
-            save_persisted,
-            achievements,
-            achievements_persisted,
-        })
+        Ok(Self::new(storage))
     }
 
-    /// Loads [`SaveRam::SAVE_PATH`] (falling back to [`SaveRam::MODERN_SAVE_PATH`]) if present.
+    /// The backing storage.
+    #[must_use]
+    pub fn storage(&self) -> &S {
+        &self.storage
+    }
+
+    /// Loads [`SaveRam::MODERN_SAVE_PATH`] (falling back to [`SaveRam::SAVE_PATH`]) if present.
     ///
     /// Returns `Ok(false)` and leaves a zeroed RAM when neither file exists. A file that exists
     /// but is malformed (length not a multiple of four, or more than
@@ -91,16 +109,16 @@ impl<S: Storage> SaveStore<S> {
     /// returns [`SaveError::Format`] and leaves the previous in-memory state untouched. Short
     /// files are accepted exactly like the engine's unchecked `fRead`.
     pub fn load_save_ram(&mut self) -> Result<bool, SaveError> {
-        let (bytes, kind) = if self.storage.exists(SaveRam::SAVE_PATH) {
-            (self.storage.read(SaveRam::SAVE_PATH)?, SaveFileKind::SGame)
-        } else if self.storage.exists(SaveRam::MODERN_SAVE_PATH) {
+        let (bytes, kind) = if self.storage.exists(SaveRam::MODERN_SAVE_PATH) {
             (
                 self.storage.read(SaveRam::MODERN_SAVE_PATH)?,
                 SaveFileKind::SData,
             )
+        } else if self.storage.exists(SaveRam::SAVE_PATH) {
+            (self.storage.read(SaveRam::SAVE_PATH)?, SaveFileKind::SGame)
         } else {
             self.save_ram = SaveRam::zeroed();
-            self.save_kind = SaveFileKind::SGame;
+            self.save_kind = SaveFileKind::SData;
             self.save_persisted = self.save_ram.to_bytes();
             return Ok(false);
         };
@@ -128,8 +146,8 @@ impl<S: Storage> SaveStore<S> {
         self.save_kind
     }
 
-    /// Writes the save RAM back to the file it was loaded from (`SGame.bin` when nothing was
-    /// loaded).
+    /// Writes the save RAM back to the file it was loaded from (`SData.bin` when nothing was
+    /// loaded, mirroring `useSGame == false`).
     ///
     /// The bytes are first written to `<path>.tmp` and then renamed over the target. On failure
     /// the temporary file is removed best-effort and the previous user data is left untouched.
@@ -226,6 +244,148 @@ fn zeroed_achievements() -> Achievements {
                 name: None,
             })
             .collect(),
+    }
+}
+
+/// Copies the shipped user data (`SData.bin`/`SGame.bin`/`Achievements.bin`) from an asset source
+/// into fresh in-memory storage.
+///
+/// Upstream keeps its save files next to the game data (`gamePath`); deterministic headless runs
+/// use this to read the shipped save without ever writing to the asset tree.
+#[must_use]
+pub fn seed_memory_storage(source: &dyn DataSource) -> MemoryStorage {
+    let mut storage = MemoryStorage::new();
+    for path in [
+        SaveRam::MODERN_SAVE_PATH,
+        SaveRam::SAVE_PATH,
+        Achievements::PATH,
+    ] {
+        if source.exists(path)
+            && let Ok(bytes) = source.read(path)
+        {
+            let _ = storage.write(path, &bytes);
+        }
+    }
+    storage
+}
+
+/// Engine-facing save RAM: a boxed [`SaveStore`] plus the last storage/format error.
+///
+/// The host ops never fail a script on an I/O error: [`SaveState::load_save_ram`] and
+/// [`SaveState::write_save_ram`] report upstream's boolean result and keep the error for
+/// diagnostics. The in-memory RAM stays valid across failures.
+pub struct SaveState {
+    store: SaveStore<Box<dyn Storage>>,
+    last_error: Option<String>,
+}
+
+impl SaveState {
+    /// Wraps an open store.
+    #[must_use]
+    pub fn from_store(store: SaveStore<Box<dyn Storage>>) -> Self {
+        Self {
+            store,
+            last_error: None,
+        }
+    }
+
+    /// Opens save RAM on `storage`, probing the backend.
+    pub fn open(storage: Box<dyn Storage>) -> Result<Self, SaveError> {
+        Ok(Self::from_store(SaveStore::open(storage)?))
+    }
+
+    /// Creates a deterministic in-memory save state with no files.
+    #[must_use]
+    pub fn in_memory() -> Self {
+        Self::from_store(SaveStore::new(Box::new(MemoryStorage::new())))
+    }
+
+    /// `ReadSaveRAMData`: loads the save RAM, returning upstream's boolean result.
+    pub fn load_save_ram(&mut self) -> bool {
+        match self.store.load_save_ram() {
+            Ok(found) => {
+                self.last_error = None;
+                found
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                false
+            }
+        }
+    }
+
+    /// `WriteSaveRAMData`: persists the save RAM atomically, returning upstream's boolean result.
+    pub fn write_save_ram(&mut self) -> bool {
+        match self.store.write_save_ram() {
+            Ok(()) => {
+                self.last_error = None;
+                true
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                false
+            }
+        }
+    }
+
+    /// Writes the save RAM only when it differs from the persisted bytes.
+    pub fn flush(&mut self) -> bool {
+        if self.store.dirty() {
+            self.write_save_ram()
+        } else {
+            true
+        }
+    }
+
+    /// Whether the in-memory RAM or achievements differ from the persisted bytes.
+    #[must_use]
+    pub fn dirty(&self) -> bool {
+        self.store.dirty()
+    }
+
+    /// Which file the current save RAM was loaded from; the target of the next write.
+    #[must_use]
+    pub fn save_file_kind(&self) -> SaveFileKind {
+        self.store.save_file_kind()
+    }
+
+    /// The in-memory save RAM.
+    #[must_use]
+    pub fn save_ram(&self) -> &SaveRam {
+        self.store.save_ram()
+    }
+
+    /// Mutable access to the in-memory save RAM (does not touch the storage until a write).
+    pub fn save_ram_mut(&mut self) -> &mut SaveRam {
+        self.store.save_ram_mut()
+    }
+
+    /// Reads one `saveRAM` word (`VAR_SAVERAM`); out-of-range indices read as `0`.
+    #[must_use]
+    pub fn read_word(&self, index: i32) -> i32 {
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| self.store.save_ram().word(index))
+            .unwrap_or(0)
+    }
+
+    /// Writes one `saveRAM` word (`VAR_SAVERAM`); out-of-range indices are ignored.
+    pub fn write_word(&mut self, index: i32, value: i32) {
+        if let Ok(index) = usize::try_from(index) {
+            let _ = self.store.save_ram_mut().set_word(index, value);
+        }
+    }
+
+    /// The backing storage.
+    #[must_use]
+    pub fn storage(&self) -> &dyn Storage {
+        self.store.storage().as_ref()
+    }
+
+    /// The last storage or format error, if any.
+    #[must_use]
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
     }
 }
 
@@ -387,7 +547,11 @@ mod tests {
         let mut store = SaveStore::open(storage).unwrap();
 
         assert!(!store.load_save_ram().unwrap());
-        assert_eq!(store.save_file_kind(), SaveFileKind::SGame);
+        assert_eq!(
+            store.save_file_kind(),
+            SaveFileKind::SData,
+            "a later write defaults to SData.bin, matching useSGame == false"
+        );
         assert!(store.save_ram().is_full());
         assert!(store.save_ram().words.iter().all(|word| *word == 0));
         assert!(!store.dirty());
@@ -406,48 +570,56 @@ mod tests {
     }
 
     #[test]
-    fn save_ram_prefers_sgame_and_writes_it_back() {
-        let game = pattern_bytes(0x2000);
-        let mut data = game.clone();
-        data[0..4].copy_from_slice(&7i32.to_le_bytes());
-        let storage = seeded_storage(SaveRam::SAVE_PATH, &game);
+    fn save_ram_prefers_sdata_and_writes_it_back() {
+        let data = pattern_bytes(0x2000);
+        let mut game = data.clone();
+        game[0..4].copy_from_slice(&7i32.to_le_bytes());
+        let storage = seeded_storage(SaveRam::MODERN_SAVE_PATH, &data);
         storage
             .0
             .borrow_mut()
-            .write(SaveRam::MODERN_SAVE_PATH, &data)
+            .write(SaveRam::SAVE_PATH, &game)
             .unwrap();
 
         let mut store = SaveStore::open(storage.clone()).unwrap();
         assert!(store.load_save_ram().unwrap());
-        assert_eq!(store.save_file_kind(), SaveFileKind::SGame);
-        assert_eq!(store.save_ram().to_bytes(), game);
+        assert_eq!(
+            store.save_file_kind(),
+            SaveFileKind::SData,
+            "ReadSaveRAMData opens SData.bin first"
+        );
+        assert_eq!(store.save_ram().to_bytes(), data);
 
         store.save_ram_mut().set_word(0, 99).unwrap();
         store.write_save_ram().unwrap();
-        let mut expected = game.clone();
+        let mut expected = data.clone();
         expected[0..4].copy_from_slice(&99i32.to_le_bytes());
-        assert_eq!(store.storage.read(SaveRam::SAVE_PATH).unwrap(), expected);
-        assert_eq!(store.storage.read(SaveRam::MODERN_SAVE_PATH).unwrap(), data);
-    }
-
-    #[test]
-    fn save_ram_falls_back_to_sdata_and_writes_it_back() {
-        let bytes = pattern_bytes(0x2000);
-        let storage = seeded_storage(SaveRam::MODERN_SAVE_PATH, &bytes);
-        let mut store = SaveStore::open(storage.clone()).unwrap();
-
-        assert!(store.load_save_ram().unwrap());
-        assert_eq!(store.save_file_kind(), SaveFileKind::SData);
-        store.save_ram_mut().set_word(1, 5).unwrap();
-        store.write_save_ram().unwrap();
-
-        assert!(!store.storage.exists(SaveRam::SAVE_PATH));
-        let mut expected = bytes;
-        expected[4..8].copy_from_slice(&5i32.to_le_bytes());
         assert_eq!(
             store.storage.read(SaveRam::MODERN_SAVE_PATH).unwrap(),
             expected
         );
+        assert_eq!(store.storage.read(SaveRam::SAVE_PATH).unwrap(), game);
+    }
+
+    #[test]
+    fn save_ram_falls_back_to_sgame_and_writes_it_back() {
+        let bytes = pattern_bytes(0x2000);
+        let storage = seeded_storage(SaveRam::SAVE_PATH, &bytes);
+        let mut store = SaveStore::open(storage.clone()).unwrap();
+
+        assert!(store.load_save_ram().unwrap());
+        assert_eq!(
+            store.save_file_kind(),
+            SaveFileKind::SGame,
+            "SGame.bin is the fallback when SData.bin is absent"
+        );
+        store.save_ram_mut().set_word(1, 5).unwrap();
+        store.write_save_ram().unwrap();
+
+        assert!(!store.storage.exists(SaveRam::MODERN_SAVE_PATH));
+        let mut expected = bytes;
+        expected[4..8].copy_from_slice(&5i32.to_le_bytes());
+        assert_eq!(store.storage.read(SaveRam::SAVE_PATH).unwrap(), expected);
     }
 
     #[test]
@@ -538,6 +710,55 @@ mod tests {
         store.storage.fail_write = false;
         store.write_save_ram().unwrap();
         assert!(!store.dirty());
+    }
+
+    #[test]
+    fn save_state_round_trips_words_through_memory_storage() {
+        let mut state = SaveState::in_memory();
+        assert!(!state.load_save_ram(), "fresh memory storage has no save");
+        assert_eq!(state.read_word(0x1234), 0);
+        assert_eq!(state.read_word(-1), 0);
+
+        state.write_word(0x1234, 0x0BAD_F00D);
+        state.write_word(-1, 7);
+        assert!(state.dirty());
+        assert!(state.flush());
+        assert!(!state.dirty());
+        assert!(state.flush(), "a clean flush is a successful no-op");
+
+        let bytes = state
+            .storage()
+            .read(SaveRam::MODERN_SAVE_PATH)
+            .expect("default write target is SData.bin");
+        let ram = SaveRam::from_bytes(&bytes).unwrap();
+        assert_eq!(ram.word(0x1234), Some(0x0BAD_F00D_u32 as i32));
+        assert_eq!(ram.words.len(), 0x2000);
+    }
+
+    #[test]
+    fn save_state_reports_write_failures_without_mutating_the_ram() {
+        let mut storage = FailingStorage::new();
+        storage.fail_write = true;
+        let mut state = SaveState::open(Box::new(storage)).unwrap();
+        state.write_word(3, 9);
+        assert!(!state.write_save_ram());
+        assert!(state.last_error().is_some());
+        assert!(state.dirty());
+        assert_eq!(state.read_word(3), 9);
+    }
+
+    #[test]
+    fn seed_memory_storage_copies_shipped_user_data() {
+        let mut source = retro_io::MemorySource::new();
+        source.insert(SaveRam::MODERN_SAVE_PATH, pattern_bytes(2));
+        source.insert(SaveRam::SAVE_PATH, pattern_bytes(3));
+        let storage = seed_memory_storage(&source);
+        assert_eq!(
+            storage.read(SaveRam::MODERN_SAVE_PATH).unwrap(),
+            pattern_bytes(2)
+        );
+        assert_eq!(storage.read(SaveRam::SAVE_PATH).unwrap(), pattern_bytes(3));
+        assert!(!storage.exists(Achievements::PATH));
     }
 
     #[test]
