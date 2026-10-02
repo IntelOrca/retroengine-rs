@@ -359,6 +359,12 @@ version = "0.1.0"
 [[package]]
 name = "retro-script"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "retro-io",
+ "serde",
+ "thiserror",
+]
 
 [[package]]
 name = "rpkg-config"
