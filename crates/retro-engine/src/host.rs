@@ -2,8 +2,13 @@
 //!
 //! This is the M3 port of the `ProcessScript` engine switches in `RSDKv4/Script.cpp` plus the
 //! collision routines in `RSDKv4/Collision.cpp` (RSDKModding/RSDKv4-Decompilation @ a7f5195).
-//! Ops that only affect rendering, audio, menus or 3D are deterministic stubs: they record
-//! themselves in [`EngineState::stub_histogram`] and never touch entity or scene state.
+//! Ops that only affect menus or 3D are deterministic stubs: they record themselves in
+//! [`EngineState::stub_histogram`] and never touch entity or scene state.
+//!
+//! M5 wires the audio and save operations for real: `SetMusicTrack`/`PlayMusic`/`StopMusic`/
+//! `PauseMusic`/`ResumeMusic`/`SwapMusicTrack` and `PlaySfx`/`StopSfx`/`SetSfxAttributes` drive
+//! [`crate::audio::AudioState`], and `ReadSaveRAM`/`WriteSaveRAM` plus the `saveRAM` array
+//! variable drive [`crate::save::SaveState`].
 //!
 //! Known gaps (documented, deterministic):
 //!
@@ -18,9 +23,6 @@
 //!   title/HUD number and act-name draws are ported for rev00..rev03; the newer menu ops
 //!   (`DrawMenu`, `SetupMenu`, ...) remain stubs.
 //! * `LoadStage` sets a flag instead of switching scenes mid-frame.
-//! * Save RAM is not loaded or persisted (M5); `ReadSaveRAM` mirrors upstream's "no save file"
-//!   return value by checking for `SData.bin`/`SGame.bin`, and `WriteSaveRAM` reports success
-//!   without touching a file.
 
 use retro_format_v4::{AnimationFile, Hitbox};
 use retro_scene::collision::{
@@ -92,6 +94,8 @@ const VAR_ENGINE_ONLINE_ACTIVE: i32 = 238;
 const VAR_ENGINE_SFX_VOLUME: i32 = 239;
 /// `engine.bgmVolume`.
 const VAR_ENGINE_BGM_VOLUME: i32 = 240;
+/// `saveRAM`.
+const VAR_SAVE_RAM: i32 = 235;
 /// `engine.trialMode`.
 const VAR_ENGINE_TRIAL_MODE: i32 = 241;
 /// `engine.deviceType`.
@@ -593,12 +597,6 @@ impl EngineHost<'_> {
         }
         if let Some(target) = self.state.entities.get_mut(slot) {
             *target = entity;
-        }
-    }
-
-    fn set_music_track(&mut self, value: i32) {
-        if value >= 0 {
-            self.state.music_track = value;
         }
     }
 }
@@ -1180,16 +1178,14 @@ impl ScriptHost for EngineHost<'_> {
                 self.copy_16x16_tile(operands[0], operands[1]);
             }
             Op::ReadSaveRAM => {
-                // No save RAM is loaded yet (M5), but upstream reports false when neither
-                // `SData.bin` nor `SGame.bin` exists, so mirror that much.
-                let available =
-                    self.state.source.exists("SData.bin") || self.state.source.exists("SGame.bin");
-                state.check_result = i32::from(available);
-                self.state.record_stub(stub_name(op));
+                // `ReadSaveRAMData`: SData.bin, then SGame.bin; false when neither exists.
+                self.state.record_op("ReadSaveRAM");
+                state.check_result = i32::from(self.state.save.load_save_ram());
             }
             Op::WriteSaveRAM => {
-                state.check_result = 1;
-                self.state.record_stub(stub_name(op));
+                // `WriteSaveRAMData`: atomic write back to the file that was loaded.
+                self.state.record_op("WriteSaveRAM");
+                state.check_result = i32::from(self.state.save.write_save_ram());
             }
             Op::LoadStage => {
                 self.state.load_stage_requested = true;
@@ -1259,25 +1255,67 @@ impl ScriptHost for EngineHost<'_> {
                 self.state.record_stub(stub_name(op));
             }
             Op::SetMusicTrack => {
-                self.state.record_stub(stub_name(op));
-                self.set_music_track(operands[1]);
+                // Upstream: `operands[2] <= 1` is the loop flag with loop point 0, otherwise it
+                // is the loop point and the track loops (`Script.cpp:5029-5035`).
+                self.state.record_op("SetMusicTrack");
+                let file = state.script_text.clone();
+                let loop_operand = operands[2];
+                if loop_operand <= 1 {
+                    self.state
+                        .audio
+                        .set_track(operands[1], &file, loop_operand != 0, 0);
+                } else {
+                    self.state
+                        .audio
+                        .set_track(operands[1], &file, true, loop_operand);
+                }
             }
             Op::PlayMusic => {
-                self.state.record_stub(stub_name(op));
-                self.set_music_track(operands[0]);
+                self.state.record_op("PlayMusic");
+                self.state.audio.play_music(operands[0]);
+                // Upstream `trackID` follows a successful load (`LoadMusic`).
+                if self.state.audio.track_file(operands[0]).is_some() {
+                    self.state.music_track = operands[0];
+                }
             }
             Op::StopMusic => {
-                self.state.record_stub(stub_name(op));
+                self.state.record_op("StopMusic");
+                self.state.audio.stop_music();
             }
-            Op::PauseMusic | Op::ResumeMusic => {
-                self.state.record_stub(stub_name(op));
+            Op::PauseMusic => {
+                self.state.record_op("PauseMusic");
+                self.state.audio.pause_music();
+            }
+            Op::ResumeMusic => {
+                self.state.record_op("ResumeMusic");
+                self.state.audio.resume_music();
             }
             Op::SwapMusicTrack => {
-                self.state.record_stub(stub_name(op));
-                self.set_music_track(operands[1]);
+                // `operands[2]` is either the loop flag (<= 1) or the loop point; the ratio in
+                // `operands[3]` is accepted but unused by the deterministic mixer.
+                self.state.record_op("SwapMusicTrack");
+                let file = state.script_text.clone();
+                let loop_point = if operands[2] <= 1 { 0 } else { operands[2] };
+                self.state
+                    .audio
+                    .swap_music_track(operands[1], &file, loop_point);
+                if !file.is_empty() && self.state.audio.track_file(operands[1]).is_some() {
+                    self.state.music_track = operands[1];
+                }
             }
-            Op::PlaySfx | Op::StopSfx | Op::SetSfxAttributes => {
-                self.state.record_stub(stub_name(op));
+            Op::PlaySfx => {
+                self.state.record_op("PlaySfx");
+                self.state.audio.play_sfx(operands[0], operands[1] != 0);
+            }
+            Op::StopSfx => {
+                self.state.record_op("StopSfx");
+                self.state.audio.stop_sfx(operands[0]);
+            }
+            Op::SetSfxAttributes => {
+                self.state.record_op("SetSfxAttributes");
+                self.state
+                    .audio
+                    .set_sfx_attributes(operands[0], operands[1], operands[2]);
             }
             Op::CallNativeFunction | Op::CallNativeFunction2 | Op::CallNativeFunction4 => {
                 self.state.record_stub(stub_name(op));
@@ -1360,6 +1398,8 @@ impl ScriptHost for EngineHost<'_> {
                 .and_then(|index| self.state.touch_y.get(index))
                 .copied()
                 .unwrap_or(0)
+        } else if var == VAR_SAVE_RAM {
+            self.state.save.read_word(array_index)
         } else if var == VAR_MUSIC_VOLUME {
             100
         } else if var == VAR_MUSIC_TRACK {
@@ -1367,9 +1407,10 @@ impl ScriptHost for EngineHost<'_> {
         } else if var == VAR_MUSIC_POSITION {
             0
         } else if (VAR_KEYDOWN_FIRST..=VAR_KEYDOWN_LAST).contains(&var) {
-            i32::from(self.state.input.down(var).unwrap_or(false))
+            // Rev03 Origins: `inputCheck = arrayVal <= 1`, so higher slots read false.
+            i32::from(array_index <= 1 && self.state.input.down(var).unwrap_or(false))
         } else if (VAR_KEYPRESS_FIRST..=VAR_KEYPRESS_LAST).contains(&var) {
-            i32::from(self.state.input_press.press(var).unwrap_or(false))
+            i32::from(array_index <= 1 && self.state.input_press.press(var).unwrap_or(false))
         } else if var == VAR_MENU1 {
             self.state.menu1_selection
         } else if var == VAR_MENU2 {
@@ -1380,8 +1421,10 @@ impl ScriptHost for EngineHost<'_> {
             self.read_parallax_var(var, array_index)
         } else if var == VAR_ENGINE_STATE {
             ENGINE_MAINGAME
-        } else if var == VAR_ENGINE_SFX_VOLUME || var == VAR_ENGINE_BGM_VOLUME {
-            100
+        } else if var == VAR_ENGINE_SFX_VOLUME {
+            i32::from(self.state.audio.sfx_volume())
+        } else if var == VAR_ENGINE_BGM_VOLUME {
+            i32::from(self.state.audio.stream_volume())
         } else if (VAR_CAMERA_FIRST..=VAR_CAMERA_LAST).contains(&var) {
             self.read_camera_var(var, array_index)
         } else {
@@ -1424,8 +1467,11 @@ impl ScriptHost for EngineHost<'_> {
             self.write_parallax_var(var, array_index, value);
         } else if (VAR_CAMERA_FIRST..=VAR_CAMERA_LAST).contains(&var) {
             self.write_camera_var(var, array_index, value);
+        } else if var == VAR_SAVE_RAM {
+            // `saveRAM[arrayVal] = value`; persistence happens on `WriteSaveRAM`.
+            self.state.save.write_word(array_index, value);
         }
-        // Input, music, touchscreen and engine globals are read-only in M3.
+        // Input, music, touchscreen and engine globals are read-only.
         if (VAR_SCREEN_FIRST..=VAR_SCREEN_LAST).contains(&var) {
             self.adjust_camera_style();
         }
@@ -2514,6 +2560,7 @@ mod tests {
     use retro_format_v4::tiles::TILE_SHEET_128_ENTRY_COUNT;
     use retro_format_v4::{CollisionMasks, GameConfig, Scene, StageConfig, Tile128, TileSheet128};
     use retro_io::MemorySource;
+    use retro_platform::Storage;
     use retro_scene::ObjectRegistry;
     use retro_script::{PlatformMode, V4Revision};
     use std::sync::Arc;
@@ -2802,22 +2849,43 @@ mod tests {
     }
 
     #[test]
-    fn read_save_ram_reports_missing_save_files() {
+    fn read_save_ram_uses_the_save_store_and_saveram_variable() {
         let mut state = test_state(false);
         let mut host = EngineHost { state: &mut state };
         let mut vm_state = VmState::default();
         host.engine_op(Op::ReadSaveRAM, &mut vm_state).unwrap();
-        assert_eq!(
-            vm_state.check_result, 0,
-            "no SData.bin/SGame.bin in the test source"
-        );
+        assert_eq!(vm_state.check_result, 0, "in-memory store starts empty");
 
-        let mut source = MemorySource::new();
-        source.insert("SGame.bin", vec![0u8; 16]);
-        state.source = Arc::new(source);
-        let mut host = EngineHost { state: &mut state };
+        let mut storage = retro_platform::headless::MemoryStorage::new();
+        storage
+            .write(retro_format_v4::userdata::SaveRam::SAVE_PATH, &[0u8; 16])
+            .unwrap();
+        host.state.save = crate::save::SaveState::open(Box::new(storage)).unwrap();
         host.engine_op(Op::ReadSaveRAM, &mut vm_state).unwrap();
         assert_eq!(vm_state.check_result, 1, "SGame.bin present");
+
+        assert_eq!(
+            host.read_engine_var(VAR_SAVE_RAM, 2, &mut vm_state)
+                .unwrap(),
+            0
+        );
+        host.write_engine_var(VAR_SAVE_RAM, 2, 77, &mut vm_state)
+            .unwrap();
+        assert_eq!(
+            host.read_engine_var(VAR_SAVE_RAM, 2, &mut vm_state)
+                .unwrap(),
+            77
+        );
+        host.engine_op(Op::WriteSaveRAM, &mut vm_state).unwrap();
+        assert_eq!(vm_state.check_result, 1);
+        assert!(
+            host.state
+                .save
+                .storage()
+                .exists(retro_format_v4::userdata::SaveRam::SAVE_PATH)
+        );
+        assert_eq!(host.state.stub_histogram.get("ReadSaveRAM"), None);
+        assert_eq!(host.state.op_histogram.get("ReadSaveRAM"), Some(&2));
     }
 
     #[test]

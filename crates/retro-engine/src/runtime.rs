@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 
+use retro_audio::AudioEngine;
 use retro_format_v4::SceneEntity;
 use retro_format_v4::scene::{
     ENTITY_ATTRIB_ALPHA, ENTITY_ATTRIB_ANIMATION, ENTITY_ATTRIB_ANIMATION_SPEED,
@@ -28,7 +29,10 @@ use retro_format_v4::scene::{
     ENTITY_ATTRIB_INK_EFFECT, ENTITY_ATTRIB_PRIORITY, ENTITY_ATTRIB_ROTATION, ENTITY_ATTRIB_SCALE,
     ENTITY_ATTRIB_STATE, ENTITY_ATTRIB_VALUES,
 };
+use retro_input::ScriptedInput;
 use retro_io::DataSource;
+use retro_platform::RawInput;
+use retro_platform::Storage;
 use retro_render::ChunkEntry;
 use retro_render::layers::{LAYER_3DFLOOR, LAYER_3DSKY, LAYER_HSCROLL, LAYER_VSCROLL, LayerView};
 use retro_scene::{
@@ -37,10 +41,13 @@ use retro_scene::{
 use retro_script::{ScriptEvent, ScriptFile, Vm, VmState};
 
 use crate::EngineError;
+use crate::audio::AudioState;
 use crate::host::EngineHost;
+use crate::input::{EngineInput, PRESS_BUTTONS, apply_players};
 use crate::loader;
 use crate::profile::EngineSettings;
 use crate::rng::DEFAULT_SEED;
+use crate::save::{SaveState, seed_memory_storage};
 use crate::state::EngineState;
 
 /// The compiled script file and its VM execution state.
@@ -57,6 +64,10 @@ pub struct Engine {
     pub state: EngineState,
     /// Compiled scripts and VM state.
     pub scripts: ScriptRuntime,
+    /// Per-frame input source (idle, scripted or raw platform state).
+    pub input: EngineInput,
+    /// Index of the `input.pressButton` global, when the GameConfig defines it.
+    press_button_global: Option<usize>,
 }
 
 /// Summary of a completed run.
@@ -68,19 +79,48 @@ pub struct RunOutcome {
     pub final_hash: String,
     /// `(frame, hash)` pairs when per-frame hashing was requested.
     pub frame_hashes: Vec<(u64, String)>,
+    /// `(frame, audio hash)` for every executed frame.
+    pub audio_hashes: Vec<(u64, String)>,
 }
 
 impl Engine {
-    /// Loads and instantiates the requested scene.
+    /// Loads and instantiates the requested scene with in-memory user data.
+    ///
+    /// The shipped `SData.bin`/`SGame.bin`/`Achievements.bin` files next to the game data are
+    /// copied into the in-memory storage first, mirroring upstream's `gamePath` lookup, so a
+    /// headless run can read a shipped save without writing to the asset tree.
     pub fn load(
         source: Arc<dyn DataSource>,
         requested_scene: Option<&str>,
         act: Option<&str>,
         seed: u32,
     ) -> Result<Self, EngineError> {
+        let storage = Box::new(seed_memory_storage(source.as_ref()));
+        Self::load_with(source, requested_scene, act, seed, storage)
+    }
+
+    /// Loads and instantiates the requested scene with an explicit user-data storage.
+    ///
+    /// The backend is probed by [`SaveState::open`]; `ReadSaveRAM`/`WriteSaveRAM` then operate on
+    /// it and a dirty save RAM is flushed on [`Engine::flush_save`].
+    pub fn load_with(
+        source: Arc<dyn DataSource>,
+        requested_scene: Option<&str>,
+        act: Option<&str>,
+        seed: u32,
+        save_storage: Box<dyn Storage>,
+    ) -> Result<Self, EngineError> {
         let world = loader::load_world(&source, requested_scene, act)?;
         let rng = crate::rng::GlibcRand::new(seed);
         let file: ScriptFile = world.scripts.file;
+        let input = EngineInput::new(&world.raw_settings);
+        let audio = AudioState::for_scene(
+            Arc::clone(&source),
+            &world.game_config,
+            &world.stage_config,
+            &world.raw_settings.audio,
+        );
+        let save = SaveState::open(save_storage)?;
         let mut state = EngineState::new(
             Arc::clone(&source),
             world.settings,
@@ -94,6 +134,8 @@ impl Engine {
             world.scripts.objects,
             rng,
         );
+        state.audio = audio;
+        state.save = save;
         let act_id = state.act.clone();
         state.stage.set_act_id(&act_id);
         // `[Window] DimLimit` is stored in seconds and converted to frames when settings load.
@@ -130,12 +172,19 @@ impl Engine {
             array_position,
             ..VmState::default()
         };
+        let press_button_global = state
+            .game_config
+            .global_variables
+            .iter()
+            .position(|variable| variable.name == "input.pressButton");
         let mut engine = Self {
             state,
             scripts: ScriptRuntime {
                 vm: Vm::new(file),
                 vm_state,
             },
+            input,
+            press_button_global,
         };
         engine.run_startup()?;
         Ok(engine)
@@ -191,6 +240,7 @@ impl Engine {
     /// camera follow, parallax auto-scroll, then `DrawStageGFX` (which runs `ObjectDraw` events
     /// through the draw lists, interleaved with the tile layers) and the fade rectangle.
     pub fn run_frame(&mut self) -> Result<(), EngineError> {
+        self.poll_input();
         // `ProcessInput` runs before the frame: any press/hold resets the idle-dimming timer,
         // otherwise it advances towards `dim_limit` (`Input.cpp:377-382`). Presentation-only.
         let input_active = self.state.input.any_button()
@@ -214,7 +264,64 @@ impl Engine {
         // `FlipScreen` updates the display-only dim state after the frame is composed.
         self.state.render.process_dimming();
         self.state.frame += 1;
+        // Mix one engine tick (735 stereo frames) and, in windowed runs, submit it to the device.
+        self.state.audio.tick();
         Ok(())
+    }
+
+    /// Polls the input source and copies the player states into the engine state.
+    fn poll_input(&mut self) {
+        let players = self.input.poll();
+        apply_players(&mut self.state, &players);
+        if let Some(index) = self.press_button_global {
+            let pressed = players
+                .first()
+                .is_some_and(|player| player.pressed.intersects(PRESS_BUTTONS));
+            if let Some(value) = self.scripts.vm_state.global_variables.get_mut(index) {
+                *value = i32::from(pressed);
+            }
+        }
+    }
+
+    /// Selects the deterministic idle input source (the headless default).
+    pub fn set_null_input(&mut self) {
+        self.input.set_null();
+    }
+
+    /// Selects a deterministic scripted replay (`--input FILE`), overriding any platform source.
+    pub fn set_scripted_input(&mut self, input: ScriptedInput) {
+        self.input.set_scripted(input);
+    }
+
+    /// Selects raw platform polling through the `Settings.ini` mappings (windowed default).
+    pub fn set_platform_input(&mut self) {
+        self.input.set_platform();
+    }
+
+    /// Stores one raw platform poll for the next frame (windowed mode only).
+    pub fn set_raw_input(&mut self, raw: RawInput) {
+        self.input.set_raw(raw);
+    }
+
+    /// Attaches the windowed audio output device.
+    pub fn set_audio_device(&mut self, device: AudioEngine) {
+        self.state.audio.set_device(device);
+    }
+
+    /// Enables or disables audio output; mixing and hashing are unaffected.
+    pub fn set_muted(&mut self, muted: bool) {
+        self.state.audio.set_muted(muted);
+    }
+
+    /// The hash of the audio mixed for the most recent frame, as lower-case hex.
+    #[must_use]
+    pub fn audio_hash(&self) -> String {
+        self.state.audio.last_hash_hex()
+    }
+
+    /// Persists a dirty save RAM (called at exit; `WriteSaveRAM` writes immediately).
+    pub fn flush_save(&mut self) -> bool {
+        self.state.save.flush()
     }
 
     /// `ProcessParallaxAutoScroll`.
@@ -351,11 +458,13 @@ impl Engine {
         hash_every_frame: bool,
     ) -> Result<RunOutcome, EngineError> {
         let mut frame_hashes = Vec::new();
+        let mut audio_hashes = Vec::with_capacity(frames as usize);
         if hash_every_frame {
             frame_hashes.push((self.state.frame, self.state_hash()));
         }
         for _ in 0..frames {
             self.run_frame()?;
+            audio_hashes.push((self.state.frame, self.audio_hash()));
             if hash_every_frame {
                 frame_hashes.push((self.state.frame, self.state_hash()));
             }
@@ -364,6 +473,7 @@ impl Engine {
             frames: self.state.frame,
             final_hash: self.state_hash(),
             frame_hashes,
+            audio_hashes,
         })
     }
 
@@ -375,7 +485,7 @@ impl Engine {
     }
 
     fn run_host_event(&mut self, code_pos: u32, jump_pos: u32) -> Result<(), EngineError> {
-        let Engine { state, scripts } = self;
+        let Engine { state, scripts, .. } = self;
         let mut host = EngineHost { state };
         scripts
             .vm
