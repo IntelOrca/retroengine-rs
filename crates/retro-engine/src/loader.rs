@@ -73,66 +73,362 @@ pub struct LoadedWorld {
     pub scripts: LoadedScripts,
 }
 
+/// A GameConfig scene paired with its category (file order) and global 1-based `--list` index.
+#[derive(Clone, Copy, Debug)]
+struct IndexedScene<'a> {
+    index: usize,
+    category: usize,
+    entry: &'a retro_format_v4::SceneEntry,
+}
+
+/// Lower-cases and drops everything that is not an ASCII letter or digit.
+fn normalize_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+/// Splits trailing ASCII digits off a normalized name (`greenhillzone1` -> `greenhillzone`+`1`).
+fn split_trailing_digits(value: &str) -> (&str, Option<&str>) {
+    let split = value
+        .char_indices()
+        .rev()
+        .find(|(_, character)| !character.is_ascii_digit())
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    if split == value.len()
+        || split == 0 && value.chars().all(|character| character.is_ascii_digit())
+    {
+        (&value[..split], None)
+    } else {
+        (&value[..split], Some(&value[split..]))
+    }
+}
+
+/// Word-initial acronym of a scene name (`GREEN HILL ZONE 1` -> `ghz1`).
+fn acronym(value: &str) -> String {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .filter_map(|word| word.chars().next())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+/// Length of the longest common prefix of `a` and `b`.
+fn common_prefix(a: &str, b: &str) -> usize {
+    a.chars()
+        .zip(b.chars())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+/// Normalizes an act id: numeric ids lose leading zeros, short ids (`b`) become upper case.
+fn normalize_act(value: &str) -> Result<String, EngineError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || !trimmed
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        return Err(EngineError::InvalidAct(value.to_owned()));
+    }
+    if trimmed.chars().all(|character| character.is_ascii_digit()) {
+        let number = trimmed
+            .parse::<u32>()
+            .map_err(|_| EngineError::InvalidAct(value.to_owned()))?;
+        Ok(number.to_string())
+    } else {
+        Ok(trimmed.to_ascii_uppercase())
+    }
+}
+
+/// The canonical "first zone" shorthand that also resolves on trees without a Green Hill.
+///
+/// `--scene GHZ` matches `GREEN HILL ZONE 1` by name on Sonic 1. Sonic 2's first regular zone
+/// is Emerald Hill, so when no name/acronym match exists the shorthand falls back to the first
+/// Regular-category scene, keeping `retroengine <S1|S2> --scene GHZ` working for both.
+const FIRST_ZONE_ALIASES: &[&str] = &["ghz"];
+
 /// Resolves `--scene`/`--act` to a stage folder and act id using `GameConfig`.
 ///
-/// Resolution order, all case-insensitive:
-/// 1. an exact stage folder match (`Zone01`),
-/// 2. a GameConfig scene name match (`GREEN HILL ZONE 1`),
-/// 3. without `--scene`, the first scene of the presentation category (normal boot flow up to
-///    the title screen).
+/// `--scene` accepts, case-insensitively and ignoring spaces/punctuation:
+/// 1. a numeric scene index from `--list` (`7`, 1-based, category-major),
+/// 2. an exact stage folder (`Zone01`),
+/// 3. an exact scene name (`GREEN HILL ZONE 1`),
+/// 4. a name without the act number (`GREEN HILL ZONE`, `MarbleZone2` selects act 2),
+/// 5. a name prefix (`GreenHill`),
+/// 6. a word-initial acronym with or without the act number (`GHZ`, `GHZ1`).
 ///
-/// An explicit `act` always wins, including the literal `1` and stage ids such as `B`; when it
-/// is absent the GameConfig entry's own id is used.
+/// `GHZ` additionally resolves to the first Regular-category scene when the loaded game has no
+/// Green Hill (Sonic 2's Emerald Hill). Without `--scene` the first scene of the first category
+/// is used (normal boot flow up to the title screen).
+///
+/// An explicit `--act` always wins, including the literal `1` and stage ids such as `B`; a
+/// trailing act number in `--scene` is used next; otherwise the GameConfig entry's own id is
+/// used.
 pub fn resolve_scene(
     game_config: &GameConfig,
     requested: Option<&str>,
     act: Option<&str>,
 ) -> Result<(String, String), EngineError> {
-    let resolve_act = |entry_id: &str| {
-        act.map(str::to_owned)
-            .unwrap_or_else(|| entry_id.to_owned())
+    let mut entries = Vec::new();
+    for (category, data) in game_config.categories.iter().enumerate() {
+        for entry in &data.scenes {
+            entries.push(IndexedScene {
+                index: entries.len() + 1,
+                category,
+                entry,
+            });
+        }
+    }
+    let resolve = |scene: IndexedScene<'_>, act_override: Option<&str>| {
+        let act = match (act, act_override) {
+            (Some(value), _) | (None, Some(value)) => normalize_act(value)?,
+            (None, None) => normalize_act(&scene.entry.id)?,
+        };
+        Ok((scene.entry.folder.clone(), act))
     };
+
     let Some(requested) = requested else {
-        let entry = game_config
-            .categories
-            .first()
-            .and_then(|category| category.scenes.first());
-        return match entry {
-            Some(entry) => Ok((entry.folder.clone(), resolve_act(&entry.id))),
-            None => Err(EngineError::UnknownScene("<default>".to_owned())),
+        return match entries.first() {
+            Some(scene) => resolve(*scene, None),
+            None => Err(unknown_scene(
+                "<default>",
+                "the GameConfig has no scenes",
+                &entries,
+            )),
         };
     };
-    let lowered = requested.to_ascii_lowercase();
-    if let Some(entry) = game_config
-        .categories
-        .iter()
-        .flat_map(|category| &category.scenes)
-        .find(|entry| entry.folder.to_ascii_lowercase() == lowered)
-    {
-        return Ok((entry.folder.clone(), resolve_act(&entry.id)));
+    let trimmed = requested.trim();
+    if trimmed.is_empty() {
+        return Err(unknown_scene(requested, "the value is empty", &entries));
     }
-    let normalized: String = requested
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    if let Some(entry) = game_config
-        .categories
+
+    // 1. Numeric `--list` index.
+    if trimmed.chars().all(|character| character.is_ascii_digit()) {
+        return match trimmed
+            .parse::<usize>()
+            .ok()
+            .filter(|index| *index >= 1 && *index <= entries.len())
+        {
+            Some(index) => resolve(entries[index - 1], None),
+            None => Err(unknown_scene(
+                requested,
+                &format!(
+                    "index is out of range (1..={}); run `--list` to see the scene indexes",
+                    entries.len()
+                ),
+                &entries,
+            )),
+        };
+    }
+
+    let request_key = normalize_name(trimmed);
+    let (request_base, request_act) = split_trailing_digits(&request_key);
+
+    // 2. Exact stage folder. Duplicate folders (per-act entries) are disambiguated by `--act`,
+    //    falling back to the first entry exactly like the pre-M6 behaviour.
+    let folders: Vec<IndexedScene<'_>> = entries
         .iter()
-        .flat_map(|category| &category.scenes)
-        .find(|entry| {
-            entry
-                .name
-                .chars()
-                .filter(|character| !character.is_whitespace())
-                .collect::<String>()
-                .to_ascii_lowercase()
-                == normalized
+        .filter(|scene| scene.entry.folder.eq_ignore_ascii_case(trimmed))
+        .copied()
+        .collect();
+    if !folders.is_empty() {
+        let chosen = act
+            .and_then(|value| {
+                folders
+                    .iter()
+                    .find(|scene| scene.entry.id.eq_ignore_ascii_case(value.trim()))
+            })
+            .unwrap_or(&folders[0]);
+        return resolve(*chosen, None);
+    }
+
+    // 3. Exact scene name.
+    let exact: Vec<IndexedScene<'_>> = entries
+        .iter()
+        .filter(|scene| normalize_name(&scene.entry.name) == request_key)
+        .copied()
+        .collect();
+    match exact.as_slice() {
+        [scene] => return resolve(*scene, None),
+        [] => {}
+        _ => return Err(unknown_scene(requested, &ambiguous(&exact), &entries)),
+    }
+
+    // 4. Scene name without its act number, optionally taking the act number from the request.
+    let actless: Vec<IndexedScene<'_>> = entries
+        .iter()
+        .filter(|scene| {
+            !request_base.is_empty()
+                && split_trailing_digits(&normalize_name(&scene.entry.name)).0 == request_base
         })
-    {
-        return Ok((entry.folder.clone(), resolve_act(&entry.id)));
+        .copied()
+        .collect();
+    match actless.as_slice() {
+        [scene] => return resolve(*scene, request_act),
+        [] => {}
+        _ => return Err(unknown_scene(requested, &ambiguous(&actless), &entries)),
     }
-    Err(EngineError::UnknownScene(requested.to_owned()))
+
+    // 5. Name prefix (`GreenHill`).
+    if request_base.len() >= 3 {
+        let prefixed: Vec<IndexedScene<'_>> = entries
+            .iter()
+            .filter(|scene| {
+                split_trailing_digits(&normalize_name(&scene.entry.name))
+                    .0
+                    .starts_with(request_base)
+            })
+            .copied()
+            .collect();
+        match prefixed.as_slice() {
+            [scene] => return resolve(*scene, request_act),
+            [] => {}
+            _ => return Err(unknown_scene(requested, &ambiguous(&prefixed), &entries)),
+        }
+    }
+
+    // 6. Word-initial acronym (`GHZ`, `GHZ1`).
+    let acronyms: Vec<IndexedScene<'_>> = entries
+        .iter()
+        .filter(|scene| {
+            let name_key = normalize_name(&scene.entry.name);
+            let name_acronym = acronym(&scene.entry.name);
+            let name_acronym_base = split_trailing_digits(&name_acronym).0;
+            request_key == name_acronym
+                || request_key == name_acronym_base
+                || request_base == name_acronym_base
+                || name_key == request_key
+        })
+        .copied()
+        .collect();
+    match acronyms.as_slice() {
+        [scene] => return resolve(*scene, request_act),
+        [] => {}
+        _ => return Err(unknown_scene(requested, &ambiguous(&acronyms), &entries)),
+    }
+
+    // 7. First-zone shorthand (`GHZ` on a tree whose first zone is Emerald Hill).
+    if FIRST_ZONE_ALIASES.contains(&request_base) {
+        let first_regular = entries.iter().find(|scene| scene.category == 1);
+        if let Some(scene) = first_regular {
+            return resolve(*scene, request_act);
+        }
+    }
+
+    Err(unknown_scene(
+        requested,
+        &candidate_hint(&entries, request_base),
+        &entries,
+    ))
+}
+
+/// Actionable detail string for an unknown scene.
+fn unknown_scene(requested: &str, detail: &str, entries: &[IndexedScene<'_>]) -> EngineError {
+    let scenes = entries.len();
+    EngineError::UnknownScene {
+        requested: requested.to_owned(),
+        details: format!(
+            "{detail} (this GameConfig has {scenes} scene(s); run `--list` to see them)"
+        ),
+    }
+}
+
+/// Formats an ambiguity list (`#7 Zone01/GREEN HILL ZONE 1 (id 1), ...`).
+fn ambiguous(matches: &[IndexedScene<'_>]) -> String {
+    let labels: Vec<String> = matches.iter().map(scene_label).collect();
+    format!("ambiguous, matches {}", labels.join(", "))
+}
+
+/// Formats one scene as `#7 Zone01/GREEN HILL ZONE 1 (id 1)`.
+fn scene_label(scene: &IndexedScene<'_>) -> String {
+    format!(
+        "#{} {}/{} (id {})",
+        scene.index, scene.entry.folder, scene.entry.name, scene.entry.id
+    )
+}
+
+/// "did you mean ..." hint for a failed resolution.
+fn candidate_hint(entries: &[IndexedScene<'_>], request_base: &str) -> String {
+    let mut scored: Vec<(usize, IndexedScene<'_>)> = entries
+        .iter()
+        .filter_map(|scene| {
+            let name = normalize_name(&scene.entry.name);
+            let name_key = split_trailing_digits(&name).0;
+            let name_acronym = acronym(&scene.entry.name);
+            let score = common_prefix(request_base, name_key)
+                .max(common_prefix(request_base, &name_acronym));
+            (score >= 2).then_some((score, *scene))
+        })
+        .collect();
+    scored.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then(left.index.cmp(&right.index))
+    });
+    let mut candidates: Vec<IndexedScene<'_>> =
+        scored.into_iter().map(|(_, scene)| scene).collect();
+    if candidates.is_empty() {
+        candidates = entries
+            .iter()
+            .filter(|scene| scene.entry.highlighted != 0)
+            .copied()
+            .collect();
+    }
+    if candidates.is_empty() {
+        candidates = entries.to_vec();
+    }
+    candidates.truncate(5);
+    let labels: Vec<String> = candidates.iter().map(scene_label).collect();
+    format!("did you mean {}?", labels.join(", "))
+}
+
+/// Returns the `Act<id>.bin` ids directly under `stage_dir`, case-insensitively.
+///
+/// The ids keep their on-disk spelling, numeric ids sort first in numeric order, and a missing
+/// or unreadable directory yields an empty list.
+#[must_use]
+pub fn available_acts(source: &dyn DataSource, stage_dir: &str) -> Vec<String> {
+    let mut acts = Vec::new();
+    if let Ok(files) = source.enumerate(stage_dir) {
+        for file in files {
+            let Some(name) = file.rsplit('/').next() else {
+                continue;
+            };
+            if name.len() < 8 {
+                continue;
+            }
+            let (Some(prefix), Some(suffix)) = (name.get(..3), name.get(name.len() - 4..)) else {
+                continue;
+            };
+            if !prefix.eq_ignore_ascii_case("Act") || !suffix.eq_ignore_ascii_case(".bin") {
+                continue;
+            }
+            let Some(id) = name.get(3..name.len() - 4) else {
+                continue;
+            };
+            if id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+            {
+                acts.push(id.to_owned());
+            }
+        }
+    }
+    acts.sort_by_key(|act| act_sort_key(act));
+    acts.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    acts
+}
+
+/// Sort key that orders numeric acts before short ids.
+fn act_sort_key(act: &str) -> (bool, u64, String) {
+    match act.parse::<u64>() {
+        Ok(number) => (false, number, String::new()),
+        Err(_) => (true, 0, act.to_ascii_uppercase()),
+    }
 }
 
 fn read_required(source: &dyn DataSource, path: &str) -> Result<Vec<u8>, EngineError> {
@@ -306,6 +602,11 @@ pub fn load_world(
     requested_scene: Option<&str>,
     act: Option<&str>,
 ) -> Result<LoadedWorld, EngineError> {
+    if !source.exists(Settings::PATH) {
+        return Err(EngineError::MissingAsset(
+            "Settings.ini (keyboard controls and video/audio settings)".to_owned(),
+        ));
+    }
     let detected = detect(source.as_ref())?;
     if detected.version != DataVersion::V4Legacy {
         return Err(EngineError::UnsupportedVersion(detected.version));
@@ -315,6 +616,18 @@ pub fn load_world(
 
     let (folder, act) = resolve_scene(&game_config, requested_scene, act)?;
     let stage_dir = format!("Data/Stages/{folder}");
+    if !source.exists(&Scene::path(&stage_dir, &act)) {
+        let available = available_acts(source.as_ref(), &stage_dir);
+        return Err(EngineError::MissingAct {
+            folder,
+            act,
+            available: if available.is_empty() {
+                "<none>".to_owned()
+            } else {
+                available.join(", ")
+            },
+        });
+    }
     let stage_config = StageConfig::load(&stage_dir, source.as_ref())?;
     let scene = Scene::load(&stage_dir, &act, source.as_ref())?;
 
@@ -431,33 +744,63 @@ mod tests {
         bytes
     }
 
+    fn scene_entry(folder: &str, id: &str, name: &str) -> SceneEntry {
+        SceneEntry {
+            folder: folder.to_owned(),
+            id: id.to_owned(),
+            name: name.to_owned(),
+            highlighted: 1,
+        }
+    }
+
+    fn sonic1_like_config() -> GameConfig {
+        let mut config = config();
+        config.categories[0]
+            .scenes
+            .push(scene_entry("Title", "1", "TITLE SCREEN"));
+        config.categories[1].scenes = vec![
+            scene_entry("Zone01", "1", "GREEN HILL ZONE 1"),
+            scene_entry("Zone01", "2", "2"),
+            scene_entry("Zone01", "3", "3"),
+            scene_entry("Zone02", "1", "MARBLE ZONE 1"),
+            scene_entry("Zone02", "2", "2"),
+        ];
+        config.categories[2].scenes = vec![
+            scene_entry("Special", "1", "SPECIAL STAGE 1"),
+            scene_entry("Special", "2", "SPECIAL STAGE 2"),
+        ];
+        config
+    }
+
+    fn sonic2_like_config() -> GameConfig {
+        let mut config = config();
+        config.categories[0]
+            .scenes
+            .push(scene_entry("Title", "1", "TITLE SCREEN"));
+        config.categories[1].scenes = vec![
+            scene_entry("Zone01", "1", "EMERALD HILL ZONE 1"),
+            scene_entry("Zone01", "2", "2"),
+            scene_entry("Zone02", "1", "CHEMICAL PLANT ZONE 1"),
+        ];
+        config
+    }
+
     #[test]
     fn scene_resolution_prefers_folder_then_name() {
-        let mut config = config();
-        config.categories[0].scenes.push(SceneEntry {
-            folder: "Title".to_owned(),
-            id: "1".to_owned(),
-            name: "TITLE SCREEN".to_owned(),
-            highlighted: 1,
-        });
-        config.categories[1].scenes.push(SceneEntry {
-            folder: "Zone01".to_owned(),
-            id: "2".to_owned(),
-            name: "GREEN HILL ZONE 1".to_owned(),
-            highlighted: 1,
-        });
+        let config = sonic1_like_config();
         assert_eq!(
             resolve_scene(&config, None, None).unwrap(),
-            ("Title".to_owned(), "1".to_owned())
+            ("Title".to_owned(), "1".to_owned()),
+            "the default is the first scene of the first category"
         );
         assert_eq!(
             resolve_scene(&config, Some("zone01"), None).unwrap(),
-            ("Zone01".to_owned(), "2".to_owned()),
+            ("Zone01".to_owned(), "1".to_owned()),
             "folder match uses the GameConfig id when act is absent"
         );
         assert_eq!(
             resolve_scene(&config, Some("green hill zone 1"), None).unwrap(),
-            ("Zone01".to_owned(), "2".to_owned())
+            ("Zone01".to_owned(), "1".to_owned())
         );
         assert_eq!(
             resolve_scene(&config, Some("Zone01"), Some("3")).unwrap(),
@@ -474,10 +817,227 @@ mod tests {
             ("Zone01".to_owned(), "B".to_owned()),
             "literal act ids are preserved"
         );
-        assert!(matches!(
-            resolve_scene(&config, Some("Missing"), None),
-            Err(EngineError::UnknownScene(_))
-        ));
+    }
+
+    #[test]
+    fn scene_resolution_accepts_short_names_and_punctuation() {
+        let config = sonic1_like_config();
+        for request in [
+            "GHZ",
+            "ghz",
+            "GhZ1",
+            "GHZ1",
+            "GreenHill",
+            "green hill",
+            "GREEN HILL ZONE",
+            "GREEN-HILL-ZONE-1!",
+            "  Green Hill Zone 1  ",
+        ] {
+            assert_eq!(
+                resolve_scene(&config, Some(request), None).unwrap(),
+                ("Zone01".to_owned(), "1".to_owned()),
+                "--scene {request:?}"
+            );
+        }
+        assert_eq!(
+            resolve_scene(&config, Some("GreenHill2"), None).unwrap(),
+            ("Zone01".to_owned(), "2".to_owned()),
+            "a trailing act number selects the act"
+        );
+        assert_eq!(
+            resolve_scene(&config, Some("GREEN HILL ZONE 3"), None).unwrap(),
+            ("Zone01".to_owned(), "3".to_owned())
+        );
+        assert_eq!(
+            resolve_scene(&config, Some("marble"), None).unwrap(),
+            ("Zone02".to_owned(), "1".to_owned()),
+            "a name prefix is enough"
+        );
+        assert_eq!(
+            resolve_scene(&config, Some("MZ"), None).unwrap(),
+            ("Zone02".to_owned(), "1".to_owned()),
+            "an acronym is enough"
+        );
+        assert_eq!(
+            resolve_scene(&config, Some("GHZ"), Some("2")).unwrap(),
+            ("Zone01".to_owned(), "2".to_owned()),
+            "an explicit --act beats the request's own act number"
+        );
+    }
+
+    #[test]
+    fn scene_resolution_accepts_list_indexes() {
+        let config = sonic1_like_config();
+        assert_eq!(
+            resolve_scene(&config, Some("1"), None).unwrap(),
+            ("Title".to_owned(), "1".to_owned())
+        );
+        assert_eq!(
+            resolve_scene(&config, Some(" 2 "), None).unwrap(),
+            ("Zone01".to_owned(), "1".to_owned())
+        );
+        assert_eq!(
+            resolve_scene(&config, Some("6"), None).unwrap(),
+            ("Zone02".to_owned(), "2".to_owned())
+        );
+        assert_eq!(
+            resolve_scene(&config, Some("6"), Some("1")).unwrap(),
+            ("Zone02".to_owned(), "1".to_owned())
+        );
+        let error = resolve_scene(&config, Some("9"), None).unwrap_err();
+        let EngineError::UnknownScene { requested, details } = error else {
+            panic!("expected UnknownScene, got {error:?}");
+        };
+        assert_eq!(requested, "9");
+        assert!(details.contains("1..=8"), "{details}");
+        assert!(details.contains("--list"), "{details}");
+    }
+
+    #[test]
+    fn scene_resolution_ghz_falls_back_to_the_first_regular_zone() {
+        let config = sonic2_like_config();
+        assert_eq!(
+            resolve_scene(&config, Some("GHZ"), None).unwrap(),
+            ("Zone01".to_owned(), "1".to_owned()),
+            "GHZ is the canonical first-zone shorthand on trees without Green Hill"
+        );
+        assert_eq!(
+            resolve_scene(&config, Some("ghz2"), None).unwrap(),
+            ("Zone01".to_owned(), "2".to_owned())
+        );
+        assert_eq!(
+            resolve_scene(&config, Some("EHZ"), None).unwrap(),
+            ("Zone01".to_owned(), "1".to_owned()),
+            "the native acronym still wins"
+        );
+        assert_eq!(
+            resolve_scene(&config, Some("ChemicalPlant"), None).unwrap(),
+            ("Zone02".to_owned(), "1".to_owned())
+        );
+    }
+
+    #[test]
+    fn scene_resolution_errors_list_close_candidates() {
+        let config = sonic1_like_config();
+        let error = resolve_scene(&config, Some("GREN HILL"), None).unwrap_err();
+        let EngineError::UnknownScene { requested, details } = error else {
+            panic!("expected UnknownScene, got {error:?}");
+        };
+        assert_eq!(requested, "GREN HILL");
+        assert!(details.contains("GREEN HILL ZONE 1"), "{details}");
+        assert!(details.contains("--list"), "{details}");
+
+        let error = resolve_scene(&config, Some("SPECIAL STAGE"), None).unwrap_err();
+        let EngineError::UnknownScene { details, .. } = error else {
+            panic!("expected UnknownScene, got {error:?}");
+        };
+        assert!(details.contains("ambiguous"), "{details}");
+
+        let error = resolve_scene(&config, Some("M"), None).unwrap_err();
+        let EngineError::UnknownScene { details, .. } = error else {
+            panic!("expected UnknownScene, got {error:?}");
+        };
+        assert!(details.contains("did you mean"), "{details}");
+    }
+
+    #[test]
+    fn acts_are_normalized_to_their_canonical_form() {
+        let config = sonic1_like_config();
+        for act in ["b", "B", " B "] {
+            assert_eq!(
+                resolve_scene(&config, Some("Zone01"), Some(act)).unwrap(),
+                ("Zone01".to_owned(), "B".to_owned()),
+                "--act {act:?}"
+            );
+        }
+        assert_eq!(
+            resolve_scene(&config, Some("Zone01"), Some("01")).unwrap(),
+            ("Zone01".to_owned(), "1".to_owned()),
+            "leading zeros are stripped"
+        );
+        for act in ["", "..", "1/2", "1 2"] {
+            assert!(
+                matches!(
+                    resolve_scene(&config, Some("Zone01"), Some(act)),
+                    Err(EngineError::InvalidAct(_))
+                ),
+                "--act {act:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn available_acts_scans_case_insensitively_and_sorts_naturally() {
+        use retro_io::MemorySource;
+
+        let mut source = MemorySource::new();
+        for file in [
+            "Data/Stages/Zone01/Act1.bin",
+            "Data/Stages/Zone01/act2.BIN",
+            "Data/Stages/Zone01/ActB.bin",
+            "Data/Stages/Zone01/Act10.bin",
+            "Data/Stages/Zone01/ActNote.txt",
+            "Data/Stages/Zone01/StageConfig.bin",
+        ] {
+            source.insert(file, vec![0]);
+        }
+        assert_eq!(
+            available_acts(&source, "data/stages/zone01"),
+            ["1", "2", "10", "B"]
+        );
+        assert!(available_acts(&source, "Data/Stages/Missing").is_empty());
+    }
+
+    #[test]
+    fn missing_act_file_reports_available_acts() {
+        use retro_io::MemorySource;
+
+        let mut source = MemorySource::new();
+        source.insert("Settings.ini", "[Game]\ngameType=1\n");
+        source.insert(
+            "Data/Game/GameConfig.bin",
+            game_config_bytes_with_scene("Zone01", "1"),
+        );
+        source.insert("Data/Stages/Zone01/StageConfig.bin", stage_config_bytes());
+        source.insert("Data/Stages/Zone01/Act1.bin", scene_bytes("FIRST"));
+        source.insert("Data/Stages/Zone01/ActB.bin", scene_bytes("BONUS"));
+        let source: Arc<dyn retro_io::DataSource> = Arc::new(source);
+
+        let error = match load_world(&source, Some("Zone01"), Some("3")) {
+            Err(error) => error,
+            Ok(_) => panic!("expected MissingAct"),
+        };
+        let EngineError::MissingAct {
+            folder,
+            act,
+            available,
+        } = error
+        else {
+            panic!("expected MissingAct, got {error:?}");
+        };
+        assert_eq!(folder, "Zone01");
+        assert_eq!(act, "3");
+        assert_eq!(available, "1, B");
+    }
+
+    #[test]
+    fn missing_settings_reports_the_file_name() {
+        use retro_io::MemorySource;
+
+        let mut source = MemorySource::new();
+        source.insert(
+            "Data/Game/GameConfig.bin",
+            game_config_bytes_with_scene("Zone01", "1"),
+        );
+        let source: Arc<dyn retro_io::DataSource> = Arc::new(source);
+        let error = match load_world(&source, None, None) {
+            Err(error) => error,
+            Ok(_) => panic!("expected MissingAsset"),
+        };
+        let EngineError::MissingAsset(path) = error else {
+            panic!("expected MissingAsset, got {error:?}");
+        };
+        assert!(path.contains("Settings.ini"), "{path}");
     }
 
     #[test]
