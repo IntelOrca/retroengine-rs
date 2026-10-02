@@ -1,9 +1,21 @@
-//! Engine entry point: loads an unpacked RSDK asset folder and runs headless or windowed.
+//! Engine entry point: loads an unpacked RSDK asset folder and runs headless (M3) or windowed
+//! (later milestones).
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub mod error;
+pub mod host;
+pub mod loader;
+pub mod profile;
+pub mod rng;
+pub mod runtime;
+pub mod state;
 
-pub use cli::{Args, EngineError, ResolvedAssets, resolve_assets, run};
+pub use cli::{Args, ResolvedAssets, backend_for, resolve_assets, resolve_scene_name, run};
+pub use error::EngineError;
+pub use profile::{EngineSettings, RuntimeProfile};
+pub use runtime::{DEFAULT_RNG_SEED, Engine, RunOutcome, ScriptRuntime};
+pub use state::EngineState;
 
 /// Builds a deterministic RGB565 test pattern used as the M0 parity artifact.
 #[must_use]

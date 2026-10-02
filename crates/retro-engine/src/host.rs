@@ -1,0 +1,1723 @@
+//! Engine-side script host: variables, `foreach` iteration and engine operations.
+//!
+//! This is the M3 port of the `ProcessScript` engine switches in `RSDKv4/Script.cpp` plus the
+//! collision routines in `RSDKv4/Collision.cpp` (RSDKModding/RSDKv4-Decompilation @ a7f5195).
+//! Ops that only affect rendering, audio, menus or 3D are deterministic stubs: they record
+//! themselves in [`EngineState::stub_histogram`] and never touch entity or scene state.
+//!
+//! Known gaps (documented, deterministic):
+//!
+//! * `ProcessObjectMovement` is the simplified movement in [`retro_scene::SceneCollision`].
+//! * `BoxCollision2`, `PlatformCollision`, `Copy16x16Tile`, `Set16x16TileInfo` and the 3D
+//!   matrix/vertex ops are no-ops.
+//! * `LoadStage` sets a flag instead of switching scenes mid-frame.
+//! * Save RAM reads/writes report success without touching a file.
+
+use retro_format_v4::{AnimationFile, Hitbox};
+use retro_scene::collision::{
+    C_PLATFORM, C_SOLID, C_SOLID2, C_TOUCH, CSIDE_FLOOR, CSIDE_LENTITY, CSIDE_LWALL, CSIDE_RENTITY,
+    CSIDE_ROOF, CSIDE_RWALL,
+};
+use retro_scene::{ENTITY_COUNT, TEMPENTITY_START};
+use retro_script::{Op, ScriptError, ScriptEvent, ScriptHost, VmState};
+
+use crate::state::{ENGINE_MAINGAME, EngineState, LayerState, PARALLAX_COUNT};
+
+/// First rev03 object variable id (`object.entityPos`).
+const VAR_OBJECT_ENTITY_POS: i32 = 19;
+/// Last rev03 object variable id (`object.spriteSheet`).
+const VAR_OBJECT_LAST: i32 = 72;
+/// First rev03 object value id (`object.value0`).
+const VAR_VALUE0: i32 = 73;
+/// Last rev03 object value id (`object.value47`).
+const VAR_VALUE47: i32 = 120;
+/// First rev03 stage variable id (`stage.state`).
+const VAR_STAGE_FIRST: i32 = 121;
+/// Last rev03 stage variable id (`stage.debugMode`).
+const VAR_STAGE_LAST: i32 = 147;
+/// `stage.entityPos`.
+const VAR_STAGE_ENTITY_POS: i32 = 148;
+/// First rev03 screen variable id (`screen.cameraEnabled`).
+const VAR_SCREEN_FIRST: i32 = 149;
+/// Last rev03 screen variable id (`screen.adjustCameraY`).
+const VAR_SCREEN_LAST: i32 = 163;
+/// `touchscreen.down`.
+const VAR_TOUCH_DOWN: i32 = 164;
+/// `music.volume`.
+const VAR_MUSIC_VOLUME: i32 = 167;
+/// `music.currentTrack`.
+const VAR_MUSIC_TRACK: i32 = 168;
+/// `music.position`.
+const VAR_MUSIC_POSITION: i32 = 169;
+/// `keyDown.up`.
+const VAR_KEYDOWN_FIRST: i32 = 170;
+/// `keyDown.select`.
+const VAR_KEYDOWN_LAST: i32 = 183;
+/// `keyPress.up`.
+const VAR_KEYPRESS_FIRST: i32 = 184;
+/// `keyPress.select`.
+const VAR_KEYPRESS_LAST: i32 = 197;
+/// `menu1.selection`.
+const VAR_MENU1: i32 = 198;
+/// `menu2.selection`.
+const VAR_MENU2: i32 = 199;
+/// First rev03 tile layer variable (`tileLayer.xsize`).
+const VAR_TILELAYER_FIRST: i32 = 200;
+/// Last rev03 tile layer variable (`tileLayer.deformationOffsetW`).
+const VAR_TILELAYER_LAST: i32 = 211;
+/// First rev03 horizontal parallax variable.
+const VAR_HPARALLAX_FIRST: i32 = 212;
+/// Last rev03 horizontal parallax variable.
+const VAR_HPARALLAX_LAST: i32 = 214;
+/// First rev03 vertical parallax variable.
+const VAR_VPARALLAX_FIRST: i32 = 215;
+/// Last rev03 vertical parallax variable.
+const VAR_VPARALLAX_LAST: i32 = 217;
+/// `engine.state`.
+const VAR_ENGINE_STATE: i32 = 236;
+/// `engine.language`.
+const VAR_ENGINE_LANGUAGE: i32 = 237;
+/// `engine.onlineActive`.
+const VAR_ENGINE_ONLINE_ACTIVE: i32 = 238;
+/// `engine.sfxVolume`.
+const VAR_ENGINE_SFX_VOLUME: i32 = 239;
+/// `engine.bgmVolume`.
+const VAR_ENGINE_BGM_VOLUME: i32 = 240;
+/// `engine.trialMode`.
+const VAR_ENGINE_TRIAL_MODE: i32 = 241;
+/// `engine.deviceType`.
+const VAR_ENGINE_DEVICE_TYPE: i32 = 242;
+/// `screen.currentID`.
+const VAR_SCREEN_CURRENT_ID: i32 = 243;
+/// `camera.enabled`.
+const VAR_CAMERA_FIRST: i32 = 244;
+/// `camera.adjustY`.
+const VAR_CAMERA_LAST: i32 = 249;
+/// `engine.hapticsEnabled`.
+const VAR_HAPTICS_ENABLED: i32 = 250;
+
+/// `OBJECT_BORDER_Y1`.
+const OBJECT_BORDER_Y1: i32 = 0x100;
+/// `OBJECT_BORDER_Y3`.
+const OBJECT_BORDER_Y3: i32 = 0x80;
+
+/// `PRIORITY_BOUNDS_SMALL`.
+const PRIORITY_BOUNDS_SMALL: u8 = 6;
+/// `PRIORITY_ACTIVE_SMALL`.
+const PRIORITY_ACTIVE_SMALL: u8 = 7;
+
+/// `TILEINFO_INDEX`.
+const TILEINFO_INDEX: i32 = 0;
+/// `TILEINFO_DIRECTION`.
+const TILEINFO_DIRECTION: i32 = 1;
+/// `TILEINFO_VISUALPLANE`.
+const TILEINFO_VISUALPLANE: i32 = 2;
+/// `TILEINFO_SOLIDITYA`.
+const TILEINFO_SOLIDITYA: i32 = 3;
+/// `TILEINFO_SOLIDITYB`.
+const TILEINFO_SOLIDITYB: i32 = 4;
+/// `TILEINFO_FLAGSA`.
+const TILEINFO_FLAGSA: i32 = 5;
+/// `TILEINFO_ANGLEA`.
+const TILEINFO_ANGLEA: i32 = 6;
+/// `TILEINFO_FLAGSB`.
+const TILEINFO_FLAGSB: i32 = 7;
+/// `TILEINFO_ANGLEB`.
+const TILEINFO_ANGLEB: i32 = 8;
+
+/// Script host borrowing the mutable engine state.
+pub struct EngineHost<'a> {
+    /// Engine state.
+    pub state: &'a mut EngineState,
+}
+
+impl EngineHost<'_> {
+    fn hitbox(&self, slot: usize) -> Hitbox {
+        self.state.hitbox_for(slot)
+    }
+
+    fn read_object_var(&self, var: i32, array_index: i32) -> i32 {
+        let slot = usize::try_from(array_index).ok();
+        let entity = slot
+            .and_then(|slot| self.state.entities.get(slot))
+            .copied()
+            .unwrap_or_default();
+        match var {
+            VAR_OBJECT_ENTITY_POS => array_index,
+            20 => i32::from(entity.group_id),
+            21 => i32::from(entity.type_id),
+            22 => i32::from(entity.property_value),
+            23 => entity.xpos,
+            24 => entity.ypos,
+            25 => entity.xpos >> 16,
+            26 => entity.ypos >> 16,
+            27 => entity.xvel,
+            28 => entity.yvel,
+            29 => entity.speed,
+            30 => entity.state,
+            31 => entity.rotation,
+            32 => entity.scale,
+            33 => i32::from(entity.priority),
+            34 => i32::from(entity.draw_order),
+            35 => i32::from(entity.direction),
+            36 => i32::from(entity.ink_effect),
+            37 => entity.alpha,
+            38 => i32::from(entity.frame),
+            39 => i32::from(entity.animation),
+            40 => i32::from(entity.prev_animation),
+            41 => entity.animation_speed,
+            42 => entity.animation_timer,
+            43 => entity.angle,
+            44 => entity.look_pos_x,
+            45 => entity.look_pos_y,
+            46 => i32::from(entity.collision_mode),
+            47 => i32::from(entity.collision_plane),
+            48 => i32::from(entity.control_mode),
+            49 => i32::from(entity.control_lock),
+            50 => i32::from(entity.pushing),
+            51 => i32::from(entity.visible),
+            52 => i32::from(entity.tile_collisions),
+            53 => i32::from(entity.object_interactions),
+            54 => i32::from(entity.gravity),
+            55 => i32::from(entity.up),
+            56 => i32::from(entity.down),
+            57 => i32::from(entity.left),
+            58 => i32::from(entity.right),
+            59 => i32::from(entity.jump_press),
+            60 => i32::from(entity.jump_hold),
+            61 => i32::from(entity.scroll_tracking),
+            62 => i32::from(entity.floor_sensors[0]),
+            63 => i32::from(entity.floor_sensors[1]),
+            64 => i32::from(entity.floor_sensors[2]),
+            65 => i32::from(entity.floor_sensors[3]),
+            66 => i32::from(entity.floor_sensors[4]),
+            67 => i32::from(self.hitbox_or_zero(slot).left[0]),
+            68 => i32::from(self.hitbox_or_zero(slot).top[0]),
+            69 => i32::from(self.hitbox_or_zero(slot).right[0]),
+            70 => i32::from(self.hitbox_or_zero(slot).bottom[0]),
+            71 => i32::from(self.out_of_bounds(&entity)),
+            72 => self
+                .state
+                .objects
+                .get(usize::from(entity.type_id))
+                .map(|entry| entry.sprite_sheet_id)
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    fn hitbox_or_zero(&self, slot: Option<usize>) -> Hitbox {
+        match slot {
+            Some(slot) => self.hitbox(slot),
+            None => crate::state::zero_hitbox(),
+        }
+    }
+
+    fn out_of_bounds(&self, entity: &retro_scene::Entity) -> bool {
+        let x = entity.xpos >> 16;
+        let y = entity.ypos >> 16;
+        let small =
+            entity.priority == PRIORITY_BOUNDS_SMALL || entity.priority == PRIORITY_ACTIVE_SMALL;
+        let (x1, x2, y1, y2) = if small {
+            (
+                self.state.object_borders[2],
+                self.state.object_borders[3],
+                OBJECT_BORDER_Y3,
+                self.state.screen.ysize + OBJECT_BORDER_Y3,
+            )
+        } else {
+            (
+                self.state.object_borders[0],
+                self.state.object_borders[1],
+                OBJECT_BORDER_Y1,
+                self.state.screen.ysize + OBJECT_BORDER_Y1,
+            )
+        };
+        let bound_l = self.state.screen.x_scroll.wrapping_sub(x1);
+        let bound_r = self.state.screen.x_scroll.wrapping_add(x2);
+        let bound_t = self.state.screen.y_scroll.wrapping_sub(y1);
+        let bound_b = self.state.screen.y_scroll.wrapping_add(y2);
+        x <= bound_l || x >= bound_r || y <= bound_t || y >= bound_b
+    }
+
+    fn write_object_var(&mut self, var: i32, array_index: i32, value: i32) {
+        let Ok(slot) = usize::try_from(array_index) else {
+            return;
+        };
+        let Some(entity) = self.state.entities.get_mut(slot) else {
+            return;
+        };
+        match var {
+            20 => entity.group_id = value as u16,
+            21 => entity.type_id = value as u8,
+            22 => entity.property_value = value as u8,
+            23 => entity.xpos = value,
+            24 => entity.ypos = value,
+            25 => entity.xpos = value << 16,
+            26 => entity.ypos = value << 16,
+            27 => entity.xvel = value,
+            28 => entity.yvel = value,
+            29 => entity.speed = value,
+            30 => entity.state = value,
+            31 => entity.rotation = value,
+            32 => entity.scale = value,
+            33 => entity.priority = value as u8,
+            34 => entity.draw_order = value as u8,
+            35 => entity.direction = value as u8,
+            36 => entity.ink_effect = value as u8,
+            37 => entity.alpha = value,
+            38 => entity.frame = value as u8,
+            39 => entity.animation = value as u8,
+            40 => entity.prev_animation = value as u8,
+            41 => entity.animation_speed = value,
+            42 => entity.animation_timer = value,
+            43 => entity.angle = value,
+            44 => entity.look_pos_x = value,
+            45 => entity.look_pos_y = value,
+            46 => entity.collision_mode = value as u8,
+            47 => entity.collision_plane = value as u8,
+            48 => entity.control_mode = value as i8,
+            49 => entity.control_lock = value as u8,
+            50 => entity.pushing = value as u8,
+            51 => entity.visible = value as u8,
+            52 => entity.tile_collisions = value as u8,
+            53 => entity.object_interactions = value as u8,
+            54 => entity.gravity = value as u8,
+            55 => entity.up = value as u8,
+            56 => entity.down = value as u8,
+            57 => entity.left = value as u8,
+            58 => entity.right = value as u8,
+            59 => entity.jump_press = value as u8,
+            60 => entity.jump_hold = value as u8,
+            61 => entity.scroll_tracking = value as u8,
+            62 => entity.floor_sensors[0] = value as u8,
+            63 => entity.floor_sensors[1] = value as u8,
+            64 => entity.floor_sensors[2] = value as u8,
+            65 => entity.floor_sensors[3] = value as u8,
+            66 => entity.floor_sensors[4] = value as u8,
+            _ => {}
+        }
+    }
+
+    fn read_screen_var(&self, var: i32, array_index: i32) -> i32 {
+        match var {
+            149 => self.state.camera.enabled,
+            150 => self.state.camera.target,
+            151 => self.state.camera.style,
+            152 => self.state.camera.xpos,
+            153 => self.state.camera.ypos,
+            154 => usize::try_from(array_index)
+                .ok()
+                .and_then(|index| self.state.draw_lists.get(index))
+                .map(|list| list.len() as i32)
+                .unwrap_or(0),
+            155 => self.state.screen.center_x(),
+            156 => self.state.screen.center_y(),
+            157 => self.state.screen.xsize,
+            158 => self.state.screen.ysize,
+            159 => self.state.screen.x_scroll,
+            160 => self.state.screen.y_scroll,
+            161 => self.state.camera.shake_x,
+            162 => self.state.camera.shake_y,
+            163 => self.state.camera.adjust_y,
+            _ => 0,
+        }
+    }
+
+    fn write_screen_var(&mut self, var: i32, value: i32) {
+        match var {
+            149 => self.state.camera.enabled = value,
+            150 => self.state.camera.target = value,
+            151 => self.state.camera.style = value,
+            152 => self.state.camera.xpos = value,
+            153 => self.state.camera.ypos = value,
+            159 => self.state.screen.x_scroll = value,
+            160 => self.state.screen.y_scroll = value,
+            161 => self.state.camera.shake_x = value,
+            162 => self.state.camera.shake_y = value,
+            163 => self.state.camera.adjust_y = value,
+            _ => {}
+        }
+    }
+
+    fn read_tile_layer_var(&self, var: i32, array_index: i32) -> i32 {
+        let Ok(index) = usize::try_from(array_index) else {
+            return 0;
+        };
+        let Some(layer) = self.state.layers.get(index) else {
+            return 0;
+        };
+        match var {
+            200 => layer.xsize,
+            201 => layer.ysize,
+            202 => layer.layer_type,
+            203 => layer.angle,
+            204 => layer.xpos,
+            205 => layer.ypos,
+            206 => layer.zpos,
+            207 => layer.parallax_factor,
+            208 => layer.scroll_speed,
+            209 => layer.scroll_pos,
+            210 => layer.deformation_offset,
+            211 => layer.deformation_offset_w,
+            _ => 0,
+        }
+    }
+
+    fn write_tile_layer_var(&mut self, var: i32, array_index: i32, value: i32) {
+        let Ok(index) = usize::try_from(array_index) else {
+            return;
+        };
+        let Some(layer) = self.state.layers.get_mut(index) else {
+            return;
+        };
+        match var {
+            200 => layer.xsize = value,
+            201 => layer.ysize = value,
+            202 => layer.layer_type = value,
+            203 => layer.angle = value,
+            204 => layer.xpos = value,
+            205 => layer.ypos = value,
+            206 => layer.zpos = value,
+            207 => layer.parallax_factor = value,
+            208 => layer.scroll_speed = value,
+            209 => layer.scroll_pos = value,
+            210 => layer.deformation_offset = value,
+            211 => layer.deformation_offset_w = value,
+            _ => {}
+        }
+    }
+
+    fn read_parallax_var(&self, var: i32, array_index: i32) -> i32 {
+        let Ok(index) = usize::try_from(array_index) else {
+            return 0;
+        };
+        let (table, field) = if (VAR_HPARALLAX_FIRST..=VAR_HPARALLAX_LAST).contains(&var) {
+            (&self.state.h_parallax, var - VAR_HPARALLAX_FIRST)
+        } else if (VAR_VPARALLAX_FIRST..=VAR_VPARALLAX_LAST).contains(&var) {
+            (&self.state.v_parallax, var - VAR_VPARALLAX_FIRST)
+        } else {
+            return 0;
+        };
+        match field {
+            0 => table.parallax_factor.get(index).copied().unwrap_or(0),
+            1 => table.scroll_speed.get(index).copied().unwrap_or(0),
+            _ => table.scroll_pos.get(index).copied().unwrap_or(0),
+        }
+    }
+
+    fn write_parallax_var(&mut self, var: i32, array_index: i32, value: i32) {
+        let Ok(index) = usize::try_from(array_index) else {
+            return;
+        };
+        if index >= PARALLAX_COUNT {
+            return;
+        }
+        let (table, field) = if (VAR_HPARALLAX_FIRST..=VAR_HPARALLAX_LAST).contains(&var) {
+            (&mut self.state.h_parallax, var - VAR_HPARALLAX_FIRST)
+        } else if (VAR_VPARALLAX_FIRST..=VAR_VPARALLAX_LAST).contains(&var) {
+            (&mut self.state.v_parallax, var - VAR_VPARALLAX_FIRST)
+        } else {
+            return;
+        };
+        match field {
+            0 => table.parallax_factor[index] = value,
+            1 => table.scroll_speed[index] = value,
+            _ => table.scroll_pos[index] = value,
+        }
+    }
+
+    fn read_camera_var(&self, var: i32, array_index: i32) -> i32 {
+        if array_index != 0 {
+            return 0;
+        }
+        match var {
+            VAR_CAMERA_FIRST => self.state.camera.enabled,
+            245 => self.state.camera.target,
+            246 => self.state.camera.style,
+            247 => self.state.camera.xpos,
+            248 => self.state.camera.ypos,
+            VAR_CAMERA_LAST => self.state.camera.adjust_y,
+            _ => 0,
+        }
+    }
+
+    fn write_camera_var(&mut self, var: i32, array_index: i32, value: i32) {
+        if array_index != 0 {
+            return;
+        }
+        match var {
+            VAR_CAMERA_FIRST => self.state.camera.enabled = value,
+            245 => self.state.camera.target = value,
+            246 => self.state.camera.style = value,
+            247 => self.state.camera.xpos = value,
+            248 => self.state.camera.ypos = value,
+            VAR_CAMERA_LAST => self.state.camera.adjust_y = value,
+            _ => {}
+        }
+    }
+
+    fn adjust_camera_style(&mut self) {
+        // The rev03 scripts set `screen.cameraStyle`; the legacy `screen.cameraEnabled`
+        // globals alias the single camera.
+        if self.state.camera.style < 0 {
+            self.state.camera.style = 0;
+        }
+    }
+
+    fn layer_mut(&mut self, index: i32) -> Option<&mut LayerState> {
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| self.state.layers.get_mut(index))
+    }
+
+    /// `FUNC_LOADANIMATION` implementation: read `Data/Animations/<name>` and assign it to the
+    /// current object type.
+    fn load_animation(&mut self, name: &str) {
+        if let Some(index) = self.state.animation_ids.get(name).copied() {
+            let type_id = self
+                .state
+                .entities
+                .get(self.state.object_entity_pos)
+                .map(|entity| usize::from(entity.type_id));
+            if let Some(entry) = type_id.and_then(|type_id| self.state.objects.get_mut(type_id)) {
+                entry.animation_file = Some(index);
+            }
+            return;
+        }
+        let path = format!("Data/Animations/{name}");
+        let bytes = self.state.source.read(&path).ok();
+        let Some(bytes) = bytes else {
+            return;
+        };
+        let Ok(file) = AnimationFile::from_bytes(&bytes) else {
+            return;
+        };
+        self.state
+            .animation_ids
+            .insert(name.to_owned(), self.state.animations.len());
+        self.state.animations.push(file);
+        let index = self.state.animations.len() - 1;
+        let type_id = self
+            .state
+            .entities
+            .get(self.state.object_entity_pos)
+            .map(|entity| usize::from(entity.type_id));
+        if let Some(entry) = type_id.and_then(|type_id| self.state.objects.get_mut(type_id)) {
+            entry.animation_file = Some(index);
+        }
+    }
+
+    /// `FUNC_PROCESSANIMATION` implementation.
+    fn process_animation(&mut self) {
+        let slot = self.state.object_entity_pos;
+        let Some(mut entity) = self.state.entities.get(slot).copied() else {
+            return;
+        };
+        let Some(entry) = self.state.objects.get(usize::from(entity.type_id)) else {
+            return;
+        };
+        let Some(animation_index) = entry.animation_file else {
+            return;
+        };
+        let Some(file) = self.state.animations.get(animation_index) else {
+            return;
+        };
+        let Some(animation) = file.animations.get(usize::from(entity.animation)) else {
+            return;
+        };
+        if entity.animation_speed <= 0 {
+            entity.animation_timer += i32::from(animation.speed);
+        } else {
+            if entity.animation_speed > 0xF0 {
+                entity.animation_speed = 0xF0;
+            }
+            entity.animation_timer += entity.animation_speed;
+        }
+        if entity.animation != entity.prev_animation {
+            entity.prev_animation = entity.animation;
+            entity.frame = 0;
+            entity.animation_timer = 0;
+            entity.animation_speed = 0;
+        }
+        if entity.animation_timer >= 0xF0 {
+            entity.animation_timer -= 0xF0;
+            entity.frame = entity.frame.wrapping_add(1);
+        }
+        if entity.frame >= animation.playback_frame_count {
+            entity.frame = animation.loop_point;
+        }
+        if let Some(target) = self.state.entities.get_mut(slot) {
+            *target = entity;
+        }
+    }
+
+    fn process_object_control(&mut self) {
+        let slot = self.state.object_entity_pos;
+        let Some(mut entity) = self.state.entities.get(slot).copied() else {
+            return;
+        };
+        if entity.control_mode == 0 {
+            entity.up = u8::from(self.state.input.up);
+            entity.down = u8::from(self.state.input.down);
+            if !self.state.input.left || !self.state.input.right {
+                entity.left = u8::from(self.state.input.left);
+                entity.right = u8::from(self.state.input.right);
+            } else {
+                entity.left = 0;
+                entity.right = 0;
+            }
+            entity.jump_hold = u8::from(
+                self.state.input.button_c || self.state.input.button_b || self.state.input.button_a,
+            );
+            entity.jump_press = u8::from(
+                self.state.input_press.button_c
+                    || self.state.input_press.button_b
+                    || self.state.input_press.button_a,
+            );
+        }
+        if let Some(target) = self.state.entities.get_mut(slot) {
+            *target = entity;
+        }
+    }
+
+    fn set_music_track(&mut self, value: i32) {
+        if value >= 0 {
+            self.state.music_track = value;
+        }
+    }
+}
+
+impl ScriptHost for EngineHost<'_> {
+    fn engine_op(&mut self, op: Op, state: &mut VmState) -> Result<(), ScriptError> {
+        let operands = state.operands;
+        match op {
+            Op::Rand => {
+                let max = operands[1];
+                state.operands[0] = self.state.rng.range(max);
+                self.state.record_op("Rand");
+            }
+            Op::Sin => {
+                state.operands[0] = self.state.math.sin512(operands[1]);
+                self.state.record_op("Sin");
+            }
+            Op::Cos => {
+                state.operands[0] = self.state.math.cos512(operands[1]);
+                self.state.record_op("Cos");
+            }
+            Op::Sin256 => {
+                state.operands[0] = self.state.math.sin256(operands[1]);
+                self.state.record_op("Sin256");
+            }
+            Op::Cos256 => {
+                state.operands[0] = self.state.math.cos256(operands[1]);
+                self.state.record_op("Cos256");
+            }
+            Op::ATan2 => {
+                state.operands[0] = self.state.math.atan2(operands[1], operands[2]);
+                self.state.record_op("ATan2");
+            }
+            Op::LoadSpriteSheet => {
+                let name = state.script_text.clone();
+                let index = self
+                    .state
+                    .sprite_sheets
+                    .iter()
+                    .position(|candidate| *candidate == name)
+                    .unwrap_or_else(|| {
+                        self.state.sprite_sheets.push(name);
+                        self.state.sprite_sheets.len() - 1
+                    });
+                let type_id = self
+                    .state
+                    .entities
+                    .get(self.state.object_entity_pos)
+                    .map(|entity| usize::from(entity.type_id));
+                if let Some(entry) = type_id.and_then(|type_id| self.state.objects.get_mut(type_id))
+                {
+                    entry.sprite_sheet_id = index as i32;
+                }
+                self.state.record_op("LoadSpriteSheet");
+            }
+            Op::LoadAnimation => {
+                let name = state.script_text.clone();
+                self.state.record_op("LoadAnimation");
+                self.load_animation(&name);
+            }
+            Op::GetAnimationByName => {
+                let name = state.script_text.clone();
+                let mut result = 0i32;
+                let type_id = self
+                    .state
+                    .entities
+                    .get(self.state.object_entity_pos)
+                    .map(|entity| usize::from(entity.type_id));
+                let animation_index = type_id
+                    .and_then(|type_id| self.state.objects.get(type_id))
+                    .and_then(|entry| entry.animation_file);
+                if let Some(file) =
+                    animation_index.and_then(|index| self.state.animations.get(index))
+                {
+                    for (index, animation) in file.animations.iter().enumerate() {
+                        if animation.name == name {
+                            result = index as i32;
+                            break;
+                        }
+                    }
+                }
+                state.operands[0] = result;
+                self.state.record_op("GetAnimationByName");
+            }
+            Op::ResetObjectEntity => {
+                self.state.entities.reset_object_entity(
+                    usize::try_from(operands[0]).unwrap_or(usize::MAX),
+                    operands[1] as u8,
+                    operands[2] as u8,
+                    operands[3],
+                    operands[4],
+                );
+                self.state.record_op("ResetObjectEntity");
+            }
+            Op::CreateTempObject => {
+                let cursor = &mut state.array_position[8];
+                let clamped = if (TEMPENTITY_START as i32..ENTITY_COUNT as i32).contains(cursor) {
+                    *cursor as usize
+                } else {
+                    TEMPENTITY_START
+                };
+                let mut slot_cursor = clamped;
+                self.state.entities.create_temp_object(
+                    &mut slot_cursor,
+                    operands[0] as u8,
+                    operands[1] as u8,
+                    operands[2],
+                    operands[3],
+                );
+                state.array_position[8] = slot_cursor as i32;
+                self.state.record_op("CreateTempObject");
+            }
+            Op::GetObjectValue => {
+                let value = if operands[1] < 48 {
+                    usize::try_from(operands[2])
+                        .ok()
+                        .and_then(|slot| self.state.entities.get(slot))
+                        .and_then(|entity| {
+                            usize::try_from(operands[1]).ok().map(|i| entity.values[i])
+                        })
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                state.operands[0] = value;
+                self.state.record_op("GetObjectValue");
+            }
+            Op::SetObjectValue => {
+                if operands[1] < 48
+                    && let Ok(value_index) = usize::try_from(operands[1])
+                    && let Ok(slot) = usize::try_from(operands[2])
+                    && let Some(entity) = self.state.entities.get_mut(slot)
+                {
+                    entity.values[value_index] = operands[0];
+                }
+                self.state.record_op("SetObjectValue");
+            }
+            Op::CopyObject => {
+                self.state.entities.copy_objects(
+                    usize::try_from(operands[0]).unwrap_or(usize::MAX),
+                    usize::try_from(operands[1]).unwrap_or(usize::MAX),
+                    operands[2],
+                );
+                self.state.record_op("CopyObject");
+            }
+            Op::BoxCollisionTest => {
+                let result = self.box_collision_test(operands);
+                self.state.record_op("BoxCollisionTest");
+                state.check_result = result;
+            }
+            Op::ProcessObjectMovement => {
+                let slot = self.state.object_entity_pos;
+                let on_ground = self.state.collision.as_mut().is_some_and(|collision| {
+                    collision.process_object_movement(&mut self.state.entities, slot)
+                });
+                state.check_result = i32::from(on_ground);
+                self.state.record_op("ProcessObjectMovement");
+            }
+            Op::ProcessObjectControl => {
+                self.state.record_op("ProcessObjectControl");
+                self.process_object_control();
+            }
+            Op::ProcessAnimation => {
+                self.state.record_op("ProcessAnimation");
+                self.process_animation();
+            }
+            Op::ObjectTileCollision => {
+                self.state.record_op("ObjectTileCollision");
+                state.check_result = i32::from(self.object_tile_collision(operands));
+            }
+            Op::ObjectTileGrip => {
+                self.state.record_op("ObjectTileGrip");
+                state.check_result = i32::from(self.object_tile_grip(operands));
+            }
+            Op::SetObjectRange => {
+                let width = operands[0];
+                let offset = (width >> 1).wrapping_sub(self.state.screen.center_x());
+                self.state.object_borders = [
+                    offset.wrapping_add(0x80),
+                    width.wrapping_add(0x80).wrapping_sub(offset),
+                    offset.wrapping_add(0x20),
+                    width.wrapping_add(0x20).wrapping_sub(offset),
+                ];
+                self.state.record_op("SetObjectRange");
+            }
+            Op::CheckCameraProximity => {
+                state.check_result = 0;
+                if operands[2] > 0 && operands[3] > 0 {
+                    let dx = operands[0]
+                        .wrapping_sub(self.state.camera.xpos)
+                        .wrapping_abs();
+                    let dy = operands[1]
+                        .wrapping_sub(self.state.camera.ypos)
+                        .wrapping_abs();
+                    state.check_result = i32::from(dx < operands[2] && dy < operands[3]);
+                }
+                self.state.record_op("CheckCameraProximity");
+            }
+            Op::CheckCurrentStageFolder => {
+                let text = state.script_text.clone();
+                let folder = self.state.stage_folder.clone();
+                let mut result = folder == text;
+                if !result && folder.len() > text.len() {
+                    result = folder
+                        .get(folder.len() - text.len()..)
+                        .is_some_and(|suffix| suffix == text);
+                }
+                state.check_result = i32::from(result);
+                self.state.record_op("CheckCurrentStageFolder");
+            }
+            Op::CheckTouchRect => {
+                state.check_result = -1;
+                self.state.record_op("CheckTouchRect");
+            }
+            Op::GetTileLayerEntry => {
+                let value = self
+                    .state
+                    .layers
+                    .get(usize::try_from(operands[1]).unwrap_or(usize::MAX))
+                    .map(|layer| layer.entry(operands[2], operands[3]))
+                    .unwrap_or(0);
+                state.operands[0] = i32::from(value);
+                self.state.record_op("GetTileLayerEntry");
+            }
+            Op::SetTileLayerEntry => {
+                if let Some(layer) = self.layer_mut(operands[1]) {
+                    layer.set_entry(operands[2], operands[3], operands[0] as u16);
+                }
+                self.state.record_op("SetTileLayerEntry");
+            }
+            Op::GetBit => {
+                state.operands[0] = (operands[1] & (1 << operands[2])) >> operands[2];
+                self.state.record_op("GetBit");
+            }
+            Op::SetBit => {
+                if operands[2] <= 0 {
+                    state.operands[0] &= !(1 << operands[1]);
+                } else {
+                    state.operands[0] |= 1 << operands[1];
+                }
+                self.state.record_op("SetBit");
+            }
+            Op::ClearDrawList => {
+                if let Some(list) = usize::try_from(operands[0])
+                    .ok()
+                    .and_then(|index| self.state.draw_lists.get_mut(index))
+                {
+                    list.clear();
+                }
+                self.state.record_op("ClearDrawList");
+            }
+            Op::AddDrawListEntityRef => {
+                if let Some(list) = usize::try_from(operands[0])
+                    .ok()
+                    .and_then(|index| self.state.draw_lists.get_mut(index))
+                {
+                    list.push(operands[1]);
+                }
+                self.state.record_op("AddDrawListEntityRef");
+            }
+            Op::GetDrawListEntityRef => {
+                let value = usize::try_from(operands[1])
+                    .ok()
+                    .and_then(|index| self.state.draw_lists.get(index))
+                    .and_then(|list| usize::try_from(operands[2]).ok().and_then(|i| list.get(i)))
+                    .copied()
+                    .unwrap_or(0);
+                state.operands[0] = value;
+                self.state.record_op("GetDrawListEntityRef");
+            }
+            Op::SetDrawListEntityRef => {
+                if let Some(list) = usize::try_from(operands[1])
+                    .ok()
+                    .and_then(|index| self.state.draw_lists.get_mut(index))
+                    && let Some(slot) = usize::try_from(operands[2])
+                        .ok()
+                        .and_then(|index| list.get_mut(index))
+                {
+                    *slot = operands[0];
+                }
+                self.state.record_op("SetDrawListEntityRef");
+            }
+            Op::Get16x16TileInfo => {
+                state.operands[4] = operands[1] >> 7;
+                state.operands[5] = operands[2] >> 7;
+                let chunk = self
+                    .state
+                    .layers
+                    .first()
+                    .map(|layer| layer.entry(state.operands[4], state.operands[5]))
+                    .unwrap_or(0);
+                let index = (usize::from(chunk) << 6)
+                    + usize::try_from((operands[1] & 0x7F) >> 4).unwrap_or(0)
+                    + 8 * usize::try_from((operands[2] & 0x7F) >> 4).unwrap_or(0);
+                state.operands[6] = index as i32;
+                let value = match operands[3] {
+                    TILEINFO_INDEX => self
+                        .state
+                        .collision
+                        .as_ref()
+                        .and_then(|collision| collision.tiles.entries.get(index))
+                        .map(|tile| i32::from(tile.tile_index))
+                        .unwrap_or(0),
+                    TILEINFO_DIRECTION => self
+                        .state
+                        .collision
+                        .as_ref()
+                        .and_then(|collision| collision.tiles.entries.get(index))
+                        .map(|tile| i32::from(tile.direction))
+                        .unwrap_or(0),
+                    TILEINFO_VISUALPLANE => self
+                        .state
+                        .collision
+                        .as_ref()
+                        .and_then(|collision| collision.tiles.entries.get(index))
+                        .map(|tile| i32::from(tile.visual_plane))
+                        .unwrap_or(0),
+                    TILEINFO_SOLIDITYA => self
+                        .state
+                        .collision
+                        .as_ref()
+                        .and_then(|collision| collision.tiles.entries.get(index))
+                        .map(|tile| i32::from(tile.collision_flag_a))
+                        .unwrap_or(0),
+                    TILEINFO_SOLIDITYB => self
+                        .state
+                        .collision
+                        .as_ref()
+                        .and_then(|collision| collision.tiles.entries.get(index))
+                        .map(|tile| i32::from(tile.collision_flag_b))
+                        .unwrap_or(0),
+                    TILEINFO_FLAGSA | TILEINFO_ANGLEA | TILEINFO_FLAGSB | TILEINFO_ANGLEB => {
+                        let plane = if matches!(operands[3], TILEINFO_FLAGSA | TILEINFO_ANGLEA) {
+                            0
+                        } else {
+                            1
+                        };
+                        let tile_index = self
+                            .state
+                            .collision
+                            .as_ref()
+                            .and_then(|collision| collision.tiles.entries.get(index))
+                            .map(|tile| usize::from(tile.tile_index))
+                            .unwrap_or(0);
+                        let mask = self
+                            .state
+                            .collision
+                            .as_ref()
+                            .and_then(|collision| collision.mask_tile(plane, tile_index));
+                        match operands[3] {
+                            TILEINFO_FLAGSA | TILEINFO_FLAGSB => {
+                                mask.map(|tile| i32::from(tile.flags)).unwrap_or(0)
+                            }
+                            _ => mask.map(|tile| tile.angle as i32).unwrap_or(0),
+                        }
+                    }
+                    _ => 0,
+                };
+                state.operands[0] = value;
+                self.state.record_op("Get16x16TileInfo");
+            }
+            Op::Set16x16TileInfo => {
+                self.state.record_stub(stub_name(op));
+            }
+            Op::Copy16x16Tile => {
+                self.state.record_stub(stub_name(op));
+            }
+            Op::GetPaletteEntry => {
+                state.operands[2] = 0;
+                self.state.record_stub(stub_name(op));
+            }
+            Op::SetPaletteEntry => {
+                self.state.record_stub(stub_name(op));
+            }
+            Op::ReadSaveRAM => {
+                state.check_result = 1;
+                self.state.record_stub(stub_name(op));
+            }
+            Op::WriteSaveRAM => {
+                state.check_result = 1;
+                self.state.record_stub(stub_name(op));
+            }
+            Op::LoadStage => {
+                self.state.load_stage_requested = true;
+                self.state.record_stub(stub_name(op));
+            }
+            Op::GetTextInfo => {
+                state.operands[0] = 0;
+                self.state.record_stub(stub_name(op));
+            }
+            Op::LoadTextFile | Op::LoadFontFile | Op::DrawText | Op::GetVersionNumber => {
+                self.state.record_stub(stub_name(op));
+            }
+            Op::SetMusicTrack => {
+                self.state.record_stub(stub_name(op));
+                self.set_music_track(operands[1]);
+            }
+            Op::PlayMusic => {
+                self.state.record_stub(stub_name(op));
+                self.set_music_track(operands[0]);
+            }
+            Op::StopMusic => {
+                self.state.record_stub(stub_name(op));
+            }
+            Op::PauseMusic | Op::ResumeMusic => {
+                self.state.record_stub(stub_name(op));
+            }
+            Op::SwapMusicTrack => {
+                self.state.record_stub(stub_name(op));
+                self.set_music_track(operands[1]);
+            }
+            Op::PlaySfx | Op::StopSfx | Op::SetSfxAttributes => {
+                self.state.record_stub(stub_name(op));
+            }
+            Op::CallNativeFunction | Op::CallNativeFunction2 | Op::CallNativeFunction4 => {
+                self.state.record_stub(stub_name(op));
+            }
+            Op::Print => {
+                self.state.record_stub(stub_name(op));
+            }
+            Op::ClearScreen
+            | Op::DrawSprite
+            | Op::DrawSpriteXY
+            | Op::DrawSpriteScreenXY
+            | Op::DrawTintRect
+            | Op::DrawNumbers
+            | Op::DrawActName
+            | Op::DrawMenu
+            | Op::DrawRect
+            | Op::DrawSpriteFX
+            | Op::DrawSpriteScreenFX
+            | Op::Draw3DScene
+            | Op::DrawObjectAnimation
+            | Op::SpriteFrame
+            | Op::EditFrame
+            | Op::LoadPalette
+            | Op::RotatePalette
+            | Op::SetScreenFade
+            | Op::SetActivePalette
+            | Op::SetPaletteFade
+            | Op::CopyPalette
+            | Op::SetupMenu
+            | Op::AddMenuEntry
+            | Op::EditMenuEntry
+            | Op::RemoveSpriteSheet
+            | Op::SetIdentityMatrix
+            | Op::MatrixMultiply
+            | Op::MatrixTranslateXYZ
+            | Op::MatrixScaleXYZ
+            | Op::MatrixRotateX
+            | Op::MatrixRotateY
+            | Op::MatrixRotateZ
+            | Op::MatrixRotateXYZ
+            | Op::MatrixInverse
+            | Op::TransformVertices
+            | Op::SetLayerDeformation
+            | Op::SetScreenCount
+            | Op::SetScreenVertices
+            | Op::GetInputDeviceID
+            | Op::GetFilteredInputDeviceID
+            | Op::GetInputDeviceType
+            | Op::IsInputDeviceAssigned
+            | Op::AssignInputSlotToDevice
+            | Op::IsInputSlotAssigned
+            | Op::ResetInputSlotAssignments => {
+                self.state.record_stub(stub_name(op));
+            }
+            _ => {
+                self.state.record_stub(stub_name(op));
+            }
+        }
+        Ok(())
+    }
+
+    fn read_engine_var(
+        &mut self,
+        var: i32,
+        array_index: i32,
+        _state: &mut VmState,
+    ) -> Result<i32, ScriptError> {
+        let value = if (VAR_OBJECT_ENTITY_POS..=VAR_OBJECT_LAST).contains(&var) {
+            self.read_object_var(var, array_index)
+        } else if (VAR_VALUE0..=VAR_VALUE47).contains(&var) {
+            usize::try_from(array_index)
+                .ok()
+                .and_then(|slot| self.state.entities.get(slot))
+                .and_then(|entity| {
+                    usize::try_from(var - VAR_VALUE0)
+                        .ok()
+                        .map(|index| entity.values[index])
+                })
+                .unwrap_or(0)
+        } else if (VAR_STAGE_FIRST..=VAR_STAGE_LAST).contains(&var) {
+            self.state.stage.read(var, array_index).unwrap_or(0)
+        } else if var == VAR_STAGE_ENTITY_POS {
+            self.state.object_entity_pos as i32
+        } else if (VAR_SCREEN_FIRST..=VAR_SCREEN_LAST).contains(&var) {
+            self.read_screen_var(var, array_index)
+        } else if var == VAR_TOUCH_DOWN {
+            usize::try_from(array_index)
+                .ok()
+                .and_then(|index| self.state.touch_down.get(index))
+                .copied()
+                .unwrap_or(0)
+        } else if var == VAR_TOUCH_DOWN + 1 {
+            usize::try_from(array_index)
+                .ok()
+                .and_then(|index| self.state.touch_x.get(index))
+                .copied()
+                .unwrap_or(0)
+        } else if var == VAR_TOUCH_DOWN + 2 {
+            usize::try_from(array_index)
+                .ok()
+                .and_then(|index| self.state.touch_y.get(index))
+                .copied()
+                .unwrap_or(0)
+        } else if var == VAR_MUSIC_VOLUME {
+            100
+        } else if var == VAR_MUSIC_TRACK {
+            self.state.music_track
+        } else if var == VAR_MUSIC_POSITION {
+            0
+        } else if (VAR_KEYDOWN_FIRST..=VAR_KEYDOWN_LAST).contains(&var) {
+            i32::from(self.state.input.down(var).unwrap_or(false))
+        } else if (VAR_KEYPRESS_FIRST..=VAR_KEYPRESS_LAST).contains(&var) {
+            i32::from(self.state.input_press.press(var).unwrap_or(false))
+        } else if var == VAR_MENU1 {
+            self.state.menu1_selection
+        } else if var == VAR_MENU2 {
+            self.state.menu2_selection
+        } else if (VAR_TILELAYER_FIRST..=VAR_TILELAYER_LAST).contains(&var) {
+            self.read_tile_layer_var(var, array_index)
+        } else if (VAR_HPARALLAX_FIRST..=VAR_VPARALLAX_LAST).contains(&var) {
+            self.read_parallax_var(var, array_index)
+        } else if var == VAR_ENGINE_STATE {
+            ENGINE_MAINGAME
+        } else if var == VAR_ENGINE_SFX_VOLUME || var == VAR_ENGINE_BGM_VOLUME {
+            100
+        } else if (VAR_CAMERA_FIRST..=VAR_CAMERA_LAST).contains(&var) {
+            self.read_camera_var(var, array_index)
+        } else {
+            let _ = (
+                VAR_ENGINE_LANGUAGE,
+                VAR_ENGINE_ONLINE_ACTIVE,
+                VAR_ENGINE_TRIAL_MODE,
+                VAR_ENGINE_DEVICE_TYPE,
+                VAR_SCREEN_CURRENT_ID,
+                VAR_HAPTICS_ENABLED,
+            );
+            0
+        };
+        Ok(value)
+    }
+
+    fn write_engine_var(
+        &mut self,
+        var: i32,
+        array_index: i32,
+        value: i32,
+        _state: &mut VmState,
+    ) -> Result<(), ScriptError> {
+        if (VAR_OBJECT_ENTITY_POS..=VAR_OBJECT_LAST).contains(&var) {
+            self.write_object_var(var, array_index, value);
+        } else if (VAR_VALUE0..=VAR_VALUE47).contains(&var) {
+            if let Ok(slot) = usize::try_from(array_index)
+                && let Ok(index) = usize::try_from(var - VAR_VALUE0)
+                && let Some(entity) = self.state.entities.get_mut(slot)
+            {
+                entity.values[index] = value;
+            }
+        } else if (VAR_STAGE_FIRST..=VAR_STAGE_LAST).contains(&var) {
+            self.state.stage.write(var, array_index, value);
+        } else if (VAR_SCREEN_FIRST..=VAR_SCREEN_LAST).contains(&var) {
+            self.write_screen_var(var, value);
+        } else if (VAR_TILELAYER_FIRST..=VAR_TILELAYER_LAST).contains(&var) {
+            self.write_tile_layer_var(var, array_index, value);
+        } else if (VAR_HPARALLAX_FIRST..=VAR_VPARALLAX_LAST).contains(&var) {
+            self.write_parallax_var(var, array_index, value);
+        } else if (VAR_CAMERA_FIRST..=VAR_CAMERA_LAST).contains(&var) {
+            self.write_camera_var(var, array_index, value);
+        }
+        // Input, music, touchscreen and engine globals are read-only in M3.
+        if (VAR_SCREEN_FIRST..=VAR_SCREEN_LAST).contains(&var) {
+            self.adjust_camera_style();
+        }
+        Ok(())
+    }
+
+    fn object_entity_pos(&self) -> i32 {
+        self.state.object_entity_pos as i32
+    }
+
+    fn foreach_next(
+        &mut self,
+        op: Op,
+        selector: i32,
+        loop_index: i32,
+        event: ScriptEvent,
+        _state: &mut VmState,
+    ) -> Result<Option<i32>, ScriptError> {
+        match op {
+            Op::ForEachActive => {
+                let list = usize::try_from(selector)
+                    .ok()
+                    .and_then(|index| self.state.type_groups.get(index));
+                let index = usize::try_from(loop_index).ok();
+                Ok(list
+                    .zip(index)
+                    .and_then(|(list, index)| list.entity_refs.get(index).copied()))
+            }
+            Op::ForEachAll => {
+                if selector < 0 || selector >= retro_scene::OBJECT_COUNT as i32 {
+                    return Ok(None);
+                }
+                let bound = if event == ScriptEvent::Setup {
+                    TEMPENTITY_START
+                } else {
+                    ENTITY_COUNT
+                };
+                let mut index = usize::try_from(loop_index).unwrap_or(0);
+                while index < bound {
+                    let matches = self
+                        .state
+                        .entities
+                        .get(index)
+                        .is_some_and(|entity| i32::from(entity.type_id) == selector);
+                    if matches {
+                        return Ok(Some(index as i32));
+                    }
+                    index += 1;
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Human-readable static name for an op, used by the stub histogram.
+fn stub_name(op: Op) -> &'static str {
+    match op {
+        Op::Set16x16TileInfo => "Set16x16TileInfo",
+        Op::Copy16x16Tile => "Copy16x16Tile",
+        Op::GetPaletteEntry => "GetPaletteEntry",
+        Op::SetPaletteEntry => "SetPaletteEntry",
+        Op::ReadSaveRAM => "ReadSaveRAM",
+        Op::WriteSaveRAM => "WriteSaveRAM",
+        Op::LoadStage => "LoadStage",
+        Op::GetTextInfo => "GetTextInfo",
+        Op::LoadTextFile => "LoadTextFile",
+        Op::LoadFontFile => "LoadFontFile",
+        Op::DrawText => "DrawText",
+        Op::GetVersionNumber => "GetVersionNumber",
+        Op::SetMusicTrack => "SetMusicTrack",
+        Op::PlayMusic => "PlayMusic",
+        Op::StopMusic => "StopMusic",
+        Op::PauseMusic => "PauseMusic",
+        Op::ResumeMusic => "ResumeMusic",
+        Op::SwapMusicTrack => "SwapMusicTrack",
+        Op::PlaySfx => "PlaySfx",
+        Op::StopSfx => "StopSfx",
+        Op::SetSfxAttributes => "SetSfxAttributes",
+        Op::CallNativeFunction => "CallNativeFunction",
+        Op::CallNativeFunction2 => "CallNativeFunction2",
+        Op::CallNativeFunction4 => "CallNativeFunction4",
+        Op::Print => "Print",
+        Op::DrawSprite => "DrawSprite",
+        Op::DrawSpriteXY => "DrawSpriteXY",
+        Op::DrawSpriteScreenXY => "DrawSpriteScreenXY",
+        Op::DrawTintRect => "DrawTintRect",
+        Op::DrawNumbers => "DrawNumbers",
+        Op::DrawActName => "DrawActName",
+        Op::DrawMenu => "DrawMenu",
+        Op::DrawRect => "DrawRect",
+        Op::DrawSpriteFX => "DrawSpriteFX",
+        Op::DrawSpriteScreenFX => "DrawSpriteScreenFX",
+        Op::Draw3DScene => "Draw3DScene",
+        Op::DrawObjectAnimation => "DrawObjectAnimation",
+        Op::SpriteFrame => "SpriteFrame",
+        Op::EditFrame => "EditFrame",
+        Op::LoadPalette => "LoadPalette",
+        Op::RotatePalette => "RotatePalette",
+        Op::SetScreenFade => "SetScreenFade",
+        Op::SetActivePalette => "SetActivePalette",
+        Op::SetPaletteFade => "SetPaletteFade",
+        Op::CopyPalette => "CopyPalette",
+        Op::ClearScreen => "ClearScreen",
+        Op::SetupMenu => "SetupMenu",
+        Op::AddMenuEntry => "AddMenuEntry",
+        Op::EditMenuEntry => "EditMenuEntry",
+        Op::RemoveSpriteSheet => "RemoveSpriteSheet",
+        Op::SetIdentityMatrix => "SetIdentityMatrix",
+        Op::MatrixMultiply => "MatrixMultiply",
+        Op::MatrixTranslateXYZ => "MatrixTranslateXYZ",
+        Op::MatrixScaleXYZ => "MatrixScaleXYZ",
+        Op::MatrixRotateX => "MatrixRotateX",
+        Op::MatrixRotateY => "MatrixRotateY",
+        Op::MatrixRotateZ => "MatrixRotateZ",
+        Op::MatrixRotateXYZ => "MatrixRotateXYZ",
+        Op::MatrixInverse => "MatrixInverse",
+        Op::TransformVertices => "TransformVertices",
+        Op::SetLayerDeformation => "SetLayerDeformation",
+        Op::SetScreenCount => "SetScreenCount",
+        Op::SetScreenVertices => "SetScreenVertices",
+        Op::GetInputDeviceID => "GetInputDeviceID",
+        Op::GetFilteredInputDeviceID => "GetFilteredInputDeviceID",
+        Op::GetInputDeviceType => "GetInputDeviceType",
+        Op::IsInputDeviceAssigned => "IsInputDeviceAssigned",
+        Op::AssignInputSlotToDevice => "AssignInputSlotToDevice",
+        Op::IsInputSlotAssigned => "IsInputSlotAssigned",
+        Op::ResetInputSlotAssignments => "ResetInputSlotAssignments",
+        _ => "Unimplemented",
+    }
+}
+
+impl EngineHost<'_> {
+    fn box_collision_test(&mut self, operands: [i32; 16]) -> i32 {
+        let collision_type = operands[0];
+        let this_slot = usize::try_from(operands[1]).unwrap_or(usize::MAX);
+        let other_slot = usize::try_from(operands[6]).unwrap_or(usize::MAX);
+        match collision_type {
+            C_TOUCH => {
+                let hit =
+                    self.with_collision_entities(|collision, entities, objects, animations| {
+                        let hitbox = |_slot: usize, entity: &retro_scene::Entity| {
+                            crate::state::hitbox_from(objects, animations, entity)
+                        };
+                        collision.touch_collision(
+                            entities,
+                            this_slot,
+                            operands[2],
+                            operands[3],
+                            operands[4],
+                            operands[5],
+                            other_slot,
+                            operands[7],
+                            operands[8],
+                            operands[9],
+                            operands[10],
+                            &hitbox,
+                        )
+                    });
+                i32::from(hit)
+            }
+            C_SOLID => self.with_collision_entities(|collision, entities, objects, animations| {
+                let hitbox = |_slot: usize, entity: &retro_scene::Entity| {
+                    crate::state::hitbox_from(objects, animations, entity)
+                };
+                collision.box_collision(
+                    entities,
+                    this_slot,
+                    operands[2],
+                    operands[3],
+                    operands[4],
+                    operands[5],
+                    other_slot,
+                    operands[7],
+                    operands[8],
+                    operands[9],
+                    operands[10],
+                    &hitbox,
+                )
+            }),
+            C_SOLID2 | C_PLATFORM => 0,
+            _ => 0,
+        }
+    }
+
+    fn with_collision_entities<T>(
+        &mut self,
+        run: impl FnOnce(
+            &mut retro_scene::SceneCollision,
+            &mut retro_scene::EntityStore,
+            &retro_scene::ObjectRegistry,
+            &[AnimationFile],
+        ) -> T,
+    ) -> T
+    where
+        T: Default,
+    {
+        let Some(collision) = self.state.collision.as_mut() else {
+            return T::default();
+        };
+        run(
+            collision,
+            &mut self.state.entities,
+            &self.state.objects,
+            &self.state.animations,
+        )
+    }
+
+    fn object_tile_collision(&mut self, operands: [i32; 16]) -> bool {
+        let slot = self.state.object_entity_pos;
+        let side = operands[0];
+        let Some(collision) = self.state.collision.as_mut() else {
+            return false;
+        };
+        let entities = &mut self.state.entities;
+        match side {
+            CSIDE_FLOOR => collision.object_floor_collision(
+                entities,
+                slot,
+                operands[1],
+                operands[2],
+                operands[3] as usize,
+            ),
+            CSIDE_LWALL => collision.object_lwall_collision(
+                entities,
+                slot,
+                operands[1],
+                operands[2],
+                operands[3] as usize,
+            ),
+            CSIDE_RWALL => collision.object_rwall_collision(
+                entities,
+                slot,
+                operands[1] - 1,
+                operands[2],
+                operands[3] as usize,
+            ),
+            CSIDE_ROOF => collision.object_roof_collision(
+                entities,
+                slot,
+                operands[1],
+                operands[2] - 1,
+                operands[3] as usize,
+            ),
+            CSIDE_LENTITY => {
+                let plane = usize::try_from(operands[1])
+                    .ok()
+                    .and_then(|other| entities.get(other))
+                    .map(|entity| usize::from(entity.collision_plane))
+                    .unwrap_or(0);
+                collision.object_lwall_collision(entities, slot, operands[2], 0, plane)
+            }
+            CSIDE_RENTITY => {
+                let plane = usize::try_from(operands[1])
+                    .ok()
+                    .and_then(|other| entities.get(other))
+                    .map(|entity| usize::from(entity.collision_plane))
+                    .unwrap_or(0);
+                collision.object_lwall_collision(entities, slot, operands[2] - 1, 0, plane)
+            }
+            _ => false,
+        }
+    }
+
+    fn object_tile_grip(&mut self, operands: [i32; 16]) -> bool {
+        let slot = self.state.object_entity_pos;
+        let side = operands[0];
+        let groups = std::mem::take(&mut self.state.type_groups);
+        let result = {
+            let Some(collision) = self.state.collision.as_mut() else {
+                self.state.type_groups = groups;
+                return false;
+            };
+            let entities = &mut self.state.entities;
+            match side {
+                CSIDE_FLOOR => collision.object_floor_grip(
+                    entities,
+                    slot,
+                    operands[1],
+                    operands[2],
+                    operands[3] as usize,
+                ),
+                CSIDE_LWALL => collision.object_lwall_grip(
+                    entities,
+                    slot,
+                    operands[1],
+                    operands[2],
+                    operands[3] as usize,
+                ),
+                CSIDE_RWALL => collision.object_rwall_grip(
+                    entities,
+                    slot,
+                    operands[1] - 1,
+                    operands[2],
+                    operands[3] as usize,
+                ),
+                CSIDE_ROOF => collision.object_roof_grip(
+                    entities,
+                    slot,
+                    operands[1],
+                    operands[2] - 1,
+                    operands[3] as usize,
+                ),
+                CSIDE_LENTITY => collision.object_lentity_grip(
+                    entities,
+                    slot,
+                    operands[1],
+                    operands[2],
+                    operands[3] as usize,
+                    &groups,
+                ),
+                CSIDE_RENTITY => collision.object_rentity_grip(
+                    entities,
+                    slot,
+                    operands[1],
+                    operands[2],
+                    operands[3] as usize,
+                    &groups,
+                ),
+                _ => false,
+            }
+        };
+        self.state.type_groups = groups;
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::EngineSettings;
+    use crate::rng::GameRng;
+    use retro_format_v4::collision::{
+        COLLISION_FILE_BYTES, COLLISION_PLANE_COUNT, COLLISION_TILE_BYTES, COLLISION_TILE_COUNT,
+    };
+    use retro_format_v4::tiles::TILE_SHEET_128_ENTRY_COUNT;
+    use retro_format_v4::{CollisionMasks, GameConfig, Scene, StageConfig, Tile128, TileSheet128};
+    use retro_io::MemorySource;
+    use retro_scene::ObjectRegistry;
+    use retro_script::{PlatformMode, V4Revision};
+    use std::sync::Arc;
+
+    fn minimal_game_config() -> GameConfig {
+        GameConfig {
+            title: "Test".to_owned(),
+            subtitle: String::new(),
+            palette: vec![[0, 0, 0]; retro_format_v4::gameconfig::PALETTE_COUNT],
+            objects: Vec::new(),
+            global_variables: Vec::new(),
+            sound_effects: Vec::new(),
+            players: Vec::new(),
+            categories: retro_format_v4::gameconfig::CATEGORY_NAMES
+                .iter()
+                .map(|name| retro_format_v4::SceneCategory {
+                    name: (*name).to_owned(),
+                    scenes: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn minimal_scene() -> Scene {
+        Scene {
+            title: "Test".to_owned(),
+            active_layers: [9, 9, 9, 9],
+            mid_point: 3,
+            width: 1,
+            height: 1,
+            layout: vec![0],
+            entities: Vec::new(),
+        }
+    }
+
+    /// A collision context whose first 16x16 tile is solid with a floor sample at height 8.
+    fn collision() -> retro_scene::SceneCollision {
+        let mut bytes = Vec::with_capacity(COLLISION_FILE_BYTES);
+        for index in 0..COLLISION_TILE_COUNT * COLLISION_PLANE_COUNT {
+            if index == 0 {
+                bytes.push(0); // non-ceiling, SOLID_ALL
+                bytes.extend_from_slice(&0u32.to_le_bytes());
+                bytes.extend_from_slice(&[0x88; 8]);
+                bytes.push(0xFF);
+                bytes.push(0xFF);
+            } else {
+                bytes.push(0x33); // SOLID_NONE
+                bytes.extend_from_slice(&0u32.to_le_bytes());
+                bytes.extend_from_slice(&[0u8; 8]);
+                bytes.push(0xFF);
+                bytes.push(0xFF);
+            }
+        }
+        assert_eq!(bytes.len(), COLLISION_TILE_BYTES * COLLISION_TILE_COUNT * 2);
+        let masks = CollisionMasks::from_bytes(&bytes).unwrap();
+        let tiles = TileSheet128 {
+            entries: vec![
+                Tile128 {
+                    direction: 0,
+                    visual_plane: 0,
+                    tile_index: 0,
+                    collision_flag_a: 0,
+                    collision_flag_b: 0,
+                };
+                TILE_SHEET_128_ENTRY_COUNT
+            ],
+        };
+        retro_scene::SceneCollision::new(
+            retro_scene::StageLayout::from_scene(&minimal_scene()),
+            tiles,
+            masks,
+        )
+    }
+
+    fn test_state(with_collision: bool) -> EngineState {
+        EngineState::new(
+            Arc::new(MemorySource::new()),
+            EngineSettings {
+                profile: crate::RuntimeProfile::V4Legacy,
+                platform: PlatformMode::Origins,
+                revision: V4Revision::Rev03,
+                force_scripts: false,
+            },
+            minimal_game_config(),
+            "Zone01".to_owned(),
+            "1".to_owned(),
+            minimal_scene(),
+            StageConfig {
+                load_global_objects: false,
+                palette: vec![[0, 0, 0]; retro_format_v4::stageconfig::STAGE_PALETTE_COUNT],
+                sound_effects: Vec::new(),
+                objects: Vec::new(),
+            },
+            with_collision.then(collision),
+            None,
+            ObjectRegistry::new(),
+            GameRng::new(1),
+        )
+    }
+
+    #[test]
+    fn host_reads_and_writes_entity_fields() {
+        let mut state = test_state(false);
+        state.entities.reset_object_entity(7, 3, 9, 100, 200);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        assert_eq!(
+            host.read_engine_var(23, 7, &mut vm_state).unwrap(),
+            100,
+            "object.xpos"
+        );
+        assert_eq!(
+            host.read_engine_var(21, 7, &mut vm_state).unwrap(),
+            3,
+            "object.type"
+        );
+        host.write_engine_var(23, 7, 500, &mut vm_state).unwrap();
+        assert_eq!(host.state.entities.get(7).unwrap().xpos, 500);
+    }
+
+    #[test]
+    fn host_entity_pos_and_object_values() {
+        let mut state = test_state(false);
+        state.object_entity_pos = 5;
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        assert_eq!(
+            host.read_engine_var(19, 5, &mut vm_state).unwrap(),
+            5,
+            "object.entityPos resolves to the VM-provided slot"
+        );
+
+        vm_state.operands[0] = 77;
+        vm_state.operands[1] = 3;
+        vm_state.operands[2] = 5;
+        host.engine_op(Op::SetObjectValue, &mut vm_state).unwrap();
+        assert_eq!(host.state.entities.get(5).unwrap().values[3], 77);
+        vm_state.operands[0] = 0;
+        host.engine_op(Op::GetObjectValue, &mut vm_state).unwrap();
+        assert_eq!(vm_state.operands[0], 77);
+    }
+
+    #[test]
+    fn host_reset_object_entity_matches_upstream() {
+        let mut state = test_state(false);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 32;
+        vm_state.operands[1] = 4;
+        vm_state.operands[2] = 2;
+        vm_state.operands[3] = 16;
+        vm_state.operands[4] = 32;
+        host.engine_op(Op::ResetObjectEntity, &mut vm_state)
+            .unwrap();
+        let entity = host.state.entities.get(32).unwrap();
+        assert_eq!(entity.type_id, 4);
+        assert_eq!(entity.property_value, 2);
+        assert_eq!((entity.xpos, entity.ypos), (16, 32));
+        assert_eq!(entity.scale, 512);
+        assert_eq!(entity.visible, 1);
+    }
+
+    #[test]
+    fn host_tile_collision_on_tiny_mask() {
+        let mut state = test_state(true);
+        state
+            .entities
+            .reset_object_entity(0, 1, 0, 64 << 16, 64 << 16);
+        state.object_entity_pos = 0;
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = CSIDE_FLOOR;
+        vm_state.operands[1] = 0;
+        vm_state.operands[2] = 15;
+        vm_state.operands[3] = 0;
+        host.engine_op(Op::ObjectTileCollision, &mut vm_state)
+            .unwrap();
+        assert_eq!(vm_state.check_result, 1);
+        assert_eq!(host.state.entities.get(0).unwrap().ypos >> 16, 57);
+    }
+
+    #[test]
+    fn host_foreach_iterates_type_groups_in_slot_order() {
+        let mut state = test_state(false);
+        state.entities.reset_object_entity(5, 9, 0, 0, 0);
+        state.entities.reset_object_entity(9, 9, 0, 0, 0);
+        let mut flags = vec![false; retro_scene::ENTITY_COUNT];
+        flags[5] = true;
+        flags[9] = true;
+        state
+            .entities
+            .build_type_groups(&flags, &mut state.type_groups, retro_scene::OBJECT_COUNT);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        assert_eq!(
+            host.foreach_next(Op::ForEachActive, 9, 0, ScriptEvent::Main, &mut vm_state)
+                .unwrap(),
+            Some(5)
+        );
+        assert_eq!(
+            host.foreach_next(Op::ForEachActive, 9, 1, ScriptEvent::Main, &mut vm_state)
+                .unwrap(),
+            Some(9)
+        );
+        assert_eq!(
+            host.foreach_next(Op::ForEachActive, 9, 2, ScriptEvent::Main, &mut vm_state)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            host.foreach_next(Op::ForEachAll, 9, 4, ScriptEvent::Main, &mut vm_state)
+                .unwrap(),
+            Some(5)
+        );
+    }
+}
