@@ -96,6 +96,8 @@ impl Engine {
         );
         let act_id = state.act.clone();
         state.stage.set_act_id(&act_id);
+        // `[Window] DimLimit` is stored in seconds and converted to frames when settings load.
+        state.render.dim_limit = state.settings.dim_limit_frames;
         state.apply_game_palette();
         state.apply_stage_palette();
         if let Some(tiles16) = &world.tiles16 {
@@ -189,6 +191,18 @@ impl Engine {
     /// camera follow, parallax auto-scroll, then `DrawStageGFX` (which runs `ObjectDraw` events
     /// through the draw lists, interleaved with the tile layers) and the fade rectangle.
     pub fn run_frame(&mut self) -> Result<(), EngineError> {
+        // `ProcessInput` runs before the frame: any press/hold resets the idle-dimming timer,
+        // otherwise it advances towards `dim_limit` (`Input.cpp:377-382`). Presentation-only.
+        let input_active = self.state.input.any_button()
+            || self.state.input_press.any_button()
+            || self
+                .state
+                .touch_down
+                .iter()
+                .filter(|down| **down != 0)
+                .count()
+                > 1;
+        self.state.render.update_dim_timer(input_active, false);
         if self.state.render.fade_mode > 0 {
             self.state.render.fade_mode -= 1;
         }

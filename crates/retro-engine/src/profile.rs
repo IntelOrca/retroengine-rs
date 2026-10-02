@@ -54,17 +54,27 @@ pub struct EngineSettings {
     pub revision: V4Revision,
     /// `[Game] txtScripts`: prefer `Data/Scripts` sources over `Bytecode/`.
     pub force_scripts: bool,
+    /// `[Window] DimLimit` converted to frames (`seconds * refresh_rate`, or `-1` disabled),
+    /// mirroring `Userdata.cpp:446-449`.
+    pub dim_limit_frames: i32,
 }
 
 impl EngineSettings {
     /// Resolves the engine settings from parsed `Settings.ini`.
     #[must_use]
     pub fn from_settings(settings: &Settings) -> Self {
+        let refresh_rate = settings.video.refresh_rate.max(1);
+        let dim_limit_frames = if settings.video.dim_limit >= 0 {
+            settings.video.dim_limit.saturating_mul(refresh_rate)
+        } else {
+            -1
+        };
         Self {
             profile: RuntimeProfile::V4Legacy,
             platform: RuntimeProfile::platform_mode(settings.game.game_type),
             revision: RuntimeProfile::V4Legacy.script_revision(),
             force_scripts: settings.game.txt_scripts,
+            dim_limit_frames,
         }
     }
 }
@@ -86,6 +96,29 @@ mod tests {
         assert_eq!(
             RuntimeProfile::platform_mode(GameType::Other(7)),
             PlatformMode::Standalone
+        );
+    }
+
+    #[test]
+    fn dim_limit_is_converted_to_frames() {
+        let mut settings = Settings::default();
+        settings.video.dim_limit = 300;
+        settings.video.refresh_rate = 60;
+        assert_eq!(
+            EngineSettings::from_settings(&settings).dim_limit_frames,
+            18000
+        );
+        settings.video.dim_limit = -1;
+        assert_eq!(
+            EngineSettings::from_settings(&settings).dim_limit_frames,
+            -1
+        );
+        settings.video.dim_limit = 2;
+        settings.video.refresh_rate = 0;
+        assert_eq!(
+            EngineSettings::from_settings(&settings).dim_limit_frames,
+            2,
+            "a zero refresh rate is treated as one frame per second"
         );
     }
 

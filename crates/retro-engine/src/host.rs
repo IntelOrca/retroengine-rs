@@ -2596,6 +2596,7 @@ mod tests {
                 platform: PlatformMode::Origins,
                 revision: V4Revision::Rev03,
                 force_scripts: false,
+                dim_limit_frames: 18000,
             },
             minimal_game_config(),
             "Zone01".to_owned(),
@@ -3268,9 +3269,12 @@ mod tests {
         vm_state.operands[0] = 0;
         vm_state.operands[2] = 0;
         host.engine_op(Op::LoadTextFile, &mut vm_state).unwrap();
+        // `rowCount` is a true row count upstream: `LoadTextFile` bumps it on every `\r` and
+        // then once more before returning (`Text.cpp:98,226-238`), and `DrawBitmapText`
+        // iterates `rowStart..rowStart+rowCount` (`Drawing.cpp:4381-4399`). `"A\rB"` therefore
+        // has two rows, not a last index of one.
         assert_eq!(host.state.text_menus[0].row_count, 2);
         assert_eq!(host.state.text_menus[0].text_data, vec![65, 66]);
-
         vm_state.operands[1] = 0;
         vm_state.operands[2] = 0; // TEXTINFO_TEXTDATA
         vm_state.operands[3] = 1;

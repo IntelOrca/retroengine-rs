@@ -56,9 +56,9 @@ pub struct RenderState {
     pub fade_a: u16,
     /// Display-only dim timer (`Engine.dimTimer`).
     pub dim_timer: i32,
-    /// Display-only dim limit (`Engine.dimLimit`). Defaults to `-1` (disabled): the decomps'
-    /// zero default would decay `dim_percent` to 25% as a display-only overlay, which the
-    /// original-code builds do not do. Natives/mods may set it to enable dimming.
+    /// Display-only dim limit in frames (`Engine.dimLimit`), set by the engine from
+    /// `Settings.ini`'s `[Window] DimLimit` (`dim_limit_frames`) like `Userdata.cpp:446-449`.
+    /// The renderer default is `-1` (disabled) so standalone `retro-render` use never dims.
     pub dim_limit: i32,
     /// Display-only dim max (`Engine.dimMax`).
     pub dim_max: f32,
@@ -553,6 +553,17 @@ impl RenderState {
             i32::from(b),
             i32::from(a),
         );
+    }
+
+    /// `ProcessInput`'s idle-dimming timer (`Input.cpp:377-382`): any input press/hold
+    /// resets the timer, otherwise it advances one frame towards `dim_limit`. A negative
+    /// limit leaves the timer untouched (dimming disabled).
+    pub fn update_dim_timer(&mut self, input_active: bool, paused: bool) {
+        if input_active {
+            self.dim_timer = 0;
+        } else if self.dim_timer < self.dim_limit && !paused {
+            self.dim_timer += 1;
+        }
     }
 
     /// Processes display dimming exactly like the `FlipScreen` `dimPercent` update.

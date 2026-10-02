@@ -506,6 +506,7 @@ mod tests {
             platform: retro_script::PlatformMode::Origins,
             revision: retro_script::V4Revision::Rev03,
             force_scripts: false,
+            dim_limit_frames: 18000,
         };
 
         let linked = load_scripts(&source, &config, &stage, &settings).unwrap();

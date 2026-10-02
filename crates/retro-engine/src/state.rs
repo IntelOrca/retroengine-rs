@@ -191,6 +191,25 @@ impl InputState {
     pub fn press(&self, var: i32) -> Option<bool> {
         self.down(var - 14)
     }
+
+    /// Whether any button is pressed or held (`inputDevice[INPUT_ANY].press || hold`).
+    #[must_use]
+    pub fn any_button(&self) -> bool {
+        self.up
+            || self.down
+            || self.left
+            || self.right
+            || self.button_a
+            || self.button_b
+            || self.button_c
+            || self.button_x
+            || self.button_y
+            || self.button_z
+            || self.button_l
+            || self.button_r
+            || self.start
+            || self.select
+    }
 }
 
 /// Mutable state owned by the engine and mutated by host operations.

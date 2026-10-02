@@ -291,6 +291,34 @@ mod tests {
     }
 
     #[test]
+    fn dim_timer_advances_while_idle_and_resets_on_input() {
+        let mut render = RenderState::new(4, 4);
+        render.dim_limit = 3;
+        for expected in 1..=3 {
+            render.update_dim_timer(false, false);
+            assert_eq!(render.dim_timer, expected);
+        }
+        render.update_dim_timer(false, false);
+        assert_eq!(render.dim_timer, 3, "timer stops at dim_limit");
+        render.update_dim_timer(true, false);
+        assert_eq!(render.dim_timer, 0, "input resets the timer");
+        render.update_dim_timer(false, true);
+        assert_eq!(render.dim_timer, 0, "a paused engine does not advance");
+
+        render.dim_limit = -1;
+        render.update_dim_timer(false, false);
+        assert_eq!(render.dim_timer, 0, "a negative limit disables dimming");
+
+        // Once the timer reaches the limit, `ProcessDimming` engages.
+        render.dim_limit = 2;
+        render.dim_timer = 2;
+        render.update_dim_timer(false, false);
+        assert_eq!(render.dim_timer, 2);
+        render.process_dimming();
+        assert!(render.dim_percent < 1.0);
+    }
+
+    #[test]
     fn clear_screen_uses_active_palette_index() {
         let palette = two_color_palette();
         let lookup = LookupTables::new();

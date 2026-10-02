@@ -250,6 +250,53 @@ fn draw_events_run_after_updates_in_slot_order() {
 }
 
 #[test]
+fn dimming_is_presentation_only_and_never_enters_the_hash() {
+    // Draw something so the framebuffer comparison is meaningful.
+    let body = "    DrawRect(0, 0, 2, 2, 255, 0, 0, 255)\n";
+    // The default `[Window] DimLimit` (300 s at 60 fps) is wired into the render state.
+    let mut control = Engine::load(draw_source(body), None, None, DEFAULT_SEED).unwrap();
+    assert_eq!(control.state.render.dim_limit, 18_000);
+    assert_eq!(control.state.render.dim_timer, 0);
+
+    // An immediate dim limit decays `dimPercent` (the SDL present buffer darkens) without
+    // touching the framebuffer or the canonical hash.
+    let mut dimmed = Engine::load(draw_source(body), None, None, DEFAULT_SEED).unwrap();
+    dimmed.state.render.dim_limit = 0;
+    for _ in 0..5 {
+        control.run_frame().unwrap();
+        dimmed.run_frame().unwrap();
+    }
+    assert_eq!(
+        dimmed.state.render.dim_timer, 0,
+        "limit 0 engages immediately"
+    );
+    assert!(
+        dimmed.state.render.dim_amount() < 1.0,
+        "dim amount decays after the idle limit"
+    );
+    assert_eq!(control.state.render.dim_amount(), 1.0);
+    assert_eq!(control.framebuffer().get(0, 0), 0xF800);
+    assert_eq!(
+        control.state.render.framebuffer.hash(),
+        dimmed.state.render.framebuffer.hash(),
+        "dimming must not modify the framebuffer"
+    );
+    assert_eq!(control.state_hash(), dimmed.state_hash());
+
+    // Idle frames advance the timer towards the limit.
+    let mut idle = Engine::load(draw_source(body), None, None, DEFAULT_SEED).unwrap();
+    idle.state.render.dim_limit = 10;
+    for _ in 0..4 {
+        idle.run_frame().unwrap();
+    }
+    assert_eq!(idle.state.render.dim_timer, 4);
+    // A held button resets the timer.
+    idle.state.input.right = true;
+    idle.run_frame().unwrap();
+    assert_eq!(idle.state.render.dim_timer, 0);
+}
+
+#[test]
 fn framebuffer_pixels_are_part_of_the_state_hash() {
     let mut red = Engine::load(
         draw_source("    DrawRect(0, 0, 2, 2, 255, 0, 0, 255)\n"),
