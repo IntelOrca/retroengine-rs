@@ -358,6 +358,15 @@ impl Storage for MemoryStorage {
         self.files.remove(path);
         Ok(())
     }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), PlatformError> {
+        let data = self
+            .files
+            .remove(from)
+            .ok_or_else(|| PlatformError::Other(format!("no such file: {from}")))?;
+        self.files.insert(to.to_owned(), data);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +469,52 @@ mod tests {
         assert_eq!(storage.list("").unwrap(), vec!["config.ini", "saves"]);
         storage.remove("config.ini").unwrap();
         assert!(!storage.exists("config.ini"));
+    }
+
+    #[test]
+    fn memory_storage_renames() {
+        let mut storage = MemoryStorage::new();
+        storage.write("save.tmp", b"new").unwrap();
+        storage.write("save.bin", b"old").unwrap();
+        storage.rename("save.tmp", "save.bin").unwrap();
+        assert!(!storage.exists("save.tmp"));
+        assert_eq!(storage.read("save.bin").unwrap(), b"new");
+        assert!(storage.rename("missing.tmp", "save.bin").is_err());
+        assert_eq!(storage.file_count(), 1);
+    }
+
+    #[test]
+    fn storage_default_rename_copies_then_removes() {
+        #[derive(Default)]
+        struct DefaultRenameStorage(MemoryStorage);
+
+        impl Storage for DefaultRenameStorage {
+            fn read(&self, path: &str) -> Result<Vec<u8>, PlatformError> {
+                self.0.read(path)
+            }
+
+            fn write(&mut self, path: &str, data: &[u8]) -> Result<(), PlatformError> {
+                self.0.write(path, data)
+            }
+
+            fn exists(&self, path: &str) -> bool {
+                self.0.exists(path)
+            }
+
+            fn list(&self, dir: &str) -> Result<Vec<String>, PlatformError> {
+                self.0.list(dir)
+            }
+
+            fn remove(&mut self, path: &str) -> Result<(), PlatformError> {
+                self.0.remove(path)
+            }
+        }
+
+        let mut storage = DefaultRenameStorage::default();
+        storage.write("from.dat", b"data").unwrap();
+        storage.rename("from.dat", "to.dat").unwrap();
+        assert!(!storage.exists("from.dat"));
+        assert_eq!(storage.read("to.dat").unwrap(), b"data");
     }
 
     #[test]

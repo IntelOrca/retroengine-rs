@@ -211,6 +211,38 @@ pub trait AudioDevice {
     fn close(&mut self) -> Result<(), PlatformError>;
 }
 
+/// Raw device state captured by one input poll, free of backend-specific types.
+///
+/// Backends that support it return this from [`InputSource::poll_raw`]. The [`RawInput::keys`]
+/// slice is indexed by SDL scancode number (`0..retro_input::KEY_COUNT`); use
+/// [`RawInput::key_down`] for a bounds-checked lookup. Gamepads are already normalized to
+/// [`retro_input::GamepadState`] and can be fed to [`retro_input::InputMappings::apply`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RawInput {
+    /// Keyboard state indexed by SDL scancode number.
+    pub keys: Vec<bool>,
+    /// Gamepad state per player slot, in slot order.
+    pub gamepads: [retro_input::GamepadState; retro_input::PLAYER_COUNT],
+    /// Active touch points; only the first [`RawInput::touch_count`] entries are valid.
+    pub touches: [retro_input::TouchPoint; retro_input::MAX_TOUCHES],
+    /// Number of active touch points.
+    pub touch_count: u8,
+}
+
+impl RawInput {
+    /// Whether the given SDL scancode is held, treating unknown scancodes as released.
+    #[must_use]
+    pub fn key_down(&self, scancode: u32) -> bool {
+        self.keys.get(scancode as usize).copied().unwrap_or(false)
+    }
+
+    /// Whether any gamepad slot is connected.
+    #[must_use]
+    pub fn has_gamepad(&self) -> bool {
+        self.gamepads.iter().any(|gamepad| gamepad.connected)
+    }
+}
+
 /// A pollable source of versioned input state.
 pub trait InputSource {
     /// Version of the input state produced by this source.
@@ -219,6 +251,13 @@ pub trait InputSource {
     }
     /// Polls the current input state.
     fn poll(&mut self) -> InputState;
+    /// Polls raw per-slot device state through the shared [`retro_input`] model.
+    ///
+    /// Backends without a native implementation (and uninitialized ones) return an empty
+    /// [`RawInput`]; callers must treat that as "no devices".
+    fn poll_raw(&mut self) -> RawInput {
+        RawInput::default()
+    }
 }
 
 /// User-file storage.
@@ -233,6 +272,17 @@ pub trait Storage {
     fn list(&self, dir: &str) -> Result<Vec<String>, PlatformError>;
     /// Removes a file.
     fn remove(&mut self, path: &str) -> Result<(), PlatformError>;
+    /// Renames `from` to `to`, replacing `to` when it already exists.
+    ///
+    /// Backends with an atomic native rename override this so callers can write a temporary file
+    /// and swap it in without a window where the destination is missing or truncated. The default
+    /// implementation reads the source, writes the destination and removes the source, which is
+    /// sufficient for in-memory storage but not crash-safe.
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), PlatformError> {
+        let data = self.read(from)?;
+        self.write(to, &data)?;
+        self.remove(from)
+    }
 }
 
 /// Fixed-step frame clock.
