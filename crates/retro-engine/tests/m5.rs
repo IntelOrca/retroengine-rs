@@ -12,7 +12,7 @@ use retro_format_v4::scene::{ACTIVE_LAYER_COUNT, ENTITY_ATTRIB_STATE, ENTITY_ATT
 use retro_format_v4::stageconfig::STAGE_PALETTE_COUNT;
 use retro_format_v4::userdata::SaveRam;
 use retro_input::ScriptedInput;
-use retro_io::MemorySource;
+use retro_io::{DirSource, MemorySource};
 use retro_platform::headless::MemoryStorage;
 
 const OBJECT_SOURCE: &str = "\
@@ -309,4 +309,141 @@ fn save_state_seeded_from_source_loads_a_shipped_sgame() {
         retro_format_v4::userdata::SaveFileKind::SGame
     );
     assert_eq!(engine.state.save.save_ram().to_bytes(), save);
+}
+
+// ---------------------------------------------------------------------------
+// Asset-gated runs (ignored by default; run with `-- --ignored`)
+// ---------------------------------------------------------------------------
+
+fn asset_root() -> std::path::PathBuf {
+    std::env::var("RETRO_ASSETS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/home/ted/projects/assets"))
+}
+
+fn asset_source(game: &str) -> Arc<dyn retro_io::DataSource> {
+    Arc::new(DirSource::new(asset_root().join(game)).expect("asset folder"))
+}
+
+fn pcm_hash(samples: &[f32]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for sample in samples {
+        hasher.update(&sample.to_le_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn audio_chain(hashes: &[(u64, String)]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for (frame, hash) in hashes {
+        hasher.update(&frame.to_le_bytes());
+        hasher.update(hash.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn player_state(engine: &Engine) -> (u8, i32, i32, i32) {
+    let player = engine.state.entities.get(0).copied().unwrap_or_default();
+    (
+        player.type_id,
+        player.xpos >> 16,
+        player.ypos >> 16,
+        player.state,
+    )
+}
+
+/// Asset run: 600 frames with NullInput, a scripted replay and audio hashing.
+///
+/// Reports the state hash, player position and audio/PCM hashes, verifies two NullInput runs are
+/// byte-identical, and checks the shipped S1 `SGame.bin` loads into the save store.
+#[test]
+#[ignore = "requires assets"]
+fn m5_input_audio_save_600_frames() {
+    for (game, scene) in [
+        ("S1", "Title"),
+        ("S1", "Zone01"),
+        ("S2", "Title"),
+        ("S2", "Zone01"),
+    ] {
+        let mut first = Engine::load(asset_source(game), Some(scene), None, DEFAULT_SEED).unwrap();
+        first.state.audio.set_capture(true);
+        let outcome = first.run_frames(600, true).unwrap();
+        let first_pcm = pcm_hash(first.state.audio.captured_pcm());
+        let first_audio = audio_chain(&outcome.audio_hashes);
+        let first_player = player_state(&first);
+
+        let mut second = Engine::load(asset_source(game), Some(scene), None, DEFAULT_SEED).unwrap();
+        second.state.audio.set_capture(true);
+        let replay = second.run_frames(600, true).unwrap();
+        assert_eq!(
+            outcome.frame_hashes, replay.frame_hashes,
+            "{game}/{scene}: two NullInput runs must replay identically"
+        );
+        assert_eq!(
+            outcome.audio_hashes, replay.audio_hashes,
+            "{game}/{scene}: audio hashes must replay identically"
+        );
+        assert_eq!(
+            first_pcm,
+            pcm_hash(second.state.audio.captured_pcm()),
+            "{game}/{scene}: captured PCM must replay identically"
+        );
+
+        let mut scripted =
+            Engine::load(asset_source(game), Some(scene), None, DEFAULT_SEED).unwrap();
+        scripted.set_scripted_input(hold_right(600));
+        let scripted_outcome = scripted.run_frames(600, false).unwrap();
+        let scripted_player = player_state(&scripted);
+        if scene == "Zone01" {
+            assert!(
+                scripted_player.1 > first_player.1,
+                "{game}/{scene}: holding RIGHT must move the player right \
+                 (idle x={}, scripted x={})",
+                first_player.1,
+                scripted_player.1
+            );
+            assert_ne!(
+                first.state_hash(),
+                scripted.state_hash(),
+                "{game}/{scene}: scripted input must change the canonical state"
+            );
+        }
+
+        println!(
+            "{game}/{scene}: hash={} player(type,x,y,state)={first_player:?} \
+             audio={first_audio} pcm={first_pcm}",
+            outcome.final_hash
+        );
+        println!(
+            "  scripted: hash={} player={scripted_player:?}",
+            scripted_outcome.final_hash
+        );
+
+        if game == "S1" && scene == "Zone01" {
+            let expected = std::fs::read(asset_root().join("S1").join("SGame.bin"))
+                .expect("S1 ships SGame.bin");
+            let loaded = first.state.save.save_ram().to_bytes();
+            assert_eq!(
+                loaded, expected,
+                "S1 SGame.bin must load byte-exactly through ReadSaveRAM"
+            );
+            assert_eq!(
+                first.state.save.save_file_kind(),
+                retro_format_v4::userdata::SaveFileKind::SGame,
+                "the only shipped save file is SGame.bin"
+            );
+            let nonzero = first
+                .state
+                .save
+                .save_ram()
+                .words
+                .iter()
+                .filter(|word| **word != 0)
+                .count();
+            println!(
+                "  save: SGame.bin words={} nonzero={nonzero}",
+                first.state.save.save_ram().words.len()
+            );
+        }
+    }
 }
