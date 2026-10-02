@@ -30,6 +30,82 @@ pub const TILE_LAYER_HEIGHT: usize = 0x100;
 pub const PARALLAX_COUNT: usize = 0x100;
 /// `ENGINE_MAINGAME`, the only engine mode modelled by M3.
 pub const ENGINE_MAINGAME: i32 = 1;
+/// Number of text menus upstream keeps (`TEXTMENU_COUNT`).
+pub const TEXT_MENU_COUNT: usize = 0x2;
+/// Maximum characters stored per text menu (`TEXTDATA_COUNT`).
+pub const TEXT_DATA_COUNT: usize = 0x2800;
+/// Maximum rows stored per text menu (`TEXTENTRY_COUNT`).
+pub const TEXT_ENTRY_COUNT: usize = 0x200;
+/// Number of font characters upstream keeps (`FONTCHAR_COUNT`).
+pub const FONT_CHAR_COUNT: usize = 0x400;
+
+/// One glyph of the legacy v4 bitmap font (`FontCharacter`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct FontCharacter {
+    /// Character id used by text files (`FontCharacter::id`).
+    pub id: i32,
+    /// Source x in the current text sheet.
+    pub src_x: i32,
+    /// Source y in the current text sheet.
+    pub src_y: i32,
+    /// Glyph width in pixels.
+    pub width: i32,
+    /// Glyph height in pixels.
+    pub height: i32,
+    /// Signed pivot x.
+    pub pivot_x: i32,
+    /// Signed pivot y.
+    pub pivot_y: i32,
+    /// Horizontal advance.
+    pub x_advance: i32,
+}
+
+/// One legacy v4 text menu (`TextMenu`), storing rows of character ids.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TextMenu {
+    /// Character ids per row, concatenated (`textData`).
+    pub text_data: Vec<u16>,
+    /// Start offset of each row in [`TextMenu::text_data`].
+    pub entry_start: Vec<i32>,
+    /// Character count of each row.
+    pub entry_size: Vec<i32>,
+    /// Current write position.
+    pub text_data_pos: usize,
+    /// Number of rows.
+    pub row_count: i32,
+}
+
+impl TextMenu {
+    fn reset(&mut self) {
+        self.text_data.clear();
+        self.entry_start.clear();
+        self.entry_size.clear();
+        self.text_data_pos = 0;
+        self.row_count = 0;
+        self.entry_start.push(0);
+        self.entry_size.push(0);
+    }
+
+    fn new_row(&mut self) {
+        self.row_count += 1;
+        if self.row_count as usize >= TEXT_ENTRY_COUNT {
+            return;
+        }
+        self.entry_start.push(self.text_data_pos as i32);
+        self.entry_size.push(0);
+    }
+
+    fn push_char(&mut self, value: u16) {
+        if self.text_data.len() >= TEXT_DATA_COUNT {
+            return;
+        }
+        self.text_data.push(value);
+        if let Some(size) = self.entry_size.last_mut() {
+            *size += 1;
+        }
+        self.text_data_pos += 1;
+    }
+}
 
 /// Re-exported tile layer state (`TileLayer`).
 pub use retro_render::LayerState;
@@ -191,6 +267,12 @@ pub struct EngineState {
     pub animation_sheet_ids: Vec<Vec<i32>>,
     /// Sprite sheet names aligned with [`RenderState::surfaces`] slots.
     pub sprite_sheet_names: Vec<Option<String>>,
+    /// Legacy v4 bitmap font glyphs (`fontCharacterList`).
+    pub font_characters: Vec<FontCharacter>,
+    /// Legacy v4 text menus (`gameMenu`).
+    pub text_menus: Vec<TextMenu>,
+    /// Sprite sheet used by `DrawText` (`textMenuSurfaceNo`).
+    pub text_menu_surface_no: i32,
     /// Per-object-type script frame lists (`scriptFrames` + `frameListOffset`).
     pub object_frames: Vec<Vec<ScriptFrame>>,
     /// Software renderer state (framebuffer, palettes, sheets and tiles).
@@ -326,6 +408,9 @@ impl EngineState {
             animation_ids: BTreeMap::new(),
             animation_sheet_ids: Vec::new(),
             sprite_sheet_names: Vec::new(),
+            font_characters: vec![FontCharacter::default(); FONT_CHAR_COUNT],
+            text_menus: vec![TextMenu::default(); TEXT_MENU_COUNT],
+            text_menu_surface_no: 0,
             object_frames,
             render: RenderState::new(
                 usize::try_from(screen.xsize).unwrap_or(424),
@@ -458,6 +543,157 @@ impl EngineState {
                 }
             }
         }
+    }
+
+    /// `LoadFontFile`: parses 20-byte legacy font records into [`EngineState::font_characters`].
+    ///
+    /// Record layout: `u32` character id, `u16` srcX, `u16` srcY, `u16` width, `u16` height,
+    /// then pivotX, pivotY and xAdvance as a low byte plus a sign-aware high byte, then two
+    /// unused bytes. Upstream reads until EOF; this port caps at [`FONT_CHAR_COUNT`].
+    pub fn load_font_file(&mut self, path: &str) {
+        let Ok(bytes) = self.source.read(path) else {
+            return;
+        };
+        let read_u16 = |offset: usize| -> i32 {
+            i32::from(u16::from_le_bytes([
+                bytes.get(offset).copied().unwrap_or(0),
+                bytes.get(offset + 1).copied().unwrap_or(0),
+            ]))
+        };
+        let read_short = |offset: usize| -> i32 {
+            let low = i32::from(bytes.get(offset).copied().unwrap_or(0));
+            let high = i32::from(bytes.get(offset + 1).copied().unwrap_or(0));
+            if high > 0x80 {
+                low + ((high - 0x80) << 8) - 0x8000
+            } else {
+                low + (high << 8)
+            }
+        };
+        let mut character = 0usize;
+        let mut offset = 0usize;
+        while offset + 20 <= bytes.len() && character < FONT_CHAR_COUNT {
+            let id = u32::from_le_bytes([
+                bytes.get(offset).copied().unwrap_or(0),
+                bytes.get(offset + 1).copied().unwrap_or(0),
+                bytes.get(offset + 2).copied().unwrap_or(0),
+                bytes.get(offset + 3).copied().unwrap_or(0),
+            ]) as i32;
+            self.font_characters[character] = FontCharacter {
+                id,
+                src_x: read_u16(offset + 4),
+                src_y: read_u16(offset + 6),
+                width: read_u16(offset + 8),
+                height: read_u16(offset + 10),
+                pivot_x: read_short(offset + 12),
+                pivot_y: read_short(offset + 14),
+                x_advance: read_short(offset + 16),
+            };
+            character += 1;
+            offset += 20;
+        }
+    }
+
+    /// `LoadTextFile`: reads a legacy v4 text file into `menu_index`.
+    ///
+    /// Files starting with `0xFF` store UTF-16LE codepoints after a skipped format byte,
+    /// everything else stores single bytes. Both branches treat `\r` as a row break and ignore
+    /// `\n`; `map_code` rewrites each value to the index of the first font character with a
+    /// matching id.
+    pub fn load_text_file(&mut self, menu_index: usize, path: &str, map_code: bool) {
+        let Ok(bytes) = self.source.read(path) else {
+            return;
+        };
+        let font_ids: Vec<i32> = self.font_characters.iter().map(|font| font.id).collect();
+        let map = |value: u16| -> u16 {
+            if map_code {
+                font_ids
+                    .iter()
+                    .take(1024)
+                    .position(|id| *id == i32::from(value))
+                    .map_or(0, |index| index as u16)
+            } else {
+                value
+            }
+        };
+        let Some(menu) = self.text_menus.get_mut(menu_index) else {
+            return;
+        };
+        menu.reset();
+        if bytes.starts_with(&[0xFF]) {
+            let mut position = 2usize;
+            while position + 1 < bytes.len()
+                && menu.text_data.len() < TEXT_DATA_COUNT
+                && (menu.row_count as usize) < TEXT_ENTRY_COUNT
+            {
+                let value = u16::from_le_bytes([bytes[position], bytes[position + 1]]);
+                position += 2;
+                if value == 0x0D {
+                    menu.new_row();
+                } else if value != 0x0A {
+                    menu.push_char(map(value));
+                }
+            }
+        } else {
+            for &byte in &bytes {
+                if byte == b'\r' {
+                    menu.new_row();
+                } else if byte != b'\n' {
+                    menu.push_char(map(u16::from(byte)));
+                }
+                if menu.text_data.len() >= TEXT_DATA_COUNT {
+                    break;
+                }
+            }
+        }
+        menu.row_count += 1;
+    }
+
+    /// `GetTextInfo`: reads `TEXTINFO_TEXTDATA` (0), `TEXTINFO_TEXTSIZE` (1) or
+    /// `TEXTINFO_ROWCOUNT` (2) from menu `menu_index`.
+    #[must_use]
+    pub fn text_info(&self, menu_index: usize, info: i32, row: i32, character: i32) -> i32 {
+        let Some(menu) = self.text_menus.get(menu_index) else {
+            return 0;
+        };
+        match info {
+            0 => {
+                let Some(start) = usize::try_from(row)
+                    .ok()
+                    .and_then(|row| menu.entry_start.get(row))
+                else {
+                    return 0;
+                };
+                let Some(offset) = usize::try_from(character).ok() else {
+                    return 0;
+                };
+                start
+                    .checked_add(offset as i32)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .and_then(|index| menu.text_data.get(index))
+                    .copied()
+                    .map_or(0, i32::from)
+            }
+            1 => usize::try_from(row)
+                .ok()
+                .and_then(|row| menu.entry_size.get(row))
+                .copied()
+                .unwrap_or(0),
+            2 => menu.row_count,
+            _ => 0,
+        }
+    }
+
+    /// `titleCardWord2`: the index after the last `-` in the act title, or the title length.
+    #[must_use]
+    pub fn title_card_word2(&self) -> i32 {
+        let bytes = self.scene.title.as_bytes();
+        let mut word2 = bytes.len();
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte == b'-' {
+                word2 = index + 1;
+            }
+        }
+        word2 as i32
     }
 
     /// The script frame list of the object type currently executing, growing the list when a

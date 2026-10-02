@@ -157,6 +157,9 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         std::fs::create_dir_all(dir)?;
         dump_frame(dir, 0, engine.framebuffer())?;
     }
+    if args.hash_every_frame {
+        println!("0,{}", engine.state_hash());
+    }
 
     let dump_every = args.dump_frame_every.max(1);
     let mut present_buffer = Vec::new();
@@ -166,6 +169,7 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         let frame = engine.state.frame;
         if let Some(window) = &mut window {
             engine.framebuffer().copy_visible_into(&mut present_buffer);
+            apply_dim(&mut present_buffer, engine.state.render.dim_amount());
             window.present(&present_buffer, width, height)?;
             platform.clock().advance_frame();
             platform.clock().sleep_until_next_frame()?;
@@ -196,6 +200,22 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     report_histograms(&engine);
     platform.shutdown()?;
     Ok(())
+}
+
+/// Darkens a present buffer by the `FlipScreen` dim amount (a black overlay of alpha
+/// `1 - amount`), mirroring SDL's alpha blend on the 16-bit RGB565 channels.
+fn apply_dim(pixels: &mut [u16], amount: f32) {
+    if amount >= 1.0 {
+        return;
+    }
+    let alpha = ((1.0 - amount) * 255.0).clamp(0.0, 255.0) as u32;
+    let scale = 255 - alpha;
+    for pixel in pixels {
+        let r = (u32::from(*pixel >> 11) & 0x1F) * scale / 255;
+        let g = (u32::from(*pixel >> 5) & 0x3F) * scale / 255;
+        let b = (u32::from(*pixel) & 0x1F) * scale / 255;
+        *pixel = ((r << 11) | (g << 5) | b) as u16;
+    }
 }
 
 /// Writes one framebuffer to `DIR/frame_%04d.png`.

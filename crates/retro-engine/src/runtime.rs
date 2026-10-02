@@ -94,6 +94,8 @@ impl Engine {
             world.scripts.objects,
             rng,
         );
+        let act_id = state.act.clone();
+        state.stage.set_act_id(&act_id);
         state.apply_game_palette();
         state.apply_stage_palette();
         if let Some(tiles16) = &world.tiles16 {
@@ -195,6 +197,8 @@ impl Engine {
         self.update_camera();
         self.process_parallax_auto_scroll();
         self.draw_stage_gfx()?;
+        // `FlipScreen` updates the display-only dim state after the frame is composed.
+        self.state.render.process_dimming();
         self.state.frame += 1;
         Ok(())
     }
