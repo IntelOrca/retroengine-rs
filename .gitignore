@@ -1,0 +1,14 @@
+target/
+/assets/
+Data/
+_Bytecode/
+*.rsdk
+*.bin
+GameConfig.bin
+Settings.ini
+Achievements.bin
+SGame.bin
+.DS_Store
+.idea/
+.vscode/
+*.swp

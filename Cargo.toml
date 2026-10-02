@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/retro-audio",
+    "crates/retro-core",
+    "crates/retro-dev",
+    "crates/retro-engine",
+    "crates/retro-export",
+    "crates/retro-format",
+    "crates/retro-format-v4",
+    "crates/retro-image",
+    "crates/retro-input",
+    "crates/retro-io",
+    "crates/retro-parity",
+    "crates/retro-platform",
+    "crates/retro-render",
+    "crates/retro-scene",
+    "crates/retro-script",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "LicenseRef-Decomp-NonCommercial"
+repository = "https://github.com/IntelOrca/retroengine-rs"
+authors = ["retroengine-rs contributors"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = "deny"
+
+[workspace.dependencies]
+retro-audio = { path = "crates/retro-audio" }
+retro-core = { path = "crates/retro-core" }
+retro-format = { path = "crates/retro-format" }
+retro-format-v4 = { path = "crates/retro-format-v4" }
+retro-image = { path = "crates/retro-image" }
+retro-input = { path = "crates/retro-input" }
+retro-io = { path = "crates/retro-io" }
+retro-parity = { path = "crates/retro-parity" }
+retro-platform = { path = "crates/retro-platform" }
+retro-render = { path = "crates/retro-render" }
+retro-scene = { path = "crates/retro-scene" }
+retro-script = { path = "crates/retro-script" }
+
+blake3 = "1.8"
+clap = { version = "4.5", features = ["derive"] }
+sdl3 = { version = "=0.20.0", default-features = false }
+sdl3-sys = { version = "=0.7.1", default-features = false }
+thiserror = "2.0"
