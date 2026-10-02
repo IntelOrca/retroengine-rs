@@ -55,6 +55,12 @@ cargo build --release
 and runs until the window closes; `--frames N` caps either mode, and headless runs without
 `--frames` default to 600 frames. `--list` prints the scene table without loading a stage.
 
+On this Linux server the source-built SDL3 only has the dummy/offscreen video drivers (no
+X11/Wayland development packages are installed), so windowed mode cannot show a window here.
+Use `--headless`, or set `SDL_VIDEO_DRIVER=dummy` to exercise the window lifecycle (close,
+resize, quit) in tests. Windows, macOS and Linux builds with X11/Wayland enabled get the full
+SDL video drivers.
+
 ## Selecting a scene
 
 ```sh
@@ -111,11 +117,14 @@ wall clock including startup and asset load, with a marginal cost of about 0.6 m
   `README.txt` (usage, flags and the save location).
 
 SDL3 is compiled from source via `sdl3-sys`'s `build-from-source-static` feature and linked
-statically; the CI `dumpbin /dependents` step fails the build if `SDL3.dll` appears, and the
-Linux release binary has no `libSDL3.so` dependency either. The zip therefore needs no SDL3
-download or system installation; it uses only the standard Windows system libraries (and the
-MSVC runtime shipped with Windows). `--version`/`--help` print the CLI examples including
-Windows paths.
+statically. The Windows job also links the MSVC C runtime statically
+(`RUSTFLAGS=-C target-feature=+crt-static` plus a generated CMake toolchain file that sets
+`CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded` for SDL3's own C build, since sdl3-sys does not
+forward Rust's `crt-static` feature to CMake). `dumpbin /dependents` fails the build if
+`SDL3.dll`, `VCRUNTIME140.dll` or `MSVCP140.dll` appears; the only runtime requirement left is
+the OS-provided Universal CRT (`api-ms-win-crt-*`, shipped with Windows 10+). The Linux release
+binary has no `libSDL3.so` dependency either. `--version`/`--help` print the CLI examples
+including Windows paths.
 
 ## Assets and licensing
 

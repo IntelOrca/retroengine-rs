@@ -31,9 +31,19 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust 1.98.0
         run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Write static-CRT CMake toolchain
+        shell: pwsh
+        run: |
+          # sdl3-sys does not forward Rust's crt-static feature to CMake, so SDL3's own C code
+          # would default to /MD and keep a VCRUNTIME140 dependency. Build it /MT as well.
+          'set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")' | Set-Content -Path static-crt.cmake -Encoding ascii
+          Get-Content static-crt.cmake
       - name: Build release
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+          CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/static-crt.cmake
         run: cargo build --workspace --release
-      - name: Verify SDL3 is linked statically
+      - name: Verify static SDL3 and CRT
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -49,10 +59,13 @@ jobs:
             Write-Error "dumpbin failed to inspect retroengine.exe"
             exit 1
           }
-          if ($deps -match "SDL3\.dll") {
-            Write-Error "retroengine.exe depends on SDL3.dll; SDL3 must be linked statically"
-            exit 1
+          foreach ($forbidden in @("SDL3\.dll", "VCRUNTIME140", "MSVCP140")) {
+            if ($deps -match "(?i)$forbidden") {
+              Write-Error "retroengine.exe depends on $forbidden; SDL3 and the MSVC CRT must be linked statically"
+              exit 1
+            }
           }
+          Write-Host "Only OS-provided libraries (UCRT api-ms-win-crt-*) are required."
       - name: Package retroengine-windows.zip
         shell: pwsh
         run: |
@@ -81,7 +94,8 @@ jobs:
             "  --mute         Disable audio output",
             "",
             "Saves: written to %APPDATA%\retroengine-rs\retroengine (or --user-dir DIR).",
-            "SDL3 is linked statically; no SDL3 download or system install is required.",
+            "SDL3 and the MSVC C runtime are linked statically; only the OS-provided",
+            "Universal CRT (api-ms-win-crt-*) is used, so no extra install is required.",
             "",
             "Run retroengine.exe --help for the full option list."
           )
