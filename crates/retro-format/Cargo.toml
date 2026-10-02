@@ -8,3 +8,8 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+retro-format-v4.workspace = true
+retro-io.workspace = true
+serde.workspace = true
