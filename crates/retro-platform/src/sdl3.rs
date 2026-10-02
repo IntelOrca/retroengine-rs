@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 
 use ::sdl3::GamepadSubsystem;
 use ::sdl3::audio::{AudioFormat, AudioSpec, AudioStreamOwner};
-use ::sdl3::event::Event;
+use ::sdl3::event::{Event, WindowEvent};
 use ::sdl3::gamepad::{Axis, Button, Gamepad};
 use ::sdl3::joystick::JoystickId;
 use ::sdl3::keyboard::{KeyboardState, Scancode};
+use ::sdl3::mouse::MouseButton;
 use ::sdl3::render::WindowCanvas;
 use sdl3_sys::render::SDL_Texture;
 
@@ -120,6 +121,8 @@ impl Platform for Sdl3Platform {
                 "window dimensions must be non-zero".to_owned(),
             ));
         }
+        self.input
+            .set_window((desc.width, desc.height), desc.integer_scale);
         let video = sdl.video().map_err(PlatformError::sdl)?;
         let window = video
             .window(&desc.title, desc.width, desc.height)
@@ -481,6 +484,163 @@ fn normalize_touch(value: f32, size: i16) -> i16 {
     (value.clamp(0.0, 1.0) * f32::from(size)).round() as i16
 }
 
+/// Mapping from window-space points to the logical 424x240 touchscreen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowMapping {
+    /// Current window size in window points; updated on `WindowResized`.
+    size: (u32, u32),
+    /// Logical presentation size (the framebuffer size given to `create_window`).
+    logical: (u32, u32),
+    /// Whether the renderer presents with integer scaling (letterboxing bars when aspect
+    /// differs).
+    integer_scale: bool,
+}
+
+impl Default for WindowMapping {
+    fn default() -> Self {
+        let logical = (TOUCH_SCREEN_XSIZE as u32, TOUCH_SCREEN_YSIZE as u32);
+        Self {
+            size: logical,
+            logical,
+            integer_scale: true,
+        }
+    }
+}
+
+/// Maps a window-space mouse point onto the engine's logical screen coordinates.
+///
+/// Mirrors upstream's `displaySettings.width`/`offsetX` mapping (`RetroEngine.cpp:80-92`): the
+/// logical image is scaled to fit the window (floored to an integer when integer scaling is on)
+/// and centred, then the point is normalized and scaled to `SCREEN_XSIZE`/`SCREEN_YSIZE`. Points
+/// in the letterbox bars clamp to the nearest edge and non-finite input maps to the origin, so
+/// `CheckTouchRect` never sees out-of-range values.
+#[must_use]
+pub fn window_to_logical(
+    x: f32,
+    y: f32,
+    window: (u32, u32),
+    logical: (u32, u32),
+    integer_scale: bool,
+) -> (i16, i16) {
+    let (window_w, window_h) = (window.0 as f32, window.1 as f32);
+    let (logical_w, logical_h) = (logical.0 as f32, logical.1 as f32);
+    if !x.is_finite()
+        || !y.is_finite()
+        || window_w <= 0.0
+        || window_h <= 0.0
+        || logical_w <= 0.0
+        || logical_h <= 0.0
+    {
+        return (0, 0);
+    }
+    let mut scale = f32::min(window_w / logical_w, window_h / logical_h);
+    if integer_scale {
+        scale = scale.floor();
+    }
+    if scale <= 0.0 || !scale.is_finite() {
+        scale = 1.0;
+    }
+    let display_w = logical_w * scale;
+    let display_h = logical_h * scale;
+    let offset_x = (window_w - display_w) * 0.5;
+    let offset_y = (window_h - display_h) * 0.5;
+    let normalized_x = ((x - offset_x) / display_w).clamp(0.0, 1.0);
+    let normalized_y = ((y - offset_y) / display_h).clamp(0.0, 1.0);
+    (
+        normalize_touch(normalized_x, TOUCH_SCREEN_XSIZE),
+        normalize_touch(normalized_y, TOUCH_SCREEN_YSIZE),
+    )
+}
+
+/// Last mouse position in window points and left-button state.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MouseData {
+    x: f32,
+    y: f32,
+    down: bool,
+}
+
+/// Applies one SDL event to the mouse/window tracking, returning whether it was consumed.
+///
+/// Mouse motion/buttons mirror the upstream mouse-as-touch fallback: the left button is touch 0
+/// unless a real finger is down.
+fn apply_pointer_event(event: &Event, mouse: &mut MouseData, window: &mut WindowMapping) -> bool {
+    match event {
+        Event::MouseMotion {
+            x, y, mousestate, ..
+        } => {
+            mouse.x = *x;
+            mouse.y = *y;
+            mouse.down = mousestate.left();
+            true
+        }
+        Event::MouseButtonDown {
+            mouse_btn: MouseButton::Left,
+            x,
+            y,
+            ..
+        } => {
+            mouse.x = *x;
+            mouse.y = *y;
+            mouse.down = true;
+            true
+        }
+        Event::MouseButtonUp {
+            mouse_btn: MouseButton::Left,
+            x,
+            y,
+            ..
+        } => {
+            mouse.x = *x;
+            mouse.y = *y;
+            mouse.down = false;
+            true
+        }
+        Event::Window {
+            win_event: WindowEvent::Resized(width, height),
+            ..
+        } => {
+            let (width, height) = ((*width).max(0) as u32, (*height).max(0) as u32);
+            if width > 0 && height > 0 {
+                window.size = (width, height);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Builds the engine touch array: fingers first, then the mouse as slot 0 when no finger is
+/// active. Upstream gives touches priority over the mouse (`RetroEngine.cpp:78`).
+fn assemble_touches(
+    fingers: &[ActiveTouch],
+    mouse: MouseData,
+    window: WindowMapping,
+) -> ([retro_input::TouchPoint; retro_input::MAX_TOUCHES], u8) {
+    let mut touches = [retro_input::TouchPoint::default(); retro_input::MAX_TOUCHES];
+    let mut count = 0usize;
+    for touch in fingers.iter().take(retro_input::MAX_TOUCHES) {
+        touches[count] = retro_input::TouchPoint {
+            down: true,
+            x: normalize_touch(touch.x, TOUCH_SCREEN_XSIZE),
+            y: normalize_touch(touch.y, TOUCH_SCREEN_YSIZE),
+        };
+        count += 1;
+    }
+    if count == 0 && mouse.down {
+        let (x, y) = window_to_logical(
+            mouse.x,
+            mouse.y,
+            window.size,
+            window.logical,
+            window.integer_scale,
+        );
+        touches[0] = retro_input::TouchPoint { down: true, x, y };
+        count = 1;
+    }
+    (touches, count as u8)
+}
+
 fn open_into(
     subsystem: &GamepadSubsystem,
     gamepads: &mut [Option<Gamepad>; retro_input::PLAYER_COUNT],
@@ -523,19 +683,23 @@ fn upsert_touch(touches: &mut Vec<ActiveTouch>, finger_id: u64, x: f32, y: f32) 
     }
 }
 
-/// SDL3 input source polling the keyboard, hot-plugged gamepads and touches each frame.
+/// SDL3 input source polling the keyboard, hot-plugged gamepads, touches and the mouse each
+/// frame.
 ///
 /// [`InputSource::poll_raw`] returns the raw device state without any `Settings.ini` mapping;
 /// [`InputMappings`](retro_input::InputMappings) turns it into per-player
-/// [`InputState`](retro_input::InputState) values. `poll` keeps the legacy single-player
-/// [`InputState`] for the existing engine host. With no window focus, no gamepads and no touch
-/// devices this simply reports everything released.
+/// [`InputState`](retro_input::InputState) values. The mouse drives touch slot 0 while no real
+/// touch is active, scaled to logical screen pixels so `CheckTouchRect` works windowed. `poll`
+/// keeps the legacy single-player [`InputState`] for the existing engine host. With no window
+/// focus, no gamepads and no touch devices this simply reports everything released.
 pub struct Sdl3Input {
     events: Option<::sdl3::EventPump>,
     subsystem: Option<GamepadSubsystem>,
     gamepads: [Option<Gamepad>; retro_input::PLAYER_COUNT],
     keys: Vec<bool>,
     touches: Vec<ActiveTouch>,
+    mouse: MouseData,
+    window: WindowMapping,
     quit: Arc<AtomicBool>,
     state: InputState,
 }
@@ -548,9 +712,20 @@ impl Sdl3Input {
             gamepads: std::array::from_fn(|_| None),
             keys: Vec::new(),
             touches: Vec::new(),
+            mouse: MouseData::default(),
+            window: WindowMapping::default(),
             quit,
             state: InputState::new(),
         }
+    }
+
+    /// Records the logical presentation size used to map mouse coordinates back to pixels.
+    fn set_window(&mut self, logical: (u32, u32), integer_scale: bool) {
+        self.window = WindowMapping {
+            size: logical,
+            logical,
+            integer_scale,
+        };
     }
 
     /// Starts the event pump, opens every attached gamepad and prepares the key array.
@@ -585,6 +760,8 @@ impl Sdl3Input {
             gamepads,
             keys,
             touches,
+            mouse,
+            window,
             quit,
             ..
         } = self;
@@ -592,8 +769,15 @@ impl Sdl3Input {
             return;
         };
         for event in events.poll_iter() {
+            if apply_pointer_event(&event, mouse, window) {
+                continue;
+            }
             match event {
                 Event::Quit { .. } => quit.store(true, Ordering::Relaxed),
+                Event::Window {
+                    win_event: WindowEvent::CloseRequested,
+                    ..
+                } => quit.store(true, Ordering::Relaxed),
                 Event::GamepadAdded { which, .. } => {
                     if let Some(subsystem) = subsystem.as_ref() {
                         open_into(subsystem, gamepads, which);
@@ -634,25 +818,12 @@ impl Sdl3Input {
         if self.events.is_none() {
             return RawInput::default();
         }
-        let mut touches = [retro_input::TouchPoint::default(); retro_input::MAX_TOUCHES];
-        let count = self.touches.len().min(retro_input::MAX_TOUCHES);
-        for (index, touch) in self
-            .touches
-            .iter()
-            .take(retro_input::MAX_TOUCHES)
-            .enumerate()
-        {
-            touches[index] = retro_input::TouchPoint {
-                down: true,
-                x: normalize_touch(touch.x, TOUCH_SCREEN_XSIZE),
-                y: normalize_touch(touch.y, TOUCH_SCREEN_YSIZE),
-            };
-        }
+        let (touches, count) = assemble_touches(&self.touches, self.mouse, self.window);
         RawInput {
             keys: self.keys.clone(),
             gamepads: self.gamepad_states(),
             touches,
-            touch_count: count as u8,
+            touch_count: count,
         }
     }
 }
@@ -817,6 +988,255 @@ mod tests {
         assert_eq!(normalize_touch(f32::INFINITY, TOUCH_SCREEN_YSIZE), 0);
         assert_eq!(normalize_touch(4.0, TOUCH_SCREEN_XSIZE), 424);
         assert_eq!(normalize_touch(-1.0, TOUCH_SCREEN_YSIZE), 0);
+    }
+
+    #[test]
+    fn mouse_mapping_uses_logical_pixels() {
+        let logical = (424, 240);
+        assert_eq!(
+            window_to_logical(0.0, 0.0, (424, 240), logical, true),
+            (0, 0)
+        );
+        assert_eq!(
+            window_to_logical(212.0, 120.0, (424, 240), logical, true),
+            (212, 120)
+        );
+        assert_eq!(
+            window_to_logical(423.0, 239.0, (424, 240), logical, true),
+            (423, 239)
+        );
+        // 2x integer scale.
+        assert_eq!(
+            window_to_logical(424.0, 240.0, (848, 480), logical, true),
+            (212, 120)
+        );
+        // Integer scaling floors the scale factor: 500x300 presents at 1x with offsets.
+        assert_eq!(
+            window_to_logical(250.0, 150.0, (500, 300), logical, true),
+            (212, 120)
+        );
+        assert_eq!(
+            window_to_logical(250.0, 30.0, (500, 300), logical, true),
+            (212, 0)
+        );
+        // Non-integer presentation scales continuously instead (same normalized point).
+        assert_eq!(
+            window_to_logical(250.0, 30.0, (500, 300), logical, false),
+            (212, 18)
+        );
+        // 848x600 with integer scaling letterboxes 848x480 between 60px bars.
+        assert_eq!(
+            window_to_logical(424.0, 300.0, (848, 600), logical, true),
+            (212, 120)
+        );
+        assert_eq!(
+            window_to_logical(0.0, 0.0, (848, 600), logical, true),
+            (0, 0)
+        );
+        assert_eq!(
+            window_to_logical(846.0, 598.0, (848, 600), logical, true),
+            (423, 240)
+        );
+        // Degenerate and non-finite inputs never produce out-of-range values.
+        assert_eq!(
+            window_to_logical(f32::NAN, 0.0, (424, 240), logical, true),
+            (0, 0)
+        );
+        assert_eq!(
+            window_to_logical(0.0, f32::INFINITY, (424, 240), logical, true),
+            (0, 0)
+        );
+        assert_eq!(window_to_logical(10.0, 10.0, (0, 0), logical, true), (0, 0));
+    }
+
+    #[test]
+    fn mouse_drives_touch_zero_when_no_finger_is_active() {
+        let window = WindowMapping {
+            size: (424, 240),
+            logical: (424, 240),
+            integer_scale: true,
+        };
+        let mouse = MouseData {
+            x: 212.0,
+            y: 120.0,
+            down: true,
+        };
+        let (touches, count) = assemble_touches(&[], mouse, window);
+        assert_eq!(count, 1);
+        assert_eq!(
+            touches[0],
+            retro_input::TouchPoint {
+                down: true,
+                x: 212,
+                y: 120
+            }
+        );
+        assert!(
+            touches[1..]
+                .iter()
+                .all(|touch| *touch == retro_input::TouchPoint::default())
+        );
+
+        let released = MouseData {
+            down: false,
+            ..mouse
+        };
+        let (touches, count) = assemble_touches(&[], released, window);
+        assert_eq!(count, 0);
+        assert_eq!(touches[0], retro_input::TouchPoint::default());
+    }
+
+    #[test]
+    fn fingers_take_priority_over_the_mouse() {
+        let window = WindowMapping {
+            size: (848, 480),
+            logical: (424, 240),
+            integer_scale: true,
+        };
+        let fingers = [ActiveTouch {
+            finger_id: 1,
+            x: 0.25,
+            y: 0.5,
+        }];
+        let mouse = MouseData {
+            x: 800.0,
+            y: 470.0,
+            down: true,
+        };
+        let (touches, count) = assemble_touches(&fingers, mouse, window);
+        assert_eq!(count, 1);
+        assert_eq!(
+            touches[0],
+            retro_input::TouchPoint {
+                down: true,
+                x: 106,
+                y: 120
+            }
+        );
+    }
+
+    #[test]
+    fn fabricated_sdl_mouse_events_drive_touch_zero() {
+        use ::sdl3::mouse::MouseState;
+
+        let mut mouse = MouseData::default();
+        let mut window = WindowMapping::default();
+        let motion = |state: u32, x: f32, y: f32| Event::MouseMotion {
+            timestamp: 0,
+            window_id: 0,
+            which: 0,
+            mousestate: MouseState::from_sdl_state(state),
+            x,
+            y,
+            xrel: 0.0,
+            yrel: 0.0,
+        };
+
+        assert!(apply_pointer_event(
+            &motion(0, 100.0, 50.0),
+            &mut mouse,
+            &mut window
+        ));
+        assert_eq!(
+            mouse,
+            MouseData {
+                x: 100.0,
+                y: 50.0,
+                down: false
+            }
+        );
+        assert_eq!(assemble_touches(&[], mouse, window).1, 0);
+
+        assert!(apply_pointer_event(
+            &motion(1, 212.0, 120.0),
+            &mut mouse,
+            &mut window
+        ));
+        let (touches, count) = assemble_touches(&[], mouse, window);
+        assert_eq!(count, 1);
+        assert_eq!(
+            touches[0],
+            retro_input::TouchPoint {
+                down: true,
+                x: 212,
+                y: 120
+            }
+        );
+
+        // A press event without a preceding motion still carries the position.
+        mouse = MouseData::default();
+        assert!(apply_pointer_event(
+            &Event::MouseButtonDown {
+                timestamp: 0,
+                window_id: 0,
+                which: 0,
+                mouse_btn: MouseButton::Left,
+                clicks: 1,
+                x: 10.0,
+                y: 20.0,
+            },
+            &mut mouse,
+            &mut window,
+        ));
+        assert_eq!(
+            mouse,
+            MouseData {
+                x: 10.0,
+                y: 20.0,
+                down: true
+            }
+        );
+
+        // Right-button presses are not touch input.
+        let untouched = mouse;
+        assert!(!apply_pointer_event(
+            &Event::MouseButtonDown {
+                timestamp: 0,
+                window_id: 0,
+                which: 0,
+                mouse_btn: MouseButton::Right,
+                clicks: 1,
+                x: 400.0,
+                y: 200.0,
+            },
+            &mut mouse,
+            &mut window,
+        ));
+        assert_eq!(mouse, untouched);
+
+        assert!(apply_pointer_event(
+            &Event::MouseButtonUp {
+                timestamp: 0,
+                window_id: 0,
+                which: 0,
+                mouse_btn: MouseButton::Left,
+                clicks: 1,
+                x: 10.0,
+                y: 20.0,
+            },
+            &mut mouse,
+            &mut window,
+        ));
+        assert!(!mouse.down);
+        assert_eq!(assemble_touches(&[], mouse, window).1, 0);
+
+        assert!(apply_pointer_event(
+            &Event::Window {
+                timestamp: 0,
+                window_id: 0,
+                win_event: WindowEvent::Resized(848, 480),
+            },
+            &mut mouse,
+            &mut window,
+        ));
+        assert_eq!(window.size, (848, 480));
+
+        // Unrelated events are left to the main dispatch.
+        assert!(!apply_pointer_event(
+            &Event::Quit { timestamp: 0 },
+            &mut mouse,
+            &mut window
+        ));
     }
 
     #[test]

@@ -37,8 +37,26 @@ pub enum EngineError {
     #[error("file error: {0}")]
     File(#[from] std::io::Error),
     /// A scene name could not be resolved.
-    #[error("unknown scene '{0}' (no matching stage folder or GameConfig scene)")]
-    UnknownScene(String),
+    #[error("unknown scene '{requested}': {details}")]
+    UnknownScene {
+        /// The value the user passed to `--scene`.
+        requested: String,
+        /// Actionable detail, usually candidates and a `--list` hint.
+        details: String,
+    },
+    /// `--act` was not a usable id.
+    #[error("invalid act '{0}': expected a number or a short id such as '1', '2' or 'B'")]
+    InvalidAct(String),
+    /// The requested act file does not exist in the stage folder.
+    #[error("stage '{folder}' has no Act{act}.bin; available acts: {available}")]
+    MissingAct {
+        /// Stage folder (`Zone01`).
+        folder: String,
+        /// Requested act id (`3`).
+        act: String,
+        /// Comma-separated acts found in the folder, or `<none>`.
+        available: String,
+    },
     /// The scripted input file could not be parsed.
     #[error("input error: {0}")]
     Input(String),

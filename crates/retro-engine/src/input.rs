@@ -13,7 +13,8 @@
 
 use retro_format_v4::Settings;
 use retro_input::{
-    ButtonState, InputMappings, InputSource, NullInput, PLAYER_COUNT, ScriptedInput, idle_states,
+    Button, ButtonState, InputMappings, InputSource, NullInput, PLAYER_COUNT, ScriptedInput,
+    idle_states,
 };
 use retro_platform::RawInput;
 
@@ -128,6 +129,19 @@ impl EngineInput {
     #[must_use]
     pub fn mappings(&self) -> &InputMappings {
         &self.mappings
+    }
+
+    /// Whether any player slot has at least one keyboard binding from `Settings.ini`.
+    ///
+    /// Windowed runs warn on `false` so a config with no `[Keyboard Map N]` sections is not
+    /// silently unplayable.
+    #[must_use]
+    pub fn has_keyboard_bindings(&self) -> bool {
+        (0..PLAYER_COUNT as u8).any(|slot| {
+            Button::ALL
+                .iter()
+                .any(|button| self.mappings.scancode_for(slot, *button).is_some())
+        })
     }
 }
 
@@ -255,6 +269,12 @@ select=0x9\n";
         assert_eq!(input.poll(), idle_states());
         assert_eq!(input.poll(), idle_states());
         assert!(!input.uses_platform_input());
+    }
+
+    #[test]
+    fn keyboard_bindings_are_detected() {
+        assert!(EngineInput::new(&settings()).has_keyboard_bindings());
+        assert!(!EngineInput::new(&Settings::default()).has_keyboard_bindings());
     }
 
     #[test]

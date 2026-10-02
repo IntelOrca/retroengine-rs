@@ -31,11 +31,85 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust 1.98.0
         run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Write static-CRT CMake toolchain
+        shell: pwsh
+        run: |
+          # sdl3-sys does not forward Rust's crt-static feature to CMake, so SDL3's own C code
+          # would default to /MD and keep a VCRUNTIME140 dependency. Build it /MT as well.
+          'set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")' | Set-Content -Path static-crt.cmake -Encoding ascii
+          Get-Content static-crt.cmake
       - name: Build release
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+          CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/static-crt.cmake
         run: cargo build --workspace --release
+      - name: Verify static SDL3 and CRT
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -property installationPath
+          $devcmd = Join-Path $vs "Common7\Tools\VsDevCmd.bat"
+          if (-not (Test-Path $devcmd)) {
+            Write-Error "Visual Studio developer prompt not found"
+            exit 1
+          }
+          $deps = cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 >nul && dumpbin /dependents target\release\retroengine.exe" | Out-String
+          Write-Host $deps
+          if ($LASTEXITCODE -ne 0 -or -not $deps) {
+            Write-Error "dumpbin failed to inspect retroengine.exe"
+            exit 1
+          }
+          foreach ($forbidden in @("SDL3\.dll", "VCRUNTIME140", "MSVCP140")) {
+            if ($deps -match "(?i)$forbidden") {
+              Write-Error "retroengine.exe depends on $forbidden; SDL3 and the MSVC CRT must be linked statically"
+              exit 1
+            }
+          }
+          Write-Host "Only OS-provided libraries (UCRT api-ms-win-crt-*) are required."
+      - name: Package retroengine-windows.zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item target/release/retroengine.exe package/
+          $readme = @(
+            "retroengine - Retro Engine (RSDK v4 legacy) player",
+            "",
+            "Usage:",
+            "  retroengine.exe path\to\S1 --headless --frames 600",
+            "  retroengine.exe path\to\S1 --scene GHZ --act 1",
+            "  retroengine.exe path\to\S2 --scene `"EMERALD HILL ZONE 1`"",
+            "  retroengine.exe path\to\S1 --list",
+            "",
+            "The assets folder must be an unpacked Sonic 1 or Sonic 2 (RSDK v4 legacy) folder",
+            "containing Data\Game\GameConfig.bin. Without --headless the game opens in a window",
+            "and runs until the window closes.",
+            "",
+            "Common flags:",
+            "  --scene NAME   Zone01, `"GREEN HILL ZONE 1`", GreenHill, GHZ, GHZ2 or a --list index",
+            "  --act ID       Act id (1, 2, B, ...); defaults to the scene's own act",
+            "  --list         List categories, scenes and available Act*.bin files, then exit",
+            "  --headless     Deterministic run without a window",
+            "  --frames N     Frames to run headlessly (default 600)",
+            "  --input FILE   Replay a scripted input file",
+            "  --mute         Disable audio output",
+            "",
+            "Saves: written to %APPDATA%\retroengine-rs\retroengine (or --user-dir DIR).",
+            "SDL3 and the MSVC C runtime are linked statically; only the OS-provided",
+            "Universal CRT (api-ms-win-crt-*) is used, so no extra install is required.",
+            "",
+            "Run retroengine.exe --help for the full option list."
+          )
+          Set-Content -Path package/README.txt -Value $readme -Encoding ascii
+          Compress-Archive -Path package/retroengine.exe,package/README.txt -DestinationPath retroengine-windows.zip -Force
       - name: Upload retroengine.exe
         uses: actions/upload-artifact@v4
         with:
-          name: retroengine-windows
+          name: retroengine-windows-exe
           path: target/release/retroengine.exe
+          if-no-files-found: error
+      - name: Upload retroengine-windows.zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: retroengine-windows-zip
+          path: retroengine-windows.zip
           if-no-files-found: error
