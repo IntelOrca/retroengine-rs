@@ -10,12 +10,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
-use retro_io::DirSource;
-use retro_platform::{BackendKind, WindowDesc};
+use retro_audio::{AudioEngine, SAMPLE_RATE};
+use retro_input::ScriptedInput;
+use retro_io::{DataSource, DirSource};
+use retro_platform::{AudioDesc, BackendKind, FsStorage, Storage, WindowDesc};
 
 use crate::EngineError;
 use crate::loader;
 use crate::runtime::Engine;
+use crate::save::seed_memory_storage;
 
 /// Number of frames run when `--frames` is omitted or `0`.
 pub const DEFAULT_FRAMES: u64 = 600;
@@ -43,7 +46,7 @@ pub struct Args {
     /// Number of frames to run (0 means the 600-frame default)
     #[arg(long, default_value_t = 0)]
     pub frames: u64,
-    /// Scripted input file to replay (input replay lands in M5; accepted but unused)
+    /// Scripted input file to replay; overrides the windowed SDL input in either mode
     #[arg(long)]
     pub input: Option<PathBuf>,
     /// Directory to dump presented frames into as `frame_%04d.png`
@@ -58,6 +61,16 @@ pub struct Args {
     /// Print one `frame,hash` line per frame instead of only the final hash
     #[arg(long)]
     pub hash_every_frame: bool,
+    /// Print one `frame,blake3` line per frame for the mixed audio
+    #[arg(long)]
+    pub audio_hash: bool,
+    /// Disable audio output; mixing and `--audio-hash` output are unchanged
+    #[arg(long)]
+    pub mute: bool,
+    /// Directory to persist user data (save RAM) in; headless otherwise uses in-memory storage
+    /// seeded from the shipped SData.bin/SGame.bin
+    #[arg(long)]
+    pub user_dir: Option<PathBuf>,
 }
 
 /// A validated unpacked asset folder.
@@ -94,17 +107,49 @@ pub fn resolve_assets(root: &Path) -> Result<ResolvedAssets, EngineError> {
     })
 }
 
+/// Resolves the user-data storage for this run.
+///
+/// `--user-dir` always wins. Headless runs otherwise use in-memory storage seeded with the
+/// shipped `SData.bin`/`SGame.bin` so they stay deterministic and never write files; windowed
+/// runs use the SDL preferred path.
+fn save_storage(args: &Args, source: &Arc<dyn DataSource>) -> Box<dyn Storage> {
+    if let Some(dir) = &args.user_dir {
+        return Box::new(FsStorage::new(dir));
+    }
+    if args.headless {
+        return Box::new(seed_memory_storage(source.as_ref()));
+    }
+    let root = retro_platform::user_data_dir().unwrap_or_else(|| PathBuf::from("retroengine-user"));
+    Box::new(FsStorage::new(root))
+}
+
 /// Parses arguments, loads the requested scene and runs the frame loop.
 pub fn run(args: &Args) -> Result<(), EngineError> {
     let assets = resolve_assets(&args.assets_dir)?;
-    let source = DirSource::new(&assets.root)?;
+    let source: Arc<dyn DataSource> = Arc::new(DirSource::new(&assets.root)?);
     let seed = args.seed.unwrap_or(crate::rng::DEFAULT_SEED);
-    let mut engine = Engine::load(
-        Arc::new(source),
+
+    let mut platform = retro_platform::create(backend_for(args))?;
+    platform.init()?;
+    let storage = save_storage(args, &source);
+    let mut engine = Engine::load_with(
+        Arc::clone(&source),
         args.scene.as_deref(),
         args.act.as_deref(),
         seed,
+        storage,
     )?;
+
+    if let Some(path) = &args.input {
+        let bytes = std::fs::read(path)?;
+        let scripted = ScriptedInput::load(&bytes)
+            .map_err(|error| EngineError::Input(format!("{}: {error}", path.display())))?;
+        engine.set_scripted_input(scripted);
+    } else if !args.headless {
+        engine.set_platform_input();
+    }
+    engine.set_muted(args.mute);
+
     let (folder, act) = engine.stage_info();
     let folder = folder.to_owned();
     let act = act.to_owned();
@@ -124,10 +169,7 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     println!("frames: {frames}");
     println!("seed: {seed}");
     if let Some(input) = &args.input {
-        println!(
-            "note: input replay is not wired until M5; {} is ignored (no keys pressed)",
-            input.display()
-        );
+        println!("input: {} (scripted replay)", input.display());
     }
     if let Some(dir) = &args.dump_frames {
         println!(
@@ -137,8 +179,6 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         );
     }
 
-    let mut platform = retro_platform::create(backend_for(args))?;
-    platform.init()?;
     let (width, height) = (
         engine.framebuffer().width() as u32,
         engine.framebuffer().height() as u32,
@@ -153,6 +193,18 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         ))?)
     };
 
+    // Windowed runs push mixed audio to the SDL device. A missing device is not fatal: mixing
+    // (and therefore `--audio-hash`) continues headlessly.
+    if !args.headless && !args.mute {
+        match platform.open_audio(AudioDesc::stereo(SAMPLE_RATE)) {
+            Ok(device) => match AudioEngine::new(device) {
+                Ok(audio) => engine.set_audio_device(audio),
+                Err(error) => eprintln!("warning: audio disabled: {error}"),
+            },
+            Err(error) => eprintln!("warning: no audio device: {error}"),
+        }
+    }
+
     if let Some(dir) = &args.dump_frames {
         std::fs::create_dir_all(dir)?;
         dump_frame(dir, 0, engine.framebuffer())?;
@@ -165,6 +217,10 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     let mut present_buffer = Vec::new();
     let mut presented = 0u64;
     for _ in 0..frames {
+        if engine.input.uses_platform_input() {
+            let raw = platform.input().poll_raw();
+            engine.set_raw_input(raw);
+        }
         engine.run_frame()?;
         let frame = engine.state.frame;
         if let Some(window) = &mut window {
@@ -186,8 +242,14 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         if args.hash_every_frame {
             println!("{frame},{}", engine.state_hash());
         }
+        if args.audio_hash {
+            println!("{frame},{}", engine.audio_hash());
+        }
     }
 
+    if !engine.flush_save() {
+        eprintln!("warning: could not persist save RAM");
+    }
     if !args.hash_every_frame {
         let hash = engine.state_hash();
         println!("hash: {hash}");
@@ -286,6 +348,9 @@ mod tests {
         assert_eq!(args.frames, 0);
         assert!(args.scene.is_none());
         assert!(!args.hash_every_frame);
+        assert!(!args.audio_hash);
+        assert!(!args.mute);
+        assert_eq!(args.user_dir, None);
         assert_eq!(args.dump_frame_every, 1);
     }
 
@@ -310,6 +375,10 @@ mod tests {
             "--seed",
             "7",
             "--hash-every-frame",
+            "--audio-hash",
+            "--mute",
+            "--user-dir",
+            "user",
         ])
         .unwrap();
         assert_eq!(args.scene.as_deref(), Some("GHZ"));
@@ -321,7 +390,19 @@ mod tests {
         assert_eq!(args.dump_frame_every, 60);
         assert_eq!(args.seed, Some(7));
         assert!(args.hash_every_frame);
+        assert!(args.audio_hash);
+        assert!(args.mute);
+        assert_eq!(args.user_dir, Some(PathBuf::from("user")));
         assert_eq!(backend_for(&args), BackendKind::Headless);
+    }
+
+    #[test]
+    fn input_flag_rejects_a_missing_value() {
+        let error = Args::try_parse_from(["retro-engine", "/tmp/assets", "--input"]).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            clap::error::ErrorKind::InvalidValue | clap::error::ErrorKind::MissingRequiredArgument
+        ));
     }
 
     #[test]
