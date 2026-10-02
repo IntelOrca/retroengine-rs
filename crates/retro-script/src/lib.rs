@@ -62,5 +62,6 @@ pub use opcodes::{
 };
 pub use version::{ScriptVersion, V4Revision};
 pub use vm::{
-    DEFAULT_INSTRUCTION_LIMIT, ForeachStackEntry, ScriptEngineState, ScriptHost, Vm, VmState,
+    DEFAULT_INSTRUCTION_LIMIT, ForeachStackEntry, ScriptEngineState, ScriptEvent, ScriptHost, Vm,
+    VmState,
 };

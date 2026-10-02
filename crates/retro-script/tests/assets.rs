@@ -10,8 +10,8 @@
 use retro_io::{DataSource, DirSource};
 use retro_script::disasm::disassemble;
 use retro_script::{
-    Op, ScriptError, ScriptFile, ScriptHost, ScriptVersion, V4Revision, Vm, VmState, load_bytecode,
-    write_bytecode,
+    Op, ScriptError, ScriptEvent, ScriptFile, ScriptHost, ScriptVersion, V4Revision, Vm, VmState,
+    load_bytecode, write_bytecode,
 };
 
 const ASSET_ROOT: &str = "/home/ted/projects/assets";
@@ -113,6 +113,35 @@ fn disassembly_prefix(game: &str, name: &str, lines: usize) -> String {
     text.lines().take(lines).collect::<Vec<_>>().join("\n")
 }
 
+/// Combines a stage bytecode file with the `GlobalCode.bin` prefix when its stored positions are
+/// global-absolute. Presentation stages are compiled standalone and are returned unchanged.
+fn combined_stage(global: &ScriptFile, stage: &ScriptFile) -> ScriptFile {
+    let standalone = stage
+        .functions
+        .iter()
+        .all(|function| (function.code_pos as usize) < stage.code.len())
+        && stage
+            .object_scripts
+            .iter()
+            .flat_map(|script| [script.update, script.draw, script.startup])
+            .all(|ptr| {
+                ptr.code_pos == retro_script::EMPTY_EVENT
+                    || (ptr.code_pos as usize) < stage.code.len()
+            });
+    if standalone {
+        return stage.clone();
+    }
+    let mut combined = ScriptFile {
+        code: global.code.clone(),
+        jump_table: global.jump_table.clone(),
+        functions: stage.functions.clone(),
+        ..ScriptFile::default()
+    };
+    combined.code.extend_from_slice(&stage.code);
+    combined.jump_table.extend_from_slice(&stage.jump_table);
+    combined
+}
+
 /// Inert host used by the execution smoke test: engine operations do nothing, engine variables
 /// read as zero and `foreach` lists are empty.
 #[derive(Default)]
@@ -128,6 +157,7 @@ impl ScriptHost for NullHost {
         _op: Op,
         _selector: i32,
         _loop_index: i32,
+        _event: ScriptEvent,
         _state: &mut VmState,
     ) -> Result<Option<i32>, ScriptError> {
         Ok(None)
@@ -169,35 +199,7 @@ fn vm_executes_real_functions() {
                 continue;
             }
             let stage = load_bytecode(bytes).unwrap();
-            // Presentation stages are compiled standalone (positions fit inside the file);
-            // everything else stores global-absolute positions and needs `GlobalCode.bin`
-            // in front of it.
-            let standalone = stage
-                .functions
-                .iter()
-                .all(|function| (function.code_pos as usize) < stage.code.len())
-                && stage
-                    .object_scripts
-                    .iter()
-                    .flat_map(|script| [script.update, script.draw, script.startup])
-                    .all(|ptr| {
-                        ptr.code_pos == retro_script::EMPTY_EVENT
-                            || (ptr.code_pos as usize) < stage.code.len()
-                    });
-            let combined = if standalone {
-                stage.clone()
-            } else {
-                let mut combined = ScriptFile {
-                    code: global.code.clone(),
-                    jump_table: global.jump_table.clone(),
-                    functions: stage.functions.clone(),
-                    ..ScriptFile::default()
-                };
-                combined.code.extend_from_slice(&stage.code);
-                combined.jump_table.extend_from_slice(&stage.jump_table);
-                combined
-            };
-            let mut vm = Vm::new(combined);
+            let mut vm = Vm::new(combined_stage(&global, &stage));
             for index in 0..stage.functions.len() {
                 total += 1;
                 let mut state = VmState::default();
@@ -234,6 +236,98 @@ fn vm_executes_real_functions() {
     assert!(
         grand_ok * 100 > grand_total * 95,
         "expected at least 95% of stage functions to terminate"
+    );
+}
+
+/// Host that hands every `foreach` loop a fixed entity sequence and records where those entity
+/// values surface in script variable state: `temp`/`arrayPos`/`global` snapshots taken at each
+/// engine operation, plus engine-variable writes.
+#[derive(Default)]
+struct ForeachProbeHost {
+    entity_values: Vec<i32>,
+    observed: Vec<i32>,
+}
+
+impl ScriptHost for ForeachProbeHost {
+    fn engine_op(&mut self, _op: Op, state: &mut VmState) -> Result<(), ScriptError> {
+        self.observed.extend_from_slice(&state.temp);
+        self.observed.extend_from_slice(&state.array_position);
+        self.observed.extend_from_slice(&state.global_variables);
+        Ok(())
+    }
+
+    fn write_engine_var(
+        &mut self,
+        _var: i32,
+        _array_index: i32,
+        value: i32,
+        _state: &mut VmState,
+    ) -> Result<(), ScriptError> {
+        self.observed.push(value);
+        Ok(())
+    }
+
+    fn foreach_next(
+        &mut self,
+        _op: Op,
+        _selector: i32,
+        loop_index: i32,
+        _event: ScriptEvent,
+        _state: &mut VmState,
+    ) -> Result<Option<i32>, ScriptError> {
+        Ok(self.entity_values.get(loop_index.max(0) as usize).copied())
+    }
+}
+
+/// Runs every real stage function with a host that returns two distinct entity references from
+/// `foreach` and checks that both values reach script variable state in order. This is the
+/// end-to-end guard for the upstream "success path writes `operands[2]` back" behavior.
+#[test]
+#[ignore = "requires the local Sonic 1/2 asset trees"]
+fn real_bytecode_foreach_writes_entity_into_loop_variable() {
+    const FIRST: i32 = 11;
+    const SECOND: i32 = 22;
+
+    let mut matches = 0usize;
+    let mut example: Option<String> = None;
+    for game in GAMES {
+        let files = bytecode_files(game);
+        let (_, global_bytes) = files
+            .iter()
+            .find(|(path, _)| path.ends_with("GlobalCode.bin"))
+            .unwrap_or_else(|| panic!("{game}/GlobalCode.bin"));
+        let global = load_bytecode(global_bytes).unwrap();
+        for (path, bytes) in &files {
+            if path.ends_with("GlobalCode.bin") {
+                continue;
+            }
+            let stage = load_bytecode(bytes).unwrap();
+            let mut vm = Vm::new(combined_stage(&global, &stage));
+            for index in 0..stage.functions.len() {
+                let mut host = ForeachProbeHost {
+                    entity_values: vec![FIRST, SECOND],
+                    ..ForeachProbeHost::default()
+                };
+                let mut state = VmState::default();
+                let _ = vm.call_with_limit(&mut host, index, &mut state, 200_000);
+                let first = host.observed.iter().position(|value| *value == FIRST);
+                let second = host.observed.iter().position(|value| *value == SECOND);
+                if let (Some(first), Some(second)) = (first, second)
+                    && first < second
+                {
+                    matches += 1;
+                    example.get_or_insert_with(|| format!("{game}/{path}#{index}"));
+                }
+            }
+        }
+    }
+
+    println!(
+        "{matches} real stage functions wrote the foreach entity sequence in order (example: {example:?})"
+    );
+    assert!(
+        matches > 0,
+        "no real function propagated the foreach entity into variable state"
     );
 }
 

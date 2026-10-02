@@ -3310,11 +3310,18 @@ pub fn opcode_by_name(version: ScriptVersion, revision: V4Revision, name: &str) 
         .map(|index| index as u8)
 }
 
-/// Returns whether the VM writes operand values back to their decoded destinations after `op`.
+/// Returns whether the VM normally writes operand values back to their decoded destinations
+/// after `op`.
 ///
 /// Upstream `ProcessScript` skips the "Set Values" pass for control-flow operations (which jump
 /// away) and for engine operations that explicitly zero `opcodeSize`. This function encodes that
-/// table; it is revision-independent because the same operation always behaves the same way.
+/// static table; it is revision-independent because the same operation always behaves the same
+/// way.
+///
+/// `ForEachActive`/`ForEachAll` return `true`: upstream leaves `opcodeSize` intact on the
+/// success path so the entity reference in `operands[2]` is written to the loop variable, and
+/// only suppresses write-back on the exit paths. The VM tracks that per-path suppression
+/// internally (see `Vm::foreach_step`).
 pub fn op_writes_back(op: Op) -> bool {
     !matches!(
         op,
@@ -3337,8 +3344,6 @@ pub fn op_writes_back(op: Op) -> bool {
             | Op::WLowerOrEqual
             | Op::WNotEqual
             | Op::Loop
-            | Op::ForEachActive
-            | Op::ForEachAll
             | Op::Next
             | Op::Switch
             | Op::Break
@@ -3942,6 +3947,10 @@ mod tests {
         assert!(!op_writes_back(Op::Return));
         assert!(!op_writes_back(Op::DrawSprite));
         assert!(!op_writes_back(Op::LoadTextFile));
+        // foreach writes the entity reference back on the success path; the VM suppresses the
+        // write-back dynamically on the exit paths, like upstream's `opcodeSize = 0`.
+        assert!(op_writes_back(Op::ForEachActive));
+        assert!(op_writes_back(Op::ForEachAll));
         assert!(op_writes_back(Op::Equal));
         assert!(op_writes_back(Op::Add));
         assert!(op_writes_back(Op::GetTableValue));

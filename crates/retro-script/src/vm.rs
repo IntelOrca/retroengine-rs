@@ -45,8 +45,30 @@ use crate::version::{ScriptVersion, V4Revision};
 /// Default per-call instruction budget, chosen well above any real event script.
 pub const DEFAULT_INSTRUCTION_LIMIT: u64 = 1 << 22;
 
-/// Maximum nesting depth for jump-table, function and foreach stacks (upstream `*_COUNT`).
-const MAX_STACK: usize = 0x400;
+/// Upstream `JUMPSTACK_COUNT`: one entry per nested `if`/`switch`/loop.
+const MAX_JUMP_DEPTH: usize = 0x400;
+/// Upstream `FORSTACK_COUNT`: one entry per nested `foreach`.
+const MAX_FOREACH_DEPTH: usize = 0x400;
+/// Upstream `FUNCSTACK_COUNT` is 0x400 *ints* and `CallFunction` pushes three words per call
+/// (return address, jump table start, code start), so the call depth is 0x400 / 3 frames.
+const MAX_CALL_DEPTH: usize = 0x400 / 3;
+
+/// Which object event is currently executing.
+///
+/// Mirrors upstream `ScriptSubs` (`EVENT_MAIN`/`EVENT_DRAW`/`EVENT_SETUP`). Upstream's
+/// `FUNC_FOREACHALL` iterates a different entity range during the setup event
+/// (`loop >= TEMPENTITY_START`) than during update/draw (`loop >= ENTITY_COUNT`), so the host
+/// receives this value through [`ScriptHost::foreach_next`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum ScriptEvent {
+    /// `eventObjectUpdate` / upstream `EVENT_MAIN`.
+    #[default]
+    Main,
+    /// `eventObjectDraw` / upstream `EVENT_DRAW`.
+    Draw,
+    /// `eventObjectStartup` / upstream `EVENT_SETUP`.
+    Setup,
+}
 
 /// One entry of the persistent `foreach` stack: the last candidate index tried at that nesting
 /// level, or `-1` when the level is unused.
@@ -90,6 +112,9 @@ pub struct VmState {
     pub foreach_stack: Vec<ForeachStackEntry>,
     /// Upstream global `scriptText`; set by `STRCONST` operand decoding.
     pub script_text: String,
+    /// Event currently executing. The host sets this before [`Vm::call`]; the VM forwards it to
+    /// [`ScriptHost::foreach_next`] so hosts can apply the setup-event entity bound.
+    pub current_event: ScriptEvent,
 }
 
 /// Engine-side operations required by the interpreter.
@@ -136,16 +161,20 @@ pub trait ScriptHost {
     /// when the candidate is past the end of the list.
     ///
     /// `op` is [`Op::ForEachActive`] (iterate a type group) or [`Op::ForEachAll`] (iterate all
-    /// entities of `selector`). `loop_index` starts at 0 for each loop execution. The default
-    /// reports an empty list, which makes the loop exit immediately.
+    /// entities of `selector`). `loop_index` starts at 0 for each loop execution. `event` is
+    /// [`VmState::current_event`]; for [`Op::ForEachAll`] the host must apply the setup-event
+    /// bound (`loop >= TEMPENTITY_START`) when `event` is [`ScriptEvent::Setup`] instead of the
+    /// normal `loop >= ENTITY_COUNT` bound. The default reports an empty list, which makes the
+    /// loop exit immediately.
     fn foreach_next(
         &mut self,
         op: Op,
         selector: i32,
         loop_index: i32,
+        event: ScriptEvent,
         state: &mut VmState,
     ) -> Result<Option<i32>, ScriptError> {
-        let _ = (op, selector, loop_index, state);
+        let _ = (op, selector, loop_index, event, state);
         Ok(None)
     }
 }
@@ -182,6 +211,32 @@ struct Stacks {
 enum Outcome {
     Continue,
     Stop,
+}
+
+/// Result of one instruction: whether to keep running and whether the "Set Values" pass runs.
+///
+/// Upstream clears `opcodeSize` on the `foreach` exit paths, which suppresses write-back for
+/// that instruction only; every other operation's write-back behavior is static
+/// ([`crate::opcodes::op_writes_back`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StepResult {
+    outcome: Outcome,
+    write_back: bool,
+}
+
+impl StepResult {
+    const CONTINUE: Self = Self {
+        outcome: Outcome::Continue,
+        write_back: true,
+    };
+    const CONTINUE_WITHOUT_WRITE_BACK: Self = Self {
+        outcome: Outcome::Continue,
+        write_back: false,
+    };
+    const STOP: Self = Self {
+        outcome: Outcome::Stop,
+        write_back: true,
+    };
 }
 
 impl Vm {
@@ -268,14 +323,14 @@ impl Vm {
             state.script_text.clear();
             self.decode_operands(host, state, &mut frame.code_pos, info.operands.len())?;
 
-            let outcome = self.execute(host, state, info.op, &mut frame, &mut stacks)?;
+            let step = self.execute(host, state, info.op, &mut frame, &mut stacks)?;
 
-            if opcodes::op_writes_back(info.op) && !info.operands.is_empty() {
+            if step.write_back && opcodes::op_writes_back(info.op) && !info.operands.is_empty() {
                 let mut ptr = operands_start;
                 self.write_back_operands(host, state, &mut ptr, info.operands.len())?;
             }
 
-            if outcome == Outcome::Stop {
+            if step.outcome == Outcome::Stop {
                 return Ok(());
             }
         }
@@ -510,7 +565,7 @@ impl Vm {
     }
 
     fn push_jump(&self, stacks: &mut Stacks, index: i32) -> Result<(), ScriptError> {
-        if stacks.jump.len() >= MAX_STACK {
+        if stacks.jump.len() >= MAX_JUMP_DEPTH {
             return Err(ScriptError::InvalidState(
                 "jump table stack overflow".to_string(),
             ));
@@ -564,9 +619,9 @@ impl Vm {
         op: Op,
         frame: &mut Frame,
         stacks: &mut Stacks,
-    ) -> Result<Outcome, ScriptError> {
+    ) -> Result<StepResult, ScriptError> {
         match op {
-            Op::End => return Ok(Outcome::Stop),
+            Op::End => return Ok(StepResult::STOP),
             Op::Equal => state.operands[0] = state.operands[1],
             Op::Add => {
                 state.operands[0] = state.operands[0].wrapping_add(state.operands[1]);
@@ -699,7 +754,7 @@ impl Vm {
                 self.jump_table_target(frame, index as i32, 0)?;
             }
             Op::ForEachActive | Op::ForEachAll => {
-                self.foreach_step(host, state, frame, stacks, op)?;
+                return self.foreach_step(host, state, frame, stacks, op);
             }
             Op::Next => {
                 let index = self.pop_jump(stacks)?;
@@ -741,7 +796,7 @@ impl Vm {
                     .ok_or(ScriptError::BadFunction)?;
                 self.validate_entry(target.0)?;
                 self.validate_entry(target.1)?;
-                if stacks.calls.len() >= MAX_STACK {
+                if stacks.calls.len() >= MAX_CALL_DEPTH {
                     return Err(ScriptError::InvalidState(
                         "function stack overflow".to_string(),
                     ));
@@ -755,7 +810,7 @@ impl Vm {
                 if let Some(caller) = stacks.calls.pop() {
                     *frame = caller;
                 } else {
-                    return Ok(Outcome::Stop);
+                    return Ok(StepResult::STOP);
                 }
             }
             Op::GetTableValue => {
@@ -808,9 +863,14 @@ impl Vm {
             }
             _ => host.engine_op(op, state)?,
         }
-        Ok(Outcome::Continue)
+        Ok(StepResult::CONTINUE)
     }
 
+    /// Runs one `foreach` step.
+    ///
+    /// On success upstream leaves `opcodeSize` intact so the "Set Values" pass writes the entity
+    /// reference in `operands[2]` back to the loop variable; the exit paths zero `opcodeSize`,
+    /// so this returns [`StepResult::CONTINUE_WITHOUT_WRITE_BACK`] there.
     fn foreach_step(
         &self,
         host: &mut dyn ScriptHost,
@@ -818,7 +878,7 @@ impl Vm {
         frame: &mut Frame,
         stacks: &mut Stacks,
         op: Op,
-    ) -> Result<(), ScriptError> {
+    ) -> Result<StepResult, ScriptError> {
         let index = state.operands[0];
         let selector = state.operands[1];
         if index < 0 {
@@ -828,7 +888,7 @@ impl Vm {
         }
         stacks.foreach_pos += 1;
         let position = stacks.foreach_pos;
-        if position > MAX_STACK {
+        if position > MAX_FOREACH_DEPTH {
             return Err(ScriptError::InvalidState(
                 "foreach stack overflow".to_string(),
             ));
@@ -839,18 +899,20 @@ impl Vm {
         let candidate = state.foreach_stack[position].wrapping_add(1);
         state.foreach_stack[position] = candidate;
 
-        match host.foreach_next(op, selector, candidate, state)? {
+        let event = state.current_event;
+        match host.foreach_next(op, selector, candidate, event, state)? {
             Some(entity) => {
                 state.operands[2] = entity;
                 self.push_jump(stacks, index)?;
+                Ok(StepResult::CONTINUE)
             }
             None => {
                 state.foreach_stack[position] = -1;
                 stacks.foreach_pos -= 1;
                 self.jump_table_target(frame, index, 1)?;
+                Ok(StepResult::CONTINUE_WITHOUT_WRITE_BACK)
             }
         }
-        Ok(())
     }
 }
 
@@ -967,7 +1029,7 @@ mod tests {
         engine_vars: HashMap<i32, i32>,
         writes: Vec<(i32, i32, i32)>,
         foreach: Vec<Option<i32>>,
-        foreach_calls: Vec<(Op, i32, i32)>,
+        foreach_calls: Vec<(Op, i32, i32, ScriptEvent)>,
     }
 
     impl ScriptHost for MockHost {
@@ -1008,9 +1070,10 @@ mod tests {
             op: Op,
             selector: i32,
             loop_index: i32,
+            event: ScriptEvent,
             _state: &mut VmState,
         ) -> Result<Option<i32>, ScriptError> {
-            self.foreach_calls.push((op, selector, loop_index));
+            self.foreach_calls.push((op, selector, loop_index, event));
             Ok(self
                 .foreach
                 .get(loop_index.max(0) as usize)
@@ -1320,19 +1383,30 @@ mod tests {
         assert_eq!(vm.find_function("Missing"), None);
     }
 
-    #[test]
-    fn foreach_iterates_and_exits() {
-        // 0: ForEachActive(jt0, group 0, temp1) [8]
-        // 8: Add(temp0, 1)                      [6]
-        // 14: next                              [1]
-        // 15: End
-        // jump[0] = 0 (foreach), jump[1] = 15 (after)
+    /// Program used by the foreach tests:
+    ///
+    /// ```text
+    /// 0:  ForEachActive(jt0, group 0, temp1)  [8]
+    /// 8:  Add(temp0, temp1)                   [7]
+    /// 15: DrawSprite(temp1)                   [4]
+    /// 19: next                                [1]
+    /// 20: End
+    /// jump[0] = 0 (foreach), jump[1] = 20 (after the loop)
+    /// ```
+    fn foreach_program() -> Asm {
         let mut asm = Asm::default();
         asm.op("ForEachActive").int(0).int(0).var(1);
-        asm.op("Add").var(0).int(1);
+        asm.op("Add").var(0).var(1);
+        asm.op("DrawSprite").var(1);
         asm.op("next");
         asm.op("End");
-        asm.jump(0).jump(15);
+        asm.jump(0).jump(20);
+        asm
+    }
+
+    #[test]
+    fn foreach_writes_entity_back_into_loop_variable() {
+        let asm = foreach_program();
         let mut vm = Vm::new(asm.file(vec![asm.function("main", 0, 0)]));
         let mut state = VmState::default();
         let mut host = MockHost {
@@ -1340,31 +1414,84 @@ mod tests {
             ..MockHost::default()
         };
         vm.call(&mut host, 0, &mut state).unwrap();
-        assert_eq!(state.temp[0], 2);
+
+        // The loop variable is updated on every successful iteration (upstream leaves
+        // `opcodeSize` intact on that path), so the body accumulates and observes 3 then 7.
+        assert_eq!(state.temp[0], 10);
+        assert_eq!(state.temp[1], 7, "last entity remains after loop exit");
+        let draw_values: Vec<i32> = host
+            .ops
+            .iter()
+            .zip(&host.operands)
+            .filter(|(op, _)| **op == Op::DrawSprite)
+            .map(|(_, operands)| operands[0])
+            .collect();
+        assert_eq!(draw_values, vec![3, 7], "loop variable progression");
         assert_eq!(
             host.foreach_calls,
             vec![
-                (Op::ForEachActive, 0, 0),
-                (Op::ForEachActive, 0, 1),
-                (Op::ForEachActive, 0, 2),
+                (Op::ForEachActive, 0, 0, ScriptEvent::Main),
+                (Op::ForEachActive, 0, 1, ScriptEvent::Main),
+                (Op::ForEachActive, 0, 2, ScriptEvent::Main),
             ]
         );
     }
 
     #[test]
-    fn foreach_breaks_out_when_host_returns_none() {
+    fn foreach_exit_path_suppresses_write_back() {
+        // Engine variable as the loop variable: if the exit path performed the "Set Values"
+        // pass, the host would observe a redundant write of the stale value.
         let mut asm = Asm::default();
-        asm.op("ForEachAll").int(0).int(99).var(1);
+        asm.op("ForEachAll").int(0).int(99).var(500);
         asm.op("Add").var(0).int(1);
         asm.op("next");
         asm.op("End");
         asm.jump(0).jump(15);
         let mut vm = Vm::new(asm.file(vec![asm.function("main", 0, 0)]));
         let mut state = VmState::default();
-        vm.call(&mut MockHost::default(), 0, &mut state).unwrap();
+        let mut host = MockHost::default();
+        vm.call(&mut host, 0, &mut state).unwrap();
         assert_eq!(state.temp[0], 0);
+        assert!(host.writes.is_empty(), "exit path must not write back");
         assert_eq!(state.foreach_stack.len(), 2);
         assert_eq!(state.foreach_stack[1], -1);
+    }
+
+    #[test]
+    fn foreach_receives_the_current_event() {
+        let asm = foreach_program();
+        let mut vm = Vm::new(asm.file(vec![asm.function("main", 0, 0)]));
+        let mut state = VmState {
+            current_event: ScriptEvent::Setup,
+            ..VmState::default()
+        };
+        let mut host = MockHost {
+            foreach: vec![Some(1)],
+            ..MockHost::default()
+        };
+        vm.call(&mut host, 0, &mut state).unwrap();
+        assert_eq!(
+            host.foreach_calls,
+            vec![
+                (Op::ForEachActive, 0, 0, ScriptEvent::Setup),
+                (Op::ForEachActive, 0, 1, ScriptEvent::Setup),
+            ]
+        );
+    }
+
+    #[test]
+    fn call_stack_depth_matches_upstream_function_stack_size() {
+        // 0: CallFunction(0) [3]
+        // 3: End
+        let mut asm = Asm::default();
+        asm.op("CallFunction").int(0);
+        asm.op("End");
+        let mut vm = Vm::new(asm.file(vec![asm.function("recurse", 0, 0)]));
+        let mut state = VmState::default();
+        assert!(matches!(
+            vm.call_with_limit(&mut MockHost::default(), 0, &mut state, 100_000),
+            Err(ScriptError::InvalidState(_))
+        ));
     }
 
     #[test]
