@@ -29,6 +29,8 @@ use retro_format_v4::scene::{
     ENTITY_ATTRIB_STATE, ENTITY_ATTRIB_VALUES,
 };
 use retro_io::DataSource;
+use retro_render::ChunkEntry;
+use retro_render::layers::{LAYER_3DFLOOR, LAYER_3DSKY, LAYER_HSCROLL, LAYER_VSCROLL, LayerView};
 use retro_scene::{
     DRAWLAYER_COUNT, ENTITY_COUNT, EntityStore, OBJECT_COUNT, SCENE_ENTITY_START, TEMPENTITY_START,
 };
@@ -92,6 +94,22 @@ impl Engine {
             world.scripts.objects,
             rng,
         );
+        state.apply_game_palette();
+        state.apply_stage_palette();
+        if let Some(tiles16) = &world.tiles16 {
+            state.apply_tile_sheet(tiles16);
+        }
+        if let Some(tiles128) = &world.tiles128 {
+            state
+                .render
+                .tiles
+                .chunks
+                .extend(tiles128.entries.iter().map(|entry| ChunkEntry {
+                    gfx_data_pos: entry.gfx_data_pos(),
+                    direction: entry.direction,
+                    visual_plane: entry.visual_plane,
+                }));
+        }
         state.entities.reset_scene();
         place_scene_entities(&mut state.entities, &state.scene.entities);
 
@@ -164,12 +182,148 @@ impl Engine {
     }
 
     /// Runs one 60 Hz frame.
+    ///
+    /// Ordering matches `ProcessStage`'s `STAGEMODE_NORMAL`: fade decay, clock, object updates,
+    /// camera follow, parallax auto-scroll, then `DrawStageGFX` (which runs `ObjectDraw` events
+    /// through the draw lists, interleaved with the tile layers) and the fade rectangle.
     pub fn run_frame(&mut self) -> Result<(), EngineError> {
+        if self.state.render.fade_mode > 0 {
+            self.state.render.fade_mode -= 1;
+        }
         self.update_clock();
         self.process_objects()?;
         self.update_camera();
+        self.process_parallax_auto_scroll();
+        self.draw_stage_gfx()?;
         self.state.frame += 1;
         Ok(())
+    }
+
+    /// `ProcessParallaxAutoScroll`.
+    fn process_parallax_auto_scroll(&mut self) {
+        for table in [&mut self.state.h_parallax, &mut self.state.v_parallax] {
+            for index in 0..table.entry_count.min(retro_render::PARALLAX_COUNT) {
+                if let (Some(position), Some(speed)) = (
+                    table.scroll_pos.get_mut(index),
+                    table.scroll_speed.get(index).copied(),
+                ) {
+                    *position = position.wrapping_add(speed);
+                }
+            }
+        }
+    }
+
+    /// `DrawStageGFX`: runs the draw lists in upstream order around the tile layers.
+    fn draw_stage_gfx(&mut self) -> Result<(), EngineError> {
+        let water_level = self.state.stage.water_level;
+        let y_scroll = self.state.screen.y_scroll;
+        let screen_height = self.state.render.framebuffer.height() as i32;
+        self.state.render.water_draw_pos = (water_level - y_scroll).clamp(0, screen_height);
+        let mid_point = self.state.stage.mid_point;
+        if mid_point < 3 {
+            self.draw_object_list(0)?;
+            self.draw_tile_layer(0, mid_point);
+            self.draw_object_list(1)?;
+            self.draw_tile_layer(1, mid_point);
+            self.draw_object_list(2)?;
+            self.draw_object_list(3)?;
+            self.draw_object_list(4)?;
+            self.draw_tile_layer(2, mid_point);
+        } else if mid_point < 6 {
+            self.draw_object_list(0)?;
+            self.draw_tile_layer(0, mid_point);
+            self.draw_object_list(1)?;
+            self.draw_tile_layer(1, mid_point);
+            self.draw_object_list(2)?;
+            self.draw_tile_layer(2, mid_point);
+            self.draw_object_list(3)?;
+            self.draw_object_list(4)?;
+        }
+        if mid_point < 6 {
+            self.draw_tile_layer(3, mid_point);
+            self.draw_object_list(5)?;
+            // RETRO_REV03/Origins ordering also runs draw list 7.
+            self.draw_object_list(7)?;
+            self.draw_object_list(6)?;
+        }
+        self.state.render.draw_fade();
+        Ok(())
+    }
+
+    /// `DrawObjectList`: runs `ObjectDraw` for every entity in `layer`'s draw list.
+    fn draw_object_list(&mut self, layer: usize) -> Result<(), EngineError> {
+        let Some(slot) = self.state.draw_lists.get_mut(layer) else {
+            return Ok(());
+        };
+        let list = std::mem::take(slot);
+        let result = self.run_draw_list(&list);
+        if let Some(target) = self.state.draw_lists.get_mut(layer) {
+            *target = list;
+        }
+        result
+    }
+
+    fn run_draw_list(&mut self, list: &[i32]) -> Result<(), EngineError> {
+        for &slot in list {
+            let Some(entity) = self
+                .state
+                .entities
+                .get(usize::try_from(slot).unwrap_or(usize::MAX))
+                .copied()
+            else {
+                continue;
+            };
+            if entity.type_id == 0 {
+                continue;
+            }
+            self.state.object_entity_pos = usize::try_from(slot).unwrap_or(0);
+            let Some(entry) = self.state.objects.get(usize::from(entity.type_id)) else {
+                continue;
+            };
+            let draw = entry.script.draw;
+            if self.script_exists(draw.code_pos) {
+                self.scripts.vm_state.current_event = ScriptEvent::Draw;
+                self.run_host_event(draw.code_pos, draw.jump_pos)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Draws one of the four active tile layers, recording 3D layers as stubs.
+    fn draw_tile_layer(&mut self, layer_id: usize, mid_point: i32) {
+        let Some(active) = self.state.stage.active_layers.get(layer_id).copied() else {
+            return;
+        };
+        let Ok(index) = usize::try_from(active) else {
+            return;
+        };
+        let Some(layer) = self.state.layers.get_mut(index) else {
+            return;
+        };
+        let view = LayerView {
+            is_background: active != 0,
+            above_mid_point: layer_id as i32 >= mid_point,
+            x_scroll_offset: self.state.screen.x_scroll,
+            y_scroll_offset: self.state.screen.y_scroll,
+        };
+        match layer.layer_type {
+            LAYER_HSCROLL => retro_render::layers::draw_h_line_scroll_layer(
+                &mut self.state.render,
+                layer,
+                &mut self.state.h_parallax,
+                view,
+            ),
+            LAYER_VSCROLL => retro_render::layers::draw_v_line_scroll_layer(
+                &mut self.state.render,
+                layer,
+                &mut self.state.v_parallax,
+                view,
+            ),
+            LAYER_3DFLOOR | LAYER_3DSKY => {
+                self.state.record_stub("Draw3DLayer");
+            }
+            _ => {}
+        }
     }
 
     /// Runs `frames` frames, optionally hashing every frame.
@@ -496,6 +650,9 @@ impl Engine {
                 put_i32(&mut hasher, *value);
             }
         }
+        // The software framebuffer is part of the canonical state: every backing pixel
+        // (`pitch * height`, including the padding columns) is hashed as little-endian u16.
+        self.state.render.framebuffer.hash_into(&mut hasher);
         hasher.finalize().to_hex().to_string()
     }
 
@@ -527,6 +684,12 @@ impl Engine {
     #[must_use]
     pub fn game_title(&self) -> &str {
         &self.state.game_config.title
+    }
+
+    /// The currently rendered framebuffer.
+    #[must_use]
+    pub fn framebuffer(&self) -> &retro_render::Framebuffer {
+        &self.state.render.framebuffer
     }
 }
 

@@ -1,5 +1,5 @@
-//! Engine entry point: loads an unpacked RSDK asset folder and runs headless (M3) or windowed
-//! (later milestones).
+//! Engine entry point: loads an unpacked RSDK asset folder and runs the M4 software renderer
+//! headlessly (with optional PNG frame dumps) or windowed through SDL3.
 #![forbid(unsafe_code)]
 
 pub mod cli;

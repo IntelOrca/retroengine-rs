@@ -63,6 +63,10 @@ pub struct LoadedWorld {
     pub collision: Option<SceneCollision>,
     /// Background layers/parallax (`None` when absent).
     pub backgrounds: Option<Backgrounds>,
+    /// Decoded `16x16Tiles.gif` (`None` when absent or malformed).
+    pub tiles16: Option<TileSheet16>,
+    /// Decoded `128x128Tiles.bin` (`None` when absent or malformed).
+    pub tiles128: Option<TileSheet128>,
     /// Linked scripts.
     pub scripts: LoadedScripts,
 }
@@ -312,19 +316,18 @@ pub fn load_world(
     let stage_config = StageConfig::load(&stage_dir, source.as_ref())?;
     let scene = Scene::load(&stage_dir, &act, source.as_ref())?;
 
+    let tiles128 = TileSheet128::load(&stage_dir, source.as_ref()).ok();
     let collision = match (
-        TileSheet128::load(&stage_dir, source.as_ref()),
+        tiles128.clone(),
         CollisionMasks::load(&stage_dir, source.as_ref()),
     ) {
-        (Ok(tiles), Ok(masks)) => {
+        (Some(tiles), Ok(masks)) => {
             let layout = StageLayout::from_scene(&scene);
             Some(SceneCollision::new(layout, tiles, masks))
         }
         _ => None,
     };
-    // Keep the 16x16 sheet load exercised (it is part of scene loading) even though M3 does not
-    // render it yet.
-    let _tile_sheet = TileSheet16::load(&stage_dir, source.as_ref()).ok();
+    let tiles16 = TileSheet16::load(&stage_dir, source.as_ref()).ok();
     let backgrounds = if source.exists(&format!("{stage_dir}/Backgrounds.bin")) {
         Backgrounds::load(&stage_dir, source.as_ref()).ok()
     } else {
@@ -343,6 +346,8 @@ pub fn load_world(
         stage_config,
         collision,
         backgrounds,
+        tiles16,
+        tiles128,
         scripts,
     })
 }
