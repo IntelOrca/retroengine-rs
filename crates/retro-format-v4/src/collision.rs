@@ -40,8 +40,10 @@ pub const COLLISION_FILE_BYTES: usize =
 
 /// One tile of one collision plane.
 ///
-/// The four masks hold per-column heights (left/right wall) or per-row heights (floor/roof) in
-/// the same orientation the engine uses: floor/roof are indexed by row, wall masks by column.
+/// The masks use the engine's sensor orientation (`RSDKv4/Collision.cpp`):
+/// [`CollisionTile::floor`] and [`CollisionTile::roof`] are indexed by **column**
+/// (`XPos & 15`), while [`CollisionTile::left_wall`] and [`CollisionTile::right_wall`] are
+/// indexed by **row** (`YPos & 15`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CollisionTile {
     /// High nibble of the flags byte; ceiling tiles derive their masks from the roof samples.

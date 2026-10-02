@@ -192,9 +192,8 @@ fn stage_file(stage_dir: &str, file: &str) -> String {
 fn map_image_error(error: retro_image::ImageError) -> FormatError {
     match error {
         retro_image::ImageError::Truncated => FormatError::Truncated,
-        other @ (retro_image::ImageError::Invalid(_) | retro_image::ImageError::Unsupported(_)) => {
-            FormatError::invalid(other.to_string())
-        }
+        retro_image::ImageError::Invalid(message) => FormatError::invalid(message),
+        retro_image::ImageError::Unsupported(message) => FormatError::unsupported(message),
     }
 }
 
@@ -202,6 +201,41 @@ fn map_image_error(error: retro_image::ImageError) -> FormatError {
 mod tests {
     use super::*;
     use retro_io::MemorySource;
+
+    #[test]
+    fn maps_oversized_gif_to_unsupported() {
+        // A syntactically valid GIF whose logical screen exceeds the engine's 4 MiB buffer.
+        let mut gif = Vec::new();
+        gif.extend_from_slice(b"GIF89a");
+        gif.extend_from_slice(&4096u16.to_le_bytes());
+        gif.extend_from_slice(&4096u16.to_le_bytes());
+        gif.extend_from_slice(&[0, 0, 0]); // packed (2 palette entries), background, aspect
+        gif.extend_from_slice(&[0u8; 6]); // global colour table
+        gif.push(0x2C); // image separator
+        gif.extend_from_slice(&[0u8; 8]); // image descriptor
+        gif.push(0); // image packed
+        gif.push(2); // LZW minimum code size
+        assert!(matches!(
+            TileSheet16::from_gif(&gif),
+            Err(FormatError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn image_errors_keep_their_category() {
+        assert!(matches!(
+            map_image_error(retro_image::ImageError::Truncated),
+            FormatError::Truncated
+        ));
+        assert!(matches!(
+            map_image_error(retro_image::ImageError::Invalid("bad".to_owned())),
+            FormatError::Invalid(message) if message == "bad"
+        ));
+        assert!(matches!(
+            map_image_error(retro_image::ImageError::Unsupported("nope".to_owned())),
+            FormatError::Unsupported(message) if message == "nope"
+        ));
+    }
 
     #[test]
     fn decodes_tile128_entries() {

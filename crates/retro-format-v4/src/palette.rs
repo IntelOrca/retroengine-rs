@@ -1,16 +1,20 @@
 //! Parser for RSDKv4 palette files (`Data/Palettes/*.act`) and RGB565 conversion helpers.
 //!
-//! A `.act` file is a raw RGB888 colour table with no header; upstream (`LoadPalette` in
+//! A `.act` file is a raw, unlabelled RGB888 colour table, conventionally 256 colours
+//! ([`PALETTE_COLORS`] / [`PALETTE_BYTES`]) but not required to be: upstream (`LoadPalette` in
 //! `RSDKv4/Palette.cpp`) seeks to `3 * startIndex` and reads `endIndex - startIndex` colours
-//! without ever validating the file size. Full files hold 256 colours
-//! ([`PALETTE_BYTES`]); RSDK ships partial files as well, so this parser accepts any whole
-//! number of colours up to 256.
+//! without ever validating the file size, and RSDK ships partial files as well. This parser
+//! therefore accepts any whole number of colours up to 256 and the [`Palette`] value is simply
+//! the file's colours in order; the file itself has no global/stage split.
 //!
-//! The engine's palette layout uses the first [`GLOBAL_PALETTE_COLORS`] entries for the global
-//! palette (loaded from `GameConfig.bin`) and the next [`STAGE_PALETTE_COLORS`] entries for the
-//! stage palette (loaded from `StageConfig.bin`); [`Palette::global`] and [`Palette::stage`]
-//! expose those slices, and [`Palette::to_rgb565`] packs the whole table with the software
-//! renderer's RGB565 layout from [`retro_core::color::rgb888_to_rgb565`].
+//! The 96/32 split is a property of the *engine's* palette slots, not of the `.act` data:
+//! `GameConfig.bin` fills engine indices `0x00..0x60` (96 colours,
+//! [`GLOBAL_PALETTE_COLORS`]) and `StageConfig.bin` fills `0x60..0x80` (32 colours,
+//! [`STAGE_PALETTE_COLORS`]). [`Palette::global`] and [`Palette::stage`] are only convenience
+//! views of those two engine ranges when a palette is applied to those slots (e.g. a mod or
+//! tool loading a full `.act` over the combined palette); they do not claim the file is split
+//! that way. [`Palette::to_rgb565`] packs the whole table with the software renderer's RGB565
+//! layout from [`retro_core::color::rgb888_to_rgb565`].
 
 use serde::Serialize;
 
@@ -22,9 +26,11 @@ use retro_io::DataSource;
 pub const PALETTE_COLORS: usize = 0x100;
 /// Byte size of a full `.act` palette.
 pub const PALETTE_BYTES: usize = PALETTE_COLORS * 3;
-/// Number of global palette colours loaded from `GameConfig.bin`.
+/// Number of colours in the engine's global palette slot (`0x00..0x60`), filled from
+/// `GameConfig.bin`; not a property of `.act` files.
 pub const GLOBAL_PALETTE_COLORS: usize = 0x60;
-/// Number of stage palette colours loaded from `StageConfig.bin`.
+/// Number of colours in the engine's stage palette slot (`0x60..0x80`), filled from
+/// `StageConfig.bin`; not a property of `.act` files.
 pub const STAGE_PALETTE_COLORS: usize = 0x20;
 /// Engine palette index of the first stage colour.
 pub const STAGE_PALETTE_INDEX: usize = GLOBAL_PALETTE_COLORS;
@@ -88,12 +94,21 @@ impl Palette {
         self.colors.get(start..end)
     }
 
-    /// The global palette colours (engine indices 0..0x60), truncated to the file length.
+    /// View of the colours that would occupy the engine's 96-entry global palette range
+    /// (`0x00..0x60`) if this table were applied there, truncated to the file length.
+    ///
+    /// This is a slicing convenience for the combined engine palette layout; a `.act` file is a
+    /// raw table with no inherent global/stage division.
     pub fn global(&self) -> &[[u8; 3]] {
         &self.colors[..self.colors.len().min(GLOBAL_PALETTE_COLORS)]
     }
 
-    /// The stage palette colours (engine indices 0x60..0x80), truncated to the file length.
+    /// View of the colours that would occupy the engine's 32-entry stage palette range
+    /// (`0x60..0x80`) if this table were applied to the combined engine palette, truncated to
+    /// the file length.
+    ///
+    /// This is a slicing convenience for the combined engine palette layout; a `.act` file is a
+    /// raw table with no inherent global/stage division.
     pub fn stage(&self) -> &[[u8; 3]] {
         let start = self.colors.len().min(STAGE_PALETTE_INDEX);
         let end = self
