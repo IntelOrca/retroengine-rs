@@ -368,6 +368,7 @@ version = "0.1.0"
 name = "retro-scene"
 version = "0.1.0"
 dependencies = [
+ "retro-core",
  "retro-format-v4",
  "retro-script",
  "serde",

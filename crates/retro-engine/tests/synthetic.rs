@@ -103,7 +103,7 @@ fn source() -> Arc<dyn retro_io::DataSource> {
 
 #[test]
 fn synthetic_scene_runs_sixty_frames_deterministically() {
-    let mut first = Engine::load(source(), None, 1, DEFAULT_SEED).unwrap();
+    let mut first = Engine::load(source(), None, None, DEFAULT_SEED).unwrap();
     let outcome = first.run_frames(60, true).unwrap();
     assert_eq!(outcome.frames, 60);
     assert_eq!(outcome.frame_hashes.len(), 61, "frame 0 plus 60 frames");
@@ -132,7 +132,7 @@ fn synthetic_scene_runs_sixty_frames_deterministically() {
     assert_eq!(first.stub_histogram().get("PlaySfx"), Some(&60));
 
     // A second run of the same data must produce the exact same per-frame hashes.
-    let mut second = Engine::load(source(), None, 1, DEFAULT_SEED).unwrap();
+    let mut second = Engine::load(source(), None, None, DEFAULT_SEED).unwrap();
     let replay = second.run_frames(60, true).unwrap();
     assert_eq!(first.state_hash(), second.state_hash());
     assert_eq!(outcome.frame_hashes, replay.frame_hashes);
@@ -140,8 +140,8 @@ fn synthetic_scene_runs_sixty_frames_deterministically() {
 
 #[test]
 fn different_seed_changes_the_state_hash() {
-    let mut first = Engine::load(source(), None, 1, 1).unwrap();
-    let mut second = Engine::load(source(), None, 1, 2).unwrap();
+    let mut first = Engine::load(source(), None, None, 1).unwrap();
+    let mut second = Engine::load(source(), None, None, 2).unwrap();
     first.run_frames(10, false).unwrap();
     second.run_frames(10, false).unwrap();
     assert_ne!(first.state_hash(), second.state_hash());
@@ -162,9 +162,9 @@ fn different_seed_changes_the_state_hash() {
 
 #[test]
 fn scene_selection_by_name_and_folder() {
-    let engine = Engine::load(source(), Some("TEST ZONE"), 1, DEFAULT_SEED).unwrap();
+    let engine = Engine::load(source(), Some("TEST ZONE"), None, DEFAULT_SEED).unwrap();
     assert_eq!(engine.stage_info(), ("Zone01", "1"));
-    let engine = Engine::load(source(), Some("zone01"), 1, DEFAULT_SEED).unwrap();
+    let engine = Engine::load(source(), Some("zone01"), None, DEFAULT_SEED).unwrap();
     assert_eq!(engine.stage_info(), ("Zone01", "1"));
-    assert!(Engine::load(source(), Some("missing"), 1, DEFAULT_SEED).is_err());
+    assert!(Engine::load(source(), Some("missing"), None, DEFAULT_SEED).is_err());
 }

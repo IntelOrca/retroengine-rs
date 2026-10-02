@@ -27,7 +27,7 @@ fn run(
     seed: u32,
     hash_every_frame: bool,
 ) -> (Engine, retro_engine::RunOutcome) {
-    let mut engine = Engine::load(source(game), Some(scene), 1, seed).expect("engine load");
+    let mut engine = Engine::load(source(game), Some(scene), None, seed).expect("engine load");
     let outcome = engine
         .run_frames(600, hash_every_frame)
         .expect("600-frame run must not fail");
@@ -134,4 +134,86 @@ fn all_required_scenes_summary() {
         totals += 1;
     }
     println!("totals: {totals} scenes x 600 frames");
+}
+
+/// Regression for the `BoxCollision` subtraction overflow: this stage has only `Act3.bin` and
+/// was the first real-data crash the reviewer found.
+#[test]
+#[ignore = "requires assets"]
+fn s2_br8zone09_act3_600_frames_regression() {
+    let mut engine = Engine::load(source("S2"), Some("BR8Zone09"), Some("3"), DEFAULT_SEED)
+        .expect("BR8Zone09 Act3 must load");
+    let outcome = engine
+        .run_frames(600, false)
+        .expect("BR8Zone09 Act3 must run 600 frames without HostError");
+    println!("S2/BR8Zone09 Act3 hash: {}", outcome.final_hash);
+    assert_eq!(outcome.frames, 600);
+}
+
+/// Boots every `Data/Stages/*/Act*.bin` in S1 and S2 for 60 frames and asserts that none of
+/// them panics or returns a `HostError`. This is the sweep that found the `BoxCollision`
+/// overflow; it is kept as an asset-gated regression guard.
+#[test]
+#[ignore = "requires assets"]
+fn sweep_every_act_boots_60_frames() {
+    use std::time::Instant;
+
+    let root = asset_root();
+    let started = Instant::now();
+    let mut failures = Vec::new();
+    let mut total = 0usize;
+    let mut games = vec!["S1".to_owned(), "S2".to_owned()];
+    games.sort();
+    for game in &games {
+        let stages_dir = root.join(game).join("Data/Stages");
+        let mut folders: Vec<std::path::PathBuf> = std::fs::read_dir(&stages_dir)
+            .unwrap_or_else(|error| panic!("{}: {error}", stages_dir.display()))
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.path())
+            .collect();
+        folders.sort();
+        for folder in folders {
+            let folder_name = folder
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut acts: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(&folder)
+                .unwrap_or_else(|error| panic!("{}: {error}", folder.display()))
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    name.strip_prefix("Act")
+                        .and_then(|rest| rest.strip_suffix(".bin"))
+                        .map(|act| (act.to_owned(), entry.path()))
+                })
+                .collect();
+            acts.sort();
+            for (act, path) in acts {
+                total += 1;
+                let source: Arc<dyn retro_io::DataSource> =
+                    Arc::new(DirSource::new(root.join(game)).expect("asset folder"));
+                let result = Engine::load(source, Some(&folder_name), Some(&act), DEFAULT_SEED)
+                    .and_then(|mut engine| engine.run_frames(60, false).map(|_| ()));
+                if let Err(error) = result {
+                    failures.push(format!(
+                        "{game}/{folder_name}/{}: {error}",
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    ));
+                }
+            }
+        }
+    }
+    println!(
+        "sweep: {total} acts booted for 60 frames in {:?}",
+        started.elapsed()
+    );
+    assert!(
+        failures.is_empty(),
+        "{} act(s) failed to boot:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
