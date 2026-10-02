@@ -149,6 +149,16 @@ impl SceneCollision {
         self.masks.tile(plane, tile_index)
     }
 
+    /// Returns the solidity nibble for `plane`, matching upstream
+    /// `tiles128x128.collisionFlags[plane][chunk]` (plane 0 = high nibble, plane 1 = low).
+    fn tile_flag(tile: &Tile128, plane: usize) -> u8 {
+        if plane == 0 {
+            tile.collision_flag_a
+        } else {
+            tile.collision_flag_b
+        }
+    }
+
     fn floor_height(&self, plane: usize, column: usize, tile_index: usize) -> i8 {
         self.mask_tile(plane, tile_index)
             .and_then(|tile| tile.floor.get(column).copied())
@@ -201,7 +211,7 @@ impl SceneCollision {
                     let layout_chunk = self.layout.chunk(chunk_x, chunk_y);
                     let tile = self.chunk_tile(layout_chunk, tile_x, tile_y);
                     let tile_index = usize::from(tile.tile_index);
-                    let flags = tile.collision_flag_b;
+                    let flags = Self::tile_flag(&tile, plane);
                     if flags != SOLID_LRB && flags != SOLID_NONE {
                         match tile.direction {
                             FLIP_NONE => {
@@ -296,7 +306,7 @@ impl SceneCollision {
                     let layout_chunk = self.layout.chunk(chunk_x, chunk_y);
                     let tile = self.chunk_tile(layout_chunk, tile_x, tile_y);
                     let tile_index = usize::from(tile.tile_index);
-                    if tile.collision_flag_b < SOLID_NONE {
+                    if Self::tile_flag(&tile, plane) < SOLID_NONE {
                         let row = usize::try_from(y_pos & 15).unwrap_or(0);
                         match tile.direction {
                             FLIP_NONE => {
@@ -388,7 +398,7 @@ impl SceneCollision {
                     let layout_chunk = self.layout.chunk(chunk_x, chunk_y);
                     let tile = self.chunk_tile(layout_chunk, tile_x, tile_y);
                     let tile_index = usize::from(tile.tile_index);
-                    if tile.collision_flag_b < SOLID_NONE {
+                    if Self::tile_flag(&tile, plane) < SOLID_NONE {
                         match tile.direction {
                             FLIP_NONE => {
                                 let column = (x_pos & 15) as usize;
@@ -481,7 +491,7 @@ impl SceneCollision {
                     let layout_chunk = self.layout.chunk(chunk_x, chunk_y);
                     let tile = self.chunk_tile(layout_chunk, tile_x, tile_y);
                     let tile_index = usize::from(tile.tile_index);
-                    if tile.collision_flag_b < SOLID_NONE {
+                    if Self::tile_flag(&tile, plane) < SOLID_NONE {
                         let row = usize::try_from(y_pos & 15).unwrap_or(0);
                         match tile.direction {
                             FLIP_NONE => {
@@ -586,7 +596,9 @@ impl SceneCollision {
         let chunk_y = y_pos >> 7;
         let tile_y = (y_pos & 0x7F) >> 4;
         let (_layout_chunk, tile, tile_index) = self.object_chunk(x_pos, y_pos);
-        if tile.collision_flag_b == SOLID_LRB || tile.collision_flag_b == SOLID_NONE {
+        if Self::tile_flag(&tile, c_path) == SOLID_LRB
+            || Self::tile_flag(&tile, c_path) == SOLID_NONE
+        {
             return false;
         }
         let column = (x_pos & 15) as usize;
@@ -646,7 +658,9 @@ impl SceneCollision {
         let chunk_x = x_pos >> 7;
         let tile_x = (x_pos & 0x7F) >> 4;
         let (_layout_chunk, tile, tile_index) = self.object_chunk(x_pos, y_pos);
-        if tile.collision_flag_b == SOLID_TOP || tile.collision_flag_b >= SOLID_NONE {
+        if Self::tile_flag(&tile, c_path) == SOLID_TOP
+            || Self::tile_flag(&tile, c_path) >= SOLID_NONE
+        {
             return false;
         }
         let row = (y_pos & 15) as usize;
@@ -706,7 +720,9 @@ impl SceneCollision {
         let chunk_y = y_pos >> 7;
         let tile_y = (y_pos & 0x7F) >> 4;
         let (_layout_chunk, tile, tile_index) = self.object_chunk(x_pos, y_pos);
-        if tile.collision_flag_b == SOLID_TOP || tile.collision_flag_b >= SOLID_NONE {
+        if Self::tile_flag(&tile, c_path) == SOLID_TOP
+            || Self::tile_flag(&tile, c_path) >= SOLID_NONE
+        {
             return false;
         }
         let column = (x_pos & 15) as usize;
@@ -766,7 +782,9 @@ impl SceneCollision {
         let chunk_x = x_pos >> 7;
         let tile_x = (x_pos & 0x7F) >> 4;
         let (_layout_chunk, tile, tile_index) = self.object_chunk(x_pos, y_pos);
-        if tile.collision_flag_b == SOLID_TOP || tile.collision_flag_b >= SOLID_NONE {
+        if Self::tile_flag(&tile, c_path) == SOLID_TOP
+            || Self::tile_flag(&tile, c_path) >= SOLID_NONE
+        {
             return false;
         }
         let row = (y_pos & 15) as usize;
@@ -827,7 +845,9 @@ impl SceneCollision {
                 let chunk_y = y_pos >> 7;
                 let tile_y = (y_pos & 0x7F) >> 4;
                 let (_layout_chunk, tile, tile_index) = self.object_chunk(x_pos, y_pos);
-                if tile.collision_flag_b != SOLID_LRB && tile.collision_flag_b != SOLID_NONE {
+                if Self::tile_flag(&tile, c_path) != SOLID_LRB
+                    && Self::tile_flag(&tile, c_path) != SOLID_NONE
+                {
                     let column = (x_pos & 15) as usize;
                     let found = match tile.direction {
                         FLIP_NONE => {
@@ -898,7 +918,7 @@ impl SceneCollision {
                 let chunk_x = x_pos >> 7;
                 let tile_x = (x_pos & 0x7F) >> 4;
                 let (_layout_chunk, tile, tile_index) = self.object_chunk(x_pos, y_pos);
-                if tile.collision_flag_b < SOLID_NONE {
+                if Self::tile_flag(&tile, c_path) < SOLID_NONE {
                     let row = (y_pos & 15) as usize;
                     let found = match tile.direction {
                         FLIP_NONE => {
@@ -975,7 +995,7 @@ impl SceneCollision {
                 let chunk_y = y_pos >> 7;
                 let tile_y = (y_pos & 0x7F) >> 4;
                 let (_layout_chunk, tile, tile_index) = self.object_chunk(x_pos, y_pos);
-                if tile.collision_flag_b < SOLID_NONE {
+                if Self::tile_flag(&tile, c_path) < SOLID_NONE {
                     let column = (x_pos & 15) as usize;
                     let found = match tile.direction {
                         FLIP_NONE => {
@@ -1046,7 +1066,7 @@ impl SceneCollision {
                 let chunk_x = x_pos >> 7;
                 let tile_x = (x_pos & 0x7F) >> 4;
                 let (_layout_chunk, tile, tile_index) = self.object_chunk(x_pos, y_pos);
-                if tile.collision_flag_b < SOLID_NONE {
+                if Self::tile_flag(&tile, c_path) < SOLID_NONE {
                     let row = (y_pos & 15) as usize;
                     let found = match tile.direction {
                         FLIP_NONE => {
@@ -1285,8 +1305,11 @@ impl SceneCollision {
             && other_top < this_bottom
     }
 
-    /// `BoxCollision`: standard solid interaction between two entities. Ported with the seven
-    /// temporary sensors kept local instead of the upstream globals.
+    /// `BoxCollision`: standard solid interaction between two entities.
+    ///
+    /// Ported from `BoxCollision` in `RSDKv4/Collision.cpp` with the seven temporary sensors
+    /// kept local instead of the upstream globals. All position arithmetic wraps exactly like
+    /// the C implementation (signed overflow must not panic).
     #[allow(clippy::too_many_arguments)]
     pub fn box_collision(
         &self,
@@ -1335,215 +1358,244 @@ impl SceneCollision {
         if other_bottom == C_BOX {
             other_bottom = i32::from(other_hitbox.bottom[0]);
         }
+        let _ = other_top;
         let this_x = this_entity.xpos;
         let this_y = this_entity.ypos;
-        this_left = (this_left + (this_x >> 16)) << 16;
-        this_top = (this_top + (this_y >> 16)) << 16;
-        this_right = (this_right + (this_x >> 16)) << 16;
-        this_bottom = (this_bottom + (this_y >> 16)) << 16;
-        other_left <<= 16;
-        other_top <<= 16;
-        other_right <<= 16;
-        other_bottom <<= 16;
-        let check_result;
-        let rx = (other_entity.xpos >> 16) << 16;
-        let ry = (other_entity.ypos >> 16) << 16;
+        this_left = this_left.wrapping_add(this_x >> 16).wrapping_shl(16);
+        this_top = this_top.wrapping_add(this_y >> 16).wrapping_shl(16);
+        this_right = this_right.wrapping_add(this_x >> 16).wrapping_shl(16);
+        this_bottom = this_bottom.wrapping_add(this_y >> 16).wrapping_shl(16);
+        other_left = other_left.wrapping_shl(16);
+        other_top = other_top.wrapping_shl(16);
+        other_right = other_right.wrapping_shl(16);
+        other_bottom = other_bottom.wrapping_shl(16);
+        let rx = (other_entity.xpos >> 16).wrapping_shl(16);
+        let ry = (other_entity.ypos >> 16).wrapping_shl(16);
         let x_dif = if this_entity.xpos > other_entity.xpos {
-            this_left - other_entity.xpos
+            this_left.wrapping_sub(other_entity.xpos)
         } else {
-            other_entity.xpos - this_right
+            other_entity.xpos.wrapping_sub(this_right)
         };
         let y_dif = if this_entity.ypos <= other_entity.ypos {
-            other_entity.ypos - this_bottom
+            other_entity.ypos.wrapping_sub(this_bottom)
         } else {
-            this_top - other_entity.ypos
+            this_top.wrapping_sub(other_entity.ypos)
         };
-        if x_dif <= y_dif && (other_entity.xvel.abs() >> 1) <= other_entity.yvel.abs() {
+        if x_dif <= y_dif
+            && (other_entity.xvel.wrapping_abs() >> 1) <= other_entity.yvel.wrapping_abs()
+        {
             let mut sensors = [CollisionSensor::default(); 7];
-            sensors[0].xpos = rx + other_left + 0x20000;
-            sensors[1].xpos = rx;
-            sensors[2].xpos = rx + other_right - 0x20000;
-            sensors[3].xpos = (sensors[0].xpos + rx) >> 1;
-            sensors[4].xpos = (sensors[2].xpos + rx) >> 1;
-            sensors[0].ypos = ry + other_bottom;
-            if other_entity.yvel >= 0 {
-                for index in 0..5 {
-                    if this_left < sensors[index].xpos
-                        && this_right > sensors[index].xpos
-                        && this_top <= sensors[0].ypos
-                        && this_top > other_entity.ypos - other_entity.yvel
-                    {
-                        sensors[index].collided = true;
-                        if let Some(other) = store.get_mut(other_slot) {
-                            other.floor_sensors[index] = 1;
-                        }
-                    }
-                }
-            }
-            if sensors[0].collided || sensors[1].collided || sensors[2].collided {
-                if let Some(other) = store.get_mut(other_slot) {
-                    if other.gravity == 0
-                        && (other.collision_mode == CMODE_RWALL
-                            || other.collision_mode == CMODE_LWALL)
-                    {
-                        other.xvel = 0;
-                        other.speed = 0;
-                    }
-                    other.ypos = this_top - other_bottom;
-                    other.gravity = 0;
-                    other.yvel = 0;
-                    other.angle = 0;
-                    other.rotation = 0;
-                    other.control_lock = 0;
-                }
-                check_result = 1;
-            } else {
-                sensors[0].collided = false;
-                sensors[1].collided = false;
-                sensors[0].xpos = rx + other_left + 0x20000;
-                sensors[1].xpos = rx + other_right - 0x20000;
-                sensors[0].ypos = ry + other_top;
-                for index in 0..2 {
-                    if this_left < sensors[1].xpos
-                        && this_right > sensors[0].xpos
-                        && this_bottom > sensors[0].ypos
-                        && this_bottom < other_entity.ypos - other_entity.yvel
-                    {
-                        sensors[index].collided = true;
-                    }
-                }
-                if sensors[1].collided || sensors[0].collided {
-                    if let Some(other) = store.get_mut(other_slot) {
-                        if other.gravity == 1 {
-                            other.ypos = this_bottom - other_top;
-                        }
-                        if other.yvel <= 0 {
-                            other.yvel = 0;
-                        }
-                    }
-                    check_result = 4;
-                } else {
-                    check_result = self.box_collision_horizontal(
-                        store,
-                        this_left,
-                        this_top,
-                        this_right,
-                        this_bottom,
-                        other_slot,
-                        other_left,
-                        other_top,
-                        other_right,
-                        other_bottom,
-                        rx,
-                        ry,
-                    );
-                }
-            }
-        } else {
-            check_result = self.box_collision_horizontal(
+            // Floor probes.
+            set_ground_sensors(&mut sensors, rx, ry, other_left, other_right, other_bottom);
+            if box_ground_collision(
                 store,
-                this_left,
-                this_top,
-                this_right,
-                this_bottom,
                 other_slot,
-                other_left,
-                other_top,
-                other_right,
+                &other_entity,
+                &mut sensors,
+                [this_left, this_top, this_right],
                 other_bottom,
+            ) {
+                return 1;
+            }
+            // Ceiling probes.
+            set_ceiling_sensors(&mut sensors, rx, ry, other_left, other_right, other_top);
+            if box_ceiling_collision(
+                store,
+                other_slot,
+                &other_entity,
+                &mut sensors,
+                [this_left, this_top, this_right, this_bottom],
+                other_top,
+            ) {
+                return 4;
+            }
+            // Push left, then right.
+            if box_push_left(
+                store,
+                other_slot,
+                &other_entity,
                 rx,
                 ry,
-            );
+                other_left,
+                other_right,
+                other_bottom,
+                other_top,
+                [this_left, this_top, this_right, this_bottom],
+            ) {
+                return 2;
+            }
+            if box_push_right(
+                store,
+                other_slot,
+                &other_entity,
+                rx,
+                ry,
+                other_left,
+                other_right,
+                other_bottom,
+                other_top,
+                [this_left, this_top, this_right, this_bottom],
+            ) {
+                return 3;
+            }
+            0
+        } else {
+            let mut sensors = [CollisionSensor::default(); 7];
+            // Push left, then right.
+            if box_push_left(
+                store,
+                other_slot,
+                &other_entity,
+                rx,
+                ry,
+                other_left,
+                other_right,
+                other_bottom,
+                other_top,
+                [this_left, this_top, this_right, this_bottom],
+            ) {
+                return 2;
+            }
+            if box_push_right(
+                store,
+                other_slot,
+                &other_entity,
+                rx,
+                ry,
+                other_left,
+                other_right,
+                other_bottom,
+                other_top,
+                [this_left, this_top, this_right, this_bottom],
+            ) {
+                return 3;
+            }
+            // Floor then ceiling fallback.
+            set_ground_sensors(&mut sensors, rx, ry, other_left, other_right, other_bottom);
+            if box_ground_collision(
+                store,
+                other_slot,
+                &other_entity,
+                &mut sensors,
+                [this_left, this_top, this_right],
+                other_bottom,
+            ) {
+                return 1;
+            }
+            set_ceiling_sensors(&mut sensors, rx, ry, other_left, other_right, other_top);
+            if box_ceiling_collision(
+                store,
+                other_slot,
+                &other_entity,
+                &mut sensors,
+                [this_left, this_top, this_right, this_bottom],
+                other_top,
+            ) {
+                return 4;
+            }
+            0
         }
-        check_result
     }
 
+    /// `PlatformCollision`: one-way solid-top interaction used by moving platforms.
+    ///
+    /// Ported from `PlatformCollision` in `RSDKv4/Collision.cpp`; returns upstream's
+    /// `checkResult` (0/1).
     #[allow(clippy::too_many_arguments)]
-    fn box_collision_horizontal(
+    pub fn platform_collision(
         &self,
         store: &mut EntityStore,
-        this_left: i32,
-        this_top: i32,
-        this_right: i32,
-        this_bottom: i32,
+        this_slot: usize,
+        mut this_left: i32,
+        mut this_top: i32,
+        mut this_right: i32,
+        mut this_bottom: i32,
         other_slot: usize,
-        other_left: i32,
-        other_top: i32,
-        other_right: i32,
-        other_bottom: i32,
-        rx: i32,
-        ry: i32,
+        mut other_left: i32,
+        mut other_top: i32,
+        mut other_right: i32,
+        mut other_bottom: i32,
+        resolve_hitbox: &dyn Fn(usize, &Entity) -> Hitbox,
     ) -> i32 {
-        let Some(other_entity) = store.get(other_slot).copied() else {
+        let (Some(this_entity), Some(other_entity)) = (
+            store.get(this_slot).copied(),
+            store.get(other_slot).copied(),
+        ) else {
             return 0;
         };
-        let mut sensors = [CollisionSensor::default(); 2];
-        sensors[0].xpos = rx + other_right;
-        sensors[0].ypos = ry + other_top + 0x20000;
-        sensors[1].ypos = ry + other_bottom - 0x20000;
-        let mut collide = false;
-        for index in 0..2 {
-            let y = sensors[index].ypos;
-            if this_left <= sensors[0].xpos
-                && this_left > other_entity.xpos - other_entity.xvel
-                && this_top < y
+        let this_hitbox = resolve_hitbox(this_slot, &this_entity);
+        let other_hitbox = resolve_hitbox(other_slot, &other_entity);
+        if this_left == C_BOX {
+            this_left = i32::from(this_hitbox.left[0]);
+        }
+        if this_top == C_BOX {
+            this_top = i32::from(this_hitbox.top[0]);
+        }
+        if this_right == C_BOX {
+            this_right = i32::from(this_hitbox.right[0]);
+        }
+        if this_bottom == C_BOX {
+            this_bottom = i32::from(this_hitbox.bottom[0]);
+        }
+        if other_left == C_BOX {
+            other_left = i32::from(other_hitbox.left[0]);
+        }
+        if other_top == C_BOX {
+            other_top = i32::from(other_hitbox.top[0]);
+        }
+        if other_right == C_BOX {
+            other_right = i32::from(other_hitbox.right[0]);
+        }
+        if other_bottom == C_BOX {
+            other_bottom = i32::from(other_hitbox.bottom[0]);
+        }
+        // Upstream reads `otherTop` while assigning the hitbox but never uses it: the platform
+        // routine only needs the bottom edge. Keep the assignment for parity.
+        let _ = other_top;
+        let this_x = this_entity.xpos;
+        let this_y = this_entity.ypos;
+        this_left = this_left.wrapping_add(this_x >> 16).wrapping_shl(16);
+        this_top = this_top.wrapping_add(this_y >> 16).wrapping_shl(16);
+        this_right = this_right.wrapping_add(this_x >> 16).wrapping_shl(16);
+        this_bottom = this_bottom.wrapping_add(this_y >> 16).wrapping_shl(16);
+        let rx = (other_entity.xpos >> 16).wrapping_shl(16);
+        let ry = (other_entity.ypos >> 16).wrapping_shl(16);
+        let mut sensors = [CollisionSensor::default(); 5];
+        sensors[0].xpos = rx.wrapping_add(other_left.wrapping_shl(16));
+        sensors[1].xpos = rx;
+        sensors[2].xpos = rx.wrapping_add(other_right.wrapping_shl(16));
+        sensors[3].xpos = (rx.wrapping_add(sensors[0].xpos)) >> 1;
+        sensors[4].xpos = (sensors[2].xpos.wrapping_add(rx)) >> 1;
+        sensors[0].ypos = other_bottom.wrapping_shl(16).wrapping_add(ry);
+        for index in 0..5 {
+            if this_left < sensors[index].xpos
+                && this_right > sensors[index].xpos
+                && this_top.wrapping_sub(1) <= sensors[0].ypos
                 && this_bottom > sensors[0].ypos
+                && other_entity.yvel >= 0
             {
                 sensors[index].collided = true;
-                collide = true;
-            }
-        }
-        if collide {
-            if let Some(other) = store.get_mut(other_slot) {
-                other.xpos = this_left - other_right;
-                if other.xvel > 0 {
-                    if other.direction == FLIP_NONE {
-                        other.pushing = 2;
-                    }
-                    other.xvel = 0;
-                    if other.collision_mode != 0 || other.left == 0 {
-                        other.speed = 0;
-                    } else {
-                        other.speed = -0x8000;
-                    }
+                if let Some(other) = store.get_mut(other_slot) {
+                    other.floor_sensors[index] = 1;
                 }
             }
-            return 2;
         }
-        sensors[0].xpos = rx + other_left;
-        sensors[0].ypos = ry + other_top + 0x20000;
-        sensors[1].ypos = ry + other_bottom - 0x20000;
-        let mut collide = false;
-        for index in 0..2 {
-            let y = sensors[index].ypos;
-            if this_right > sensors[0].xpos
-                && this_right < other_entity.xpos - other_entity.xvel
-                && this_top < y
-                && this_bottom > sensors[0].ypos
-            {
-                sensors[index].collided = true;
-                collide = true;
-            }
-        }
-        if collide {
+        if sensors[0].collided || sensors[1].collided || sensors[2].collided {
             if let Some(other) = store.get_mut(other_slot) {
-                other.xpos = this_right - other_left;
-                if other.xvel < 0 {
-                    if other.direction == FLIP_X {
-                        other.pushing = 2;
-                    }
-                    if other.xvel < -0x10000 {
-                        other.xpos += 0x8000;
-                    }
+                if other.gravity == 0
+                    && (other.collision_mode == CMODE_RWALL || other.collision_mode == CMODE_LWALL)
+                {
                     other.xvel = 0;
-                    if other.collision_mode != 0 || other.right == 0 {
-                        other.speed = 0;
-                    } else {
-                        other.speed = 0x8000;
-                    }
+                    other.speed = 0;
                 }
+                other.ypos = this_top.wrapping_sub(other_bottom.wrapping_shl(16));
+                other.gravity = 0;
+                other.yvel = 0;
+                other.angle = 0;
+                other.rotation = 0;
+                other.control_lock = 0;
             }
-            return 3;
+            return 1;
         }
         0
     }
@@ -1612,6 +1664,223 @@ impl SceneCollision {
         }
         on_ground
     }
+}
+
+/// Sets up the five floor probes of `BoxCollision` and clears their collision flags.
+fn set_ground_sensors(
+    sensors: &mut [CollisionSensor; 7],
+    rx: i32,
+    ry: i32,
+    other_left: i32,
+    other_right: i32,
+    other_bottom: i32,
+) {
+    sensors[0].collided = false;
+    sensors[1].collided = false;
+    sensors[2].collided = false;
+    sensors[3].collided = false;
+    sensors[4].collided = false;
+    sensors[0].xpos = rx.wrapping_add(other_left).wrapping_add(0x20000);
+    sensors[1].xpos = rx;
+    sensors[2].xpos = rx.wrapping_add(other_right).wrapping_sub(0x20000);
+    sensors[3].xpos = (sensors[0].xpos.wrapping_add(rx)) >> 1;
+    sensors[4].xpos = (sensors[2].xpos.wrapping_add(rx)) >> 1;
+    sensors[0].ypos = ry.wrapping_add(other_bottom);
+}
+
+/// Upstream floor branch: other entity lands on `this`. Returns upstream `checkResult == 1`.
+fn box_ground_collision(
+    store: &mut EntityStore,
+    other_slot: usize,
+    other: &Entity,
+    sensors: &mut [CollisionSensor; 7],
+    this_box: [i32; 3],
+    other_bottom: i32,
+) -> bool {
+    let [this_left, this_top, this_right] = this_box;
+    if other.yvel >= 0 {
+        for index in 0..5 {
+            if this_left < sensors[index].xpos
+                && this_right > sensors[index].xpos
+                && this_top <= sensors[0].ypos
+                && this_top > other.ypos.wrapping_sub(other.yvel)
+            {
+                sensors[index].collided = true;
+                if let Some(target) = store.get_mut(other_slot) {
+                    target.floor_sensors[index] = 1;
+                }
+            }
+        }
+    }
+    if sensors[0].collided || sensors[1].collided || sensors[2].collided {
+        if let Some(target) = store.get_mut(other_slot) {
+            if target.gravity == 0
+                && (target.collision_mode == CMODE_RWALL || target.collision_mode == CMODE_LWALL)
+            {
+                target.xvel = 0;
+                target.speed = 0;
+            }
+            target.ypos = this_top.wrapping_sub(other_bottom);
+            target.gravity = 0;
+            target.yvel = 0;
+            target.angle = 0;
+            target.rotation = 0;
+            target.control_lock = 0;
+        }
+        return true;
+    }
+    false
+}
+
+/// Sets up the two ceiling probes of `BoxCollision` and clears their collision flags.
+fn set_ceiling_sensors(
+    sensors: &mut [CollisionSensor; 7],
+    rx: i32,
+    ry: i32,
+    other_left: i32,
+    other_right: i32,
+    other_top: i32,
+) {
+    sensors[0].collided = false;
+    sensors[1].collided = false;
+    sensors[0].xpos = rx.wrapping_add(other_left).wrapping_add(0x20000);
+    sensors[1].xpos = rx.wrapping_add(other_right).wrapping_sub(0x20000);
+    sensors[0].ypos = ry.wrapping_add(other_top);
+}
+
+/// Upstream ceiling branch. Returns upstream `checkResult == 4`.
+fn box_ceiling_collision(
+    store: &mut EntityStore,
+    other_slot: usize,
+    other: &Entity,
+    sensors: &mut [CollisionSensor; 7],
+    this_box: [i32; 4],
+    other_top: i32,
+) -> bool {
+    let [this_left, this_top, this_right, this_bottom] = this_box;
+    let _ = this_top;
+    for index in 0..2 {
+        if this_left < sensors[1].xpos
+            && this_right > sensors[0].xpos
+            && this_bottom > sensors[0].ypos
+            && this_bottom < other.ypos.wrapping_sub(other.yvel)
+        {
+            sensors[index].collided = true;
+        }
+    }
+    if sensors[0].collided || sensors[1].collided {
+        if let Some(target) = store.get_mut(other_slot) {
+            if target.gravity == 1 {
+                target.ypos = this_bottom.wrapping_sub(other_top);
+            }
+            if target.yvel <= 0 {
+                target.yvel = 0;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// Upstream left-push branch. Returns upstream `checkResult == 2`.
+#[allow(clippy::too_many_arguments)]
+fn box_push_left(
+    store: &mut EntityStore,
+    other_slot: usize,
+    other: &Entity,
+    rx: i32,
+    ry: i32,
+    other_left: i32,
+    other_right: i32,
+    other_bottom: i32,
+    other_top: i32,
+    this_box: [i32; 4],
+) -> bool {
+    let [this_left, this_top, this_right, this_bottom] = this_box;
+    let mut sensors = [CollisionSensor::default(); 2];
+    sensors[0].xpos = rx.wrapping_add(other_right);
+    sensors[0].ypos = ry.wrapping_add(other_top).wrapping_add(0x20000);
+    sensors[1].ypos = ry.wrapping_add(other_bottom).wrapping_sub(0x20000);
+    let _ = (other_left, this_right);
+    for index in 0..2 {
+        if this_left <= sensors[0].xpos
+            && this_left > other.xpos.wrapping_sub(other.xvel)
+            && this_top < sensors[1].ypos
+            && this_bottom > sensors[0].ypos
+        {
+            sensors[index].collided = true;
+        }
+    }
+    if sensors[0].collided || sensors[1].collided {
+        if let Some(target) = store.get_mut(other_slot) {
+            target.xpos = this_left.wrapping_sub(other_right);
+            if target.xvel > 0 {
+                if target.direction == FLIP_NONE {
+                    target.pushing = 2;
+                }
+                target.xvel = 0;
+                if target.collision_mode != 0 || target.left == 0 {
+                    target.speed = 0;
+                } else {
+                    target.speed = -0x8000;
+                }
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// Upstream right-push branch. Returns upstream `checkResult == 3`.
+#[allow(clippy::too_many_arguments)]
+fn box_push_right(
+    store: &mut EntityStore,
+    other_slot: usize,
+    other: &Entity,
+    rx: i32,
+    ry: i32,
+    other_left: i32,
+    other_right: i32,
+    other_bottom: i32,
+    other_top: i32,
+    this_box: [i32; 4],
+) -> bool {
+    let [this_left, this_top, this_right, this_bottom] = this_box;
+    let mut sensors = [CollisionSensor::default(); 2];
+    sensors[0].xpos = rx.wrapping_add(other_left);
+    sensors[0].ypos = ry.wrapping_add(other_top).wrapping_add(0x20000);
+    sensors[1].ypos = ry.wrapping_add(other_bottom).wrapping_sub(0x20000);
+    let _ = (other_right, this_left);
+    for index in 0..2 {
+        if this_right > sensors[0].xpos
+            && this_right < other.xpos.wrapping_sub(other.xvel)
+            && this_top < sensors[1].ypos
+            && this_bottom > sensors[0].ypos
+        {
+            sensors[index].collided = true;
+        }
+    }
+    if sensors[0].collided || sensors[1].collided {
+        if let Some(target) = store.get_mut(other_slot) {
+            target.xpos = this_right.wrapping_sub(other_left);
+            if target.xvel < 0 {
+                if target.direction == FLIP_X {
+                    target.pushing = 2;
+                }
+                if target.xvel < -0x10000 {
+                    target.xpos = target.xpos.wrapping_add(0x8000);
+                }
+                target.xvel = 0;
+                if target.collision_mode != 0 || target.right == 0 {
+                    target.speed = 0;
+                } else {
+                    target.speed = 0x8000;
+                }
+            }
+        }
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1687,6 +1956,194 @@ mod tests {
             height: 4,
             tiles: vec![0; 16],
         }
+    }
+
+    fn zero_hitbox_fn(_slot: usize, _entity: &Entity) -> Hitbox {
+        Hitbox {
+            left: [0; 8],
+            top: [0; 8],
+            right: [0; 8],
+            bottom: [0; 8],
+        }
+    }
+
+    #[test]
+    fn solidity_is_selected_by_the_active_plane() {
+        // Tile 0 (used through the chunk entry below): plane 0 says SOLID_NONE while plane 1
+        // says SOLID_ALL. Tile 1 is the reverse. Only plane-aware solidity can pass both.
+        // Entities sit at pixel (64, 64) and (192, 64), i.e. 16x16 tile (4, 4) of chunk 0/1,
+        // so the chunk sheet entry is `(chunk << 6) + 4 + (4 << 3)`.
+        const TILE_0_ENTRY: usize = 36;
+        const TILE_1_ENTRY: usize = 100;
+        let mut tiles = blank_tiles();
+        tiles.entries[TILE_0_ENTRY] = Tile128 {
+            direction: 0,
+            visual_plane: 0,
+            tile_index: 0,
+            collision_flag_a: SOLID_NONE,
+            collision_flag_b: SOLID_ALL,
+        };
+        tiles.entries[TILE_1_ENTRY] = Tile128 {
+            direction: 0,
+            visual_plane: 0,
+            tile_index: 1,
+            collision_flag_a: SOLID_ALL,
+            collision_flag_b: SOLID_NONE,
+        };
+        let mut layout = layout();
+        layout.tiles[1] = 1;
+        // All collision masks have a floor sample at height 8.
+        let mut bytes = Vec::with_capacity(COLLISION_FILE_BYTES);
+        for _ in 0..COLLISION_TILE_COUNT * COLLISION_PLANE_COUNT {
+            bytes.push(0);
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&[0x88u8; 8]);
+            bytes.push(0xFF);
+            bytes.push(0xFF);
+        }
+        let masks = CollisionMasks::from_bytes(&bytes).unwrap();
+        let collision = SceneCollision::new(layout, tiles, masks);
+
+        // Tile 0 at pixel (64, 64).
+        let mut store = EntityStore::new();
+        store.reset_object_entity(0, 1, 0, 64 << 16, 64 << 16);
+        assert!(
+            !collision.object_floor_collision(&mut store, 0, 0, 15, 0),
+            "plane 0 reads flag_a (SOLID_NONE)"
+        );
+        let before = store.get(0).unwrap().ypos;
+        assert!(
+            collision.object_floor_collision(&mut store, 0, 0, 15, 1),
+            "plane 1 reads flag_b (SOLID_ALL)"
+        );
+        assert_ne!(store.get(0).unwrap().ypos, before);
+
+        // Tile 1 at pixel (192, 64).
+        let mut store = EntityStore::new();
+        store.reset_object_entity(0, 1, 0, 192 << 16, 64 << 16);
+        assert!(
+            collision.object_floor_collision(&mut store, 0, 0, 15, 0),
+            "plane 0 reads flag_a (SOLID_ALL)"
+        );
+        let before = store.get(0).unwrap().ypos;
+        assert!(
+            !collision.object_floor_collision(&mut store, 0, 0, 15, 1),
+            "plane 1 reads flag_b (SOLID_NONE)"
+        );
+        assert_eq!(store.get(0).unwrap().ypos, before);
+    }
+
+    #[test]
+    fn box_collision_wraps_extreme_positions() {
+        let collision = SceneCollision::new(layout(), blank_tiles(), blank_masks());
+        for (this_x, this_y, other_x, other_y) in [
+            (i32::MIN, 0, i32::MAX, 0),
+            (0, i32::MIN, 0, i32::MAX),
+            (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+            (i32::MAX, 0, i32::MIN, 0),
+        ] {
+            let mut store = EntityStore::new();
+            store.reset_object_entity(0, 1, 0, this_x, this_y);
+            store.reset_object_entity(1, 2, 0, other_x, other_y);
+            let result = collision.box_collision(
+                &mut store,
+                0,
+                -8,
+                -8,
+                8,
+                8,
+                1,
+                -8,
+                -8,
+                8,
+                8,
+                &zero_hitbox_fn,
+            );
+            assert!(
+                (0..=4).contains(&result),
+                "box collision must wrap, not panic ({this_x}, {this_y}, {other_x}, {other_y})"
+            );
+        }
+    }
+
+    #[test]
+    fn box_push_left_uses_the_second_sensor_y() {
+        let collision = SceneCollision::new(layout(), blank_tiles(), blank_masks());
+        // Other box (-8, -1, 8, 1) makes sensors[0].ypos (101px) > sensors[1].ypos (99px),
+        // the only shape where the per-index bug is observable.
+        let other_box = [-8, -1, 8, 1];
+
+        // this_top = 98 < 99 and this_bottom = 102 > 101: upstream pushes left.
+        let mut store = EntityStore::new();
+        store.reset_object_entity(0, 1, 0, 120 << 16, 100 << 16);
+        store.reset_object_entity(1, 2, 0, 100 << 16, 100 << 16);
+        let result = collision.box_collision(
+            &mut store,
+            0,
+            -12,
+            -2,
+            0,
+            2,
+            1,
+            other_box[0],
+            other_box[1],
+            other_box[2],
+            other_box[3],
+            &zero_hitbox_fn,
+        );
+        assert_eq!(result, 2, "this_top/this_bottom overlap the 99..101 slab");
+        assert_eq!(store.get(1).unwrap().xpos, 100 << 16);
+
+        // this_top = 100 is inside (99, 101): upstream does not push, the buggy per-index
+        // loop (which used sensors[0].ypos = 101 for index 0) would.
+        let mut store = EntityStore::new();
+        store.reset_object_entity(0, 1, 0, 120 << 16, 100 << 16);
+        store.reset_object_entity(1, 2, 0, 100 << 16, 100 << 16);
+        let result = collision.box_collision(
+            &mut store,
+            0,
+            -12,
+            0,
+            0,
+            2,
+            1,
+            other_box[0],
+            other_box[1],
+            other_box[2],
+            other_box[3],
+            &zero_hitbox_fn,
+        );
+        assert_eq!(result, 0, "sensors[1].ypos gates the push");
+        assert_eq!(store.get(1).unwrap().xpos, 100 << 16);
+    }
+
+    #[test]
+    fn platform_collision_lands_on_top() {
+        let collision = SceneCollision::new(layout(), blank_tiles(), blank_masks());
+        let mut store = EntityStore::new();
+        // Slot 0 is the platform, slot 1 is the falling entity above it.
+        store.reset_object_entity(0, 1, 0, 100 << 16, 100 << 16);
+        store.reset_object_entity(1, 2, 0, 100 << 16, 90 << 16);
+        store.get_mut(1).unwrap().yvel = 0x20000;
+        let result = collision.platform_collision(
+            &mut store,
+            0,
+            -8,
+            -8,
+            8,
+            8,
+            1,
+            -8,
+            -8,
+            8,
+            8,
+            &zero_hitbox_fn,
+        );
+        assert_eq!(result, 1);
+        // Platform top (92px) minus the falling entity's bottom offset (8px).
+        assert_eq!(store.get(1).unwrap().ypos, 84 << 16);
+        assert_eq!(store.get(1).unwrap().yvel, 0);
+        assert_eq!(store.get(1).unwrap().floor_sensors[1], 1);
     }
 
     #[test]

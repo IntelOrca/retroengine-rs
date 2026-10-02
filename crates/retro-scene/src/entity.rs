@@ -239,14 +239,11 @@ impl EntityStore {
     }
 
     /// Zeroes the regular half and applies the scene defaults to every regular slot, exactly like
-    /// the `memset` + defaults loop in `LoadStageFiles`. Storage slots are left untouched, as
-    /// upstream does.
+    /// the `memset(objectEntityList, 0, ENTITY_COUNT * sizeof(Entity))` + defaults loop in
+    /// `LoadStageFiles`. The storage half is left untouched, as upstream does.
     pub fn reset_scene(&mut self) {
         for slot in self.slots.iter_mut().take(ENTITY_COUNT) {
             *slot = Entity::scene_default();
-        }
-        for slot in self.slots.iter_mut().skip(ENTITY_COUNT) {
-            *slot = Entity::default();
         }
     }
 
@@ -442,17 +439,23 @@ mod tests {
     }
 
     #[test]
-    fn reset_scene_applies_defaults_and_clears_storage() {
+    fn reset_scene_applies_defaults_and_leaves_storage_untouched() {
         let mut store = EntityStore::new();
         store.get_mut(ENTITY_STORAGE_START).unwrap().xpos = 123;
+        store.get_mut(0).unwrap().xpos = -1;
         store.reset_scene();
         let first = store.get(0).unwrap();
+        assert_eq!(first.xpos, 0, "the regular half is zeroed before defaults");
         assert_eq!(first.draw_order, 3);
         assert_eq!(first.scale, 512);
         assert_eq!(first.object_interactions, 1);
         assert_eq!(first.visible, 1);
         assert_eq!(first.tile_collisions, 1);
-        assert_eq!(store.get(ENTITY_STORAGE_START).unwrap(), &Entity::default());
+        assert_eq!(
+            store.get(ENTITY_STORAGE_START).unwrap().xpos,
+            123,
+            "upstream only memsets the regular half"
+        );
     }
 
     #[test]
