@@ -43,13 +43,46 @@ export PATH="$HOME/.local/bin:$PATH"
 cargo build --release
 ```
 
-## Running headless
+## Running
 
 ```sh
-../target/release/retroengine /path/to/assets/S1 --headless --frames 3
+../target/release/retroengine /path/to/assets/S1                # windowed until the window closes
+../target/release/retroengine /path/to/assets/S1 --headless     # 600 deterministic frames
 ```
 
-`<ASSETS_DIR>` must be an unpacked RSDK asset folder containing `Data/Game/GameConfig.bin`. At M0 the binary parses and validates arguments, prints the resolved configuration, and exits.
+`<ASSETS_DIR>` must be an unpacked RSDK asset folder containing `Data/Game/GameConfig.bin`
+(a Sonic 1 `S1` or Sonic 2 `S2` folder). Without `--headless` the game opens in an SDL3 window
+and runs until the window closes; `--frames N` caps either mode, and headless runs without
+`--frames` default to 600 frames. `--list` prints the scene table without loading a stage.
+
+## Selecting a scene
+
+```sh
+retroengine /path/to/assets/S1 --list              # categories, scenes and available acts
+retroengine /path/to/assets/S1 --scene GHZ --act 1 # Green Hill Zone act 1
+retroengine /path/to/assets/S2 --scene GHZ         # Emerald Hill Zone act 1
+retroengine /path/to/assets/S2 --scene Zone02 --act B
+```
+
+`--scene` is case-insensitive and ignores spaces and punctuation. It accepts:
+
+| Form | Example | Picks |
+| --- | --- | --- |
+| `--list` index | `--scene 7` | the seventh listed scene |
+| stage folder | `--scene Zone01` | the GameConfig entry for that folder |
+| full scene name | `--scene "GREEN HILL ZONE 1"` | that scene |
+| name without act | `--scene "GREEN HILL ZONE"`, `--scene MarbleZone2` | the scene, act 2 from the suffix |
+| name prefix | `--scene GreenHill` | the unique prefix match |
+| acronym | `--scene GHZ`, `--scene GHZ2` | the unique acronym match |
+
+`GHZ` is the canonical first-zone shorthand and also resolves on Sonic 2 (Emerald Hill).
+`--act` accepts numeric and short ids case-insensitively (`1`, `2`, `b`); an explicit `--act`
+wins over a trailing number in `--scene`. An unknown scene lists close candidates, a missing
+act file lists the `Act*.bin` files that do exist, and `--list-json` emits the same table as
+JSON.
+
+Saves live under `--user-dir`, or `%APPDATA%\retroengine-rs\retroengine` on Windows
+(`SDL_GetPrefPath`), seeded from the shipped `SData.bin`/`SGame.bin` on first run.
 
 Full verification:
 
@@ -59,11 +92,30 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --release
 ../target/release/retroengine /path/to/assets/S1 --headless --frames 3
+../target/release/retroengine /path/to/assets/S1 --scene GHZ --act 1 --headless --frames 60
 ```
+
+## Performance
+
+Release headless throughput for S1 Zone01 (600 frames, single-threaded) is roughly 1000 fps
+wall clock including startup and asset load, with a marginal cost of about 0.6 ms/frame
+(~1700 fps) once warm. Windowed runs are locked to the engine's 60 Hz clock.
 
 ## Windows CI
 
-`.github/workflows/ci.yml` builds the workspace on `windows-latest` with `cargo build --workspace --release` and uploads `retroengine.exe` as an artifact. SDL3 is compiled from source via `sdl3-sys`'s `build-from-source-static` feature using the runner's CMake and MSVC toolchain; no system SDL3 installation is needed.
+`.github/workflows/ci.yml` builds the workspace on `windows-latest` with
+`cargo build --workspace --release` and uploads two artifacts:
+
+* `retroengine-windows-exe`: the raw `retroengine.exe`.
+* `retroengine-windows-zip`: `retroengine-windows.zip` containing `retroengine.exe` and
+  `README.txt` (usage, flags and the save location).
+
+SDL3 is compiled from source via `sdl3-sys`'s `build-from-source-static` feature and linked
+statically; the CI `dumpbin /dependents` step fails the build if `SDL3.dll` appears, and the
+Linux release binary has no `libSDL3.so` dependency either. The zip therefore needs no SDL3
+download or system installation; it uses only the standard Windows system libraries (and the
+MSVC runtime shipped with Windows). `--version`/`--help` print the CLI examples including
+Windows paths.
 
 ## Assets and licensing
 
