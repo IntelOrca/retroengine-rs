@@ -155,7 +155,8 @@ const FIRST_ZONE_ALIASES: &[&str] = &["ghz"];
 ///
 /// `--scene` accepts, case-insensitively and ignoring spaces/punctuation:
 /// 1. a numeric scene index from `--list` (`7`, 1-based, category-major),
-/// 2. an exact stage folder (`Zone01`),
+/// 2. a stage folder (`Zone01`, `Zone-01`), where duplicate folders use `--act` to pick an
+///    entry id and otherwise resolve to the highlighted entry with the lowest id,
 /// 3. an exact scene name (`GREEN HILL ZONE 1`),
 /// 4. a name without the act number (`GREEN HILL ZONE`, `MarbleZone2` selects act 2),
 /// 5. a name prefix (`GreenHill`),
@@ -216,32 +217,50 @@ pub fn resolve_scene(
             Some(index) => resolve(entries[index - 1], None),
             None => Err(unknown_scene(
                 requested,
-                &format!(
-                    "index is out of range (1..={}); run `--list` to see the scene indexes",
-                    entries.len()
-                ),
+                &format!("index is out of range (1..={})", entries.len()),
                 &entries,
             )),
         };
     }
 
     let request_key = normalize_name(trimmed);
+
+    // A key with no letters or only digits (`+7`, `!!!`) is a mistyped `--list` index, not a
+    // scene name; reject it instead of matching a digit-named entry by accident.
+    if request_key.is_empty()
+        || request_key
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
+        return Err(unknown_scene(
+            requested,
+            "not a scene name (numbers select a `--list` index and must not carry punctuation)",
+            &entries,
+        ));
+    }
+
     let (request_base, request_act) = split_trailing_digits(&request_key);
 
-    // 2. Exact stage folder. Duplicate folders (per-act entries) are disambiguated by `--act`,
-    //    falling back to the first entry exactly like the pre-M6 behaviour.
+    // 2. Exact stage folder, ignoring case, spaces and punctuation. Duplicate folders
+    //    (per-act entries or presentation variants such as `LSelect`) are disambiguated by
+    //    `--act`; otherwise the best-ranked entry wins: highlighted entries first, then the
+    //    lowest numeric id, then short ids alphabetically, then file order.
     let folders: Vec<IndexedScene<'_>> = entries
         .iter()
-        .filter(|scene| scene.entry.folder.eq_ignore_ascii_case(trimmed))
+        .filter(|scene| normalize_name(&scene.entry.folder) == request_key)
         .copied()
         .collect();
     if !folders.is_empty() {
-        let chosen = act
-            .and_then(|value| {
-                folders
-                    .iter()
-                    .find(|scene| scene.entry.id.eq_ignore_ascii_case(value.trim()))
-            })
+        if let Some(chosen) = act.and_then(|value| {
+            folders
+                .iter()
+                .find(|scene| scene.entry.id.eq_ignore_ascii_case(value.trim()))
+        }) {
+            return resolve(*chosen, None);
+        }
+        let chosen = folders
+            .iter()
+            .min_by_key(|scene| folder_rank(scene))
             .unwrap_or(&folders[0]);
         return resolve(*chosen, None);
     }
@@ -429,6 +448,20 @@ fn act_sort_key(act: &str) -> (bool, u64, String) {
         Ok(number) => (false, number, String::new()),
         Err(_) => (true, 0, act.to_ascii_uppercase()),
     }
+}
+
+/// Ranking key used to pick one entry when several GameConfig entries share a stage folder:
+/// highlighted entries first, then numeric ids ascending, then short ids alphabetically, then
+/// file order.
+fn folder_rank(scene: &IndexedScene<'_>) -> (bool, bool, u64, String, usize) {
+    let (non_numeric, number, text) = act_sort_key(&scene.entry.id);
+    (
+        scene.entry.highlighted == 0,
+        non_numeric,
+        number,
+        text,
+        scene.index,
+    )
 }
 
 fn read_required(source: &dyn DataSource, path: &str) -> Result<Vec<u8>, EngineError> {
@@ -891,6 +924,127 @@ mod tests {
         assert_eq!(requested, "9");
         assert!(details.contains("1..=8"), "{details}");
         assert!(details.contains("--list"), "{details}");
+        assert_eq!(
+            details.matches("--list").count(),
+            1,
+            "the --list hint must not be duplicated: {details}"
+        );
+    }
+
+    #[test]
+    fn folder_resolution_ignores_spaces_and_punctuation() {
+        let config = sonic1_like_config();
+        for request in ["Zone 01", "Zone-01", "zone_01", "zOnE.01", " ZONE 01 "] {
+            assert_eq!(
+                resolve_scene(&config, Some(request), None).unwrap(),
+                ("Zone01".to_owned(), "1".to_owned()),
+                "--scene {request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_folders_use_the_act_then_the_best_ranked_entry() {
+        let mut config = config();
+        config.categories[0].scenes = vec![
+            SceneEntry {
+                folder: "LSelect".to_owned(),
+                id: "1".to_owned(),
+                name: "LEVEL SELECT".to_owned(),
+                highlighted: 1,
+            },
+            SceneEntry {
+                folder: "LSelect".to_owned(),
+                id: "2".to_owned(),
+                name: "2P VS".to_owned(),
+                highlighted: 0,
+            },
+            SceneEntry {
+                folder: "LSelect".to_owned(),
+                id: "3".to_owned(),
+                name: "STAGE MENU".to_owned(),
+                highlighted: 1,
+            },
+        ];
+        assert_eq!(
+            resolve_scene(&config, Some("lselect"), None).unwrap(),
+            ("LSelect".to_owned(), "1".to_owned()),
+            "among highlighted entries the lowest id wins"
+        );
+        assert_eq!(
+            resolve_scene(&config, Some("L Select"), None).unwrap(),
+            ("LSelect".to_owned(), "1".to_owned()),
+            "spaces are ignored"
+        );
+        assert_eq!(
+            resolve_scene(&config, Some("LSelect"), Some("2")).unwrap(),
+            ("LSelect".to_owned(), "2".to_owned()),
+            "an explicit --act picks the entry with that id"
+        );
+        assert_eq!(
+            resolve_scene(&config, Some("LSelect"), Some("3")).unwrap(),
+            ("LSelect".to_owned(), "3".to_owned())
+        );
+        // Highlighting beats a lower id, and with no highlighted entry the lowest id wins
+        // (Sonic 2 lists LSelect's `2P VS` (id 2) before `LEVEL SELECT` (id 1)).
+        let mut reordered = config.clone();
+        reordered.categories[0].scenes = vec![
+            SceneEntry {
+                folder: "LSelect".to_owned(),
+                id: "2".to_owned(),
+                name: "2P VS".to_owned(),
+                highlighted: 0,
+            },
+            SceneEntry {
+                folder: "LSelect".to_owned(),
+                id: "1".to_owned(),
+                name: "LEVEL SELECT".to_owned(),
+                highlighted: 1,
+            },
+        ];
+        assert_eq!(
+            resolve_scene(&reordered, Some("LSelect"), None).unwrap(),
+            ("LSelect".to_owned(), "1".to_owned()),
+            "a highlighted higher id beats an unhighlighted lower id"
+        );
+        for scene in &mut reordered.categories[0].scenes {
+            scene.highlighted = 0;
+        }
+        assert_eq!(
+            resolve_scene(&reordered, Some("LSelect"), None).unwrap(),
+            ("LSelect".to_owned(), "1".to_owned()),
+            "with no highlighted entry the lowest numeric id wins"
+        );
+    }
+
+    #[test]
+    fn digit_only_requests_never_match_scene_names() {
+        let sonic1 = sonic1_like_config();
+        assert_eq!(
+            resolve_scene(&sonic1, Some("2"), None).unwrap(),
+            ("Zone01".to_owned(), "1".to_owned()),
+            "plain digits still select the --list index"
+        );
+        for request in ["+2", "-2", "2!", "#3", "!!!"] {
+            let error = resolve_scene(&sonic1, Some(request), None).unwrap_err();
+            let EngineError::UnknownScene { details, .. } = error else {
+                panic!("expected UnknownScene for {request:?}, got {error:?}");
+            };
+            assert!(details.contains("--list"), "{request:?}: {details}");
+        }
+
+        // Even a scene literally named `7` must not be booted by `+7`.
+        let mut named = config();
+        named.categories[0].scenes = vec![SceneEntry {
+            folder: "Level".to_owned(),
+            id: "7".to_owned(),
+            name: "7".to_owned(),
+            highlighted: 1,
+        }];
+        assert!(matches!(
+            resolve_scene(&named, Some("+7"), None),
+            Err(EngineError::UnknownScene { .. })
+        ));
     }
 
     #[test]
