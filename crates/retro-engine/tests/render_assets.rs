@@ -136,6 +136,19 @@ fn assert_deterministic(game: &str, scene: &str, dump: bool) -> RenderRun {
 
 #[test]
 #[ignore = "requires assets"]
+fn zone01_act_num_matches_the_resolved_act() {
+    for (act, expected) in [("1", 1), ("2", 2), ("3", 3)] {
+        let engine =
+            Engine::load(source("S1"), Some("Zone01"), Some(act), DEFAULT_SEED).expect("load");
+        assert_eq!(engine.state.stage.act_num, expected, "act {act}");
+    }
+    // Bonus stages use non-numeric act ids; upstream boot leaves the fresh actID at 0.
+    let engine = Engine::load(source("S2"), Some("Zone01"), Some("B"), DEFAULT_SEED).expect("load");
+    assert_eq!(engine.state.stage.act_num, 0, "act B");
+}
+
+#[test]
+#[ignore = "requires assets"]
 fn s1_title_render_600_frames() {
     let run = assert_deterministic("S1", "Title", false);
     assert_eq!(run.frame_hashes.len(), 601);

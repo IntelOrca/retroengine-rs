@@ -53,7 +53,7 @@ pub use bytecode::{
 };
 pub use compiler::{
     CompileError, CompileOptions, Compiler, GroupMark, PlatformMode, SceneNames, SymbolTables,
-    compile_group, compile_object_script, compile_script,
+    compile_group, compile_object_script, compile_script, parse_int,
 };
 pub use error::ScriptError;
 pub use opcodes::{
