@@ -73,11 +73,11 @@ impl Engine {
     pub fn load(
         source: Arc<dyn DataSource>,
         requested_scene: Option<&str>,
-        act: u32,
+        act: Option<&str>,
         seed: u32,
     ) -> Result<Self, EngineError> {
         let world = loader::load_world(&source, requested_scene, act)?;
-        let rng = crate::rng::GameRng::new(seed);
+        let rng = crate::rng::GlibcRand::new(seed);
         let file: ScriptFile = world.scripts.file;
         let mut state = EngineState::new(
             Arc::clone(&source),
@@ -123,7 +123,7 @@ impl Engine {
     pub fn load_default(
         source: Arc<dyn DataSource>,
         requested_scene: Option<&str>,
-        act: u32,
+        act: Option<&str>,
     ) -> Result<Self, EngineError> {
         Self::load(source, requested_scene, act, DEFAULT_SEED)
     }
@@ -134,13 +134,13 @@ impl Engine {
         self.scripts.vm_state.array_position[8] = TEMPENTITY_START as i32;
         self.scripts.vm_state.foreach_stack.clear();
         self.scripts.vm_state.current_event = ScriptEvent::Setup;
-        let scratch = self
-            .state
-            .entities
-            .get(TEMPENTITY_START)
-            .copied()
-            .unwrap_or_default();
-        let _ = scratch;
+        // Upstream copies slot 0's type into the second temp slot before the startup pass
+        // ("Dunno what this is meant for, but it's here in the original code so...").
+        if let Some(type_id) = self.state.entities.get(0).map(|entity| entity.type_id)
+            && let Some(entity) = self.state.entities.get_mut(TEMPENTITY_START + 1)
+        {
+            entity.type_id = type_id;
+        }
         for type_index in 0..OBJECT_COUNT {
             let type_id = type_index as u8;
             if let Some(entity) = self.state.entities.get_mut(TEMPENTITY_START) {
@@ -347,7 +347,12 @@ impl Engine {
         let mut hasher = blake3::Hasher::new();
         let mut scratch = Vec::with_capacity(512);
         put_u64(&mut hasher, self.state.frame);
-        put_u64(&mut hasher, self.state.rng.state());
+        for word in self.state.rng.state() {
+            hasher.update(&word.to_le_bytes());
+        }
+        let (front, rear) = self.state.rng.pointers();
+        put_u64(&mut hasher, front as u64);
+        put_u64(&mut hasher, rear as u64);
         put_i32(&mut hasher, self.state.object_entity_pos as i32);
         for slot in 0..self.state.entities.len() {
             let entity = self.state.entities.get_or_blank(slot);
@@ -358,6 +363,8 @@ impl Engine {
         for (index, entry) in self.state.objects.iter_enumerated() {
             put_i32(&mut hasher, index as i32);
             put_bytes(&mut hasher, entry.name.as_bytes());
+            put_i32(&mut hasher, entry.animation_file.map_or(-1, |id| id as i32));
+            put_i32(&mut hasher, entry.sprite_sheet_id);
             put_i32(&mut hasher, entry.script.update.code_pos as i32);
             put_i32(&mut hasher, entry.script.update.jump_pos as i32);
             put_i32(&mut hasher, entry.script.draw.code_pos as i32);
@@ -383,18 +390,45 @@ impl Engine {
             i32::from(self.state.scene.mid_point),
             self.state.screen.x_scroll,
             self.state.screen.y_scroll,
+            self.state.stage.state,
+            self.state.stage.active_list,
+            self.state.stage.list_pos,
+            i32::from(self.state.stage.time_enabled),
+            self.state.stage.act_num,
+            i32::from(self.state.stage.pause_enabled),
+            self.state.stage.list_size,
+            self.state.stage.new_x_boundary1,
+            self.state.stage.new_x_boundary2,
+            self.state.stage.new_y_boundary1,
+            self.state.stage.new_y_boundary2,
             self.state.stage.cur_x_boundary1,
             self.state.stage.cur_x_boundary2,
             self.state.stage.cur_y_boundary1,
             self.state.stage.cur_y_boundary2,
             self.state.stage.water_level,
+            self.state.stage.mid_point,
+            self.state.stage.player_list_pos,
+            self.state.stage.debug_mode,
             self.state.stage.milliseconds,
             self.state.stage.seconds,
             self.state.stage.minutes,
             self.state.stage.frame_counter,
             self.state.music_track,
+            self.state.menu1_selection,
+            self.state.menu2_selection,
+            i32::from(self.state.load_stage_requested),
         ] {
             put_i32(&mut hasher, value);
+        }
+        for (down, (x, y)) in self
+            .state
+            .touch_down
+            .iter()
+            .zip(self.state.touch_x.iter().zip(self.state.touch_y.iter()))
+        {
+            put_i32(&mut hasher, *down);
+            put_i32(&mut hasher, *x);
+            put_i32(&mut hasher, *y);
         }
         for layer in &self.state.stage.active_layers {
             put_i32(&mut hasher, *layer);

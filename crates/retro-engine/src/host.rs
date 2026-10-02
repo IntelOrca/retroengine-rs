@@ -8,10 +8,16 @@
 //! Known gaps (documented, deterministic):
 //!
 //! * `ProcessObjectMovement` is the simplified movement in [`retro_scene::SceneCollision`].
-//! * `BoxCollision2`, `PlatformCollision`, `Copy16x16Tile`, `Set16x16TileInfo` and the 3D
-//!   matrix/vertex ops are no-ops.
+//! * `BoxCollision2` (upstream's "barely used in S2" variant), `Copy16x16Tile`,
+//!   `Set16x16TileInfo` and the 3D matrix/vertex ops are explicit stubs (see
+//!   [`EngineState::stub_histogram`]); `TouchCollision`, `BoxCollision` and `PlatformCollision`
+//!   are fully ported.
+//! * `stage.deformationData0..3` are not modelled and always read as `0`; the deformation
+//!   tables only feed the software renderer (M4).
 //! * `LoadStage` sets a flag instead of switching scenes mid-frame.
-//! * Save RAM reads/writes report success without touching a file.
+//! * Save RAM is not loaded or persisted (M5); `ReadSaveRAM` mirrors upstream's "no save file"
+//!   return value by checking for `SData.bin`/`SGame.bin`, and `WriteSaveRAM` reports success
+//!   without touching a file.
 
 use retro_format_v4::{AnimationFile, Hitbox};
 use retro_scene::collision::{
@@ -593,8 +599,7 @@ impl ScriptHost for EngineHost<'_> {
         let operands = state.operands;
         match op {
             Op::Rand => {
-                let max = operands[1];
-                state.operands[0] = self.state.rng.range(max);
+                state.operands[0] = crate::rng::glibc_rand_range(&mut self.state.rng, operands[1]);
                 self.state.record_op("Rand");
             }
             Op::Sin => {
@@ -731,7 +736,6 @@ impl ScriptHost for EngineHost<'_> {
             }
             Op::BoxCollisionTest => {
                 let result = self.box_collision_test(operands);
-                self.state.record_op("BoxCollisionTest");
                 state.check_result = result;
             }
             Op::ProcessObjectMovement => {
@@ -779,6 +783,16 @@ impl ScriptHost for EngineHost<'_> {
                         .wrapping_sub(self.state.camera.ypos)
                         .wrapping_abs();
                     state.check_result = i32::from(dx < operands[2] && dy < operands[3]);
+                } else if operands[2] > 0 {
+                    let dx = operands[0]
+                        .wrapping_sub(self.state.camera.xpos)
+                        .wrapping_abs();
+                    state.check_result = i32::from(dx < operands[2]);
+                } else if operands[3] > 0 {
+                    let dy = operands[1]
+                        .wrapping_sub(self.state.camera.ypos)
+                        .wrapping_abs();
+                    state.check_result = i32::from(dy < operands[3]);
                 }
                 self.state.record_op("CheckCameraProximity");
             }
@@ -795,7 +809,23 @@ impl ScriptHost for EngineHost<'_> {
                 self.state.record_op("CheckCurrentStageFolder");
             }
             Op::CheckTouchRect => {
+                // Upstream starts at -1 and returns the first touch inside the rect; the M3
+                // headless input source has no touches, so this always yields -1 here.
                 state.check_result = -1;
+                for index in 0..self.state.touch_down.len() {
+                    let down = self.state.touch_down[index] != 0;
+                    let x = self.state.touch_x[index];
+                    let y = self.state.touch_y[index];
+                    if down
+                        && x > operands[0]
+                        && x < operands[2]
+                        && y > operands[1]
+                        && y < operands[3]
+                    {
+                        state.check_result = index as i32;
+                        break;
+                    }
+                }
                 self.state.record_op("CheckTouchRect");
             }
             Op::GetTileLayerEntry => {
@@ -959,7 +989,11 @@ impl ScriptHost for EngineHost<'_> {
                 self.state.record_stub(stub_name(op));
             }
             Op::ReadSaveRAM => {
-                state.check_result = 1;
+                // No save RAM is loaded yet (M5), but upstream reports false when neither
+                // `SData.bin` nor `SGame.bin` exists, so mirror that much.
+                let available =
+                    self.state.source.exists("SData.bin") || self.state.source.exists("SGame.bin");
+                state.check_result = i32::from(available);
                 self.state.record_stub(stub_name(op));
             }
             Op::WriteSaveRAM => {
@@ -1306,6 +1340,7 @@ impl EngineHost<'_> {
         let other_slot = usize::try_from(operands[6]).unwrap_or(usize::MAX);
         match collision_type {
             C_TOUCH => {
+                self.state.record_op("BoxCollisionTest");
                 let hit =
                     self.with_collision_entities(|collision, entities, objects, animations| {
                         let hitbox = |_slot: usize, entity: &retro_scene::Entity| {
@@ -1328,26 +1363,56 @@ impl EngineHost<'_> {
                     });
                 i32::from(hit)
             }
-            C_SOLID => self.with_collision_entities(|collision, entities, objects, animations| {
-                let hitbox = |_slot: usize, entity: &retro_scene::Entity| {
-                    crate::state::hitbox_from(objects, animations, entity)
-                };
-                collision.box_collision(
-                    entities,
-                    this_slot,
-                    operands[2],
-                    operands[3],
-                    operands[4],
-                    operands[5],
-                    other_slot,
-                    operands[7],
-                    operands[8],
-                    operands[9],
-                    operands[10],
-                    &hitbox,
-                )
-            }),
-            C_SOLID2 | C_PLATFORM => 0,
+            C_SOLID => {
+                self.state.record_op("BoxCollisionTest");
+                self.with_collision_entities(|collision, entities, objects, animations| {
+                    let hitbox = |_slot: usize, entity: &retro_scene::Entity| {
+                        crate::state::hitbox_from(objects, animations, entity)
+                    };
+                    collision.box_collision(
+                        entities,
+                        this_slot,
+                        operands[2],
+                        operands[3],
+                        operands[4],
+                        operands[5],
+                        other_slot,
+                        operands[7],
+                        operands[8],
+                        operands[9],
+                        operands[10],
+                        &hitbox,
+                    )
+                })
+            }
+            C_PLATFORM => {
+                self.state.record_op("BoxCollisionTest");
+                self.with_collision_entities(|collision, entities, objects, animations| {
+                    let hitbox = |_slot: usize, entity: &retro_scene::Entity| {
+                        crate::state::hitbox_from(objects, animations, entity)
+                    };
+                    collision.platform_collision(
+                        entities,
+                        this_slot,
+                        operands[2],
+                        operands[3],
+                        operands[4],
+                        operands[5],
+                        other_slot,
+                        operands[7],
+                        operands[8],
+                        operands[9],
+                        operands[10],
+                        &hitbox,
+                    )
+                })
+            }
+            C_SOLID2 => {
+                // `BoxCollision2` is a separate ~300-line routine that upstream itself notes
+                // is "barely used in S2"; it is an explicit M3 stub.
+                self.state.record_stub("BoxCollision2");
+                0
+            }
             _ => 0,
         }
     }
@@ -1498,7 +1563,7 @@ impl EngineHost<'_> {
 mod tests {
     use super::*;
     use crate::profile::EngineSettings;
-    use crate::rng::GameRng;
+    use crate::rng::GlibcRand;
     use retro_format_v4::collision::{
         COLLISION_FILE_BYTES, COLLISION_PLANE_COUNT, COLLISION_TILE_BYTES, COLLISION_TILE_COUNT,
     };
@@ -1601,7 +1666,7 @@ mod tests {
             with_collision.then(collision),
             None,
             ObjectRegistry::new(),
-            GameRng::new(1),
+            GlibcRand::new(1),
         )
     }
 
@@ -1719,5 +1784,143 @@ mod tests {
                 .unwrap(),
             Some(5)
         );
+    }
+
+    #[test]
+    fn check_camera_proximity_handles_partial_ranges() {
+        let mut state = test_state(false);
+        state.camera.xpos = 100;
+        state.camera.ypos = 200;
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+
+        // Both axes: inside.
+        vm_state.operands[0] = 110;
+        vm_state.operands[1] = 210;
+        vm_state.operands[2] = 20;
+        vm_state.operands[3] = 20;
+        host.engine_op(Op::CheckCameraProximity, &mut vm_state)
+            .unwrap();
+        assert_eq!(vm_state.check_result, 1);
+
+        // Only x: y distance is huge, x passes.
+        vm_state.operands[1] = i32::MAX;
+        vm_state.operands[3] = 0;
+        host.engine_op(Op::CheckCameraProximity, &mut vm_state)
+            .unwrap();
+        assert_eq!(vm_state.check_result, 1);
+
+        // Only y: x distance is huge, y passes.
+        vm_state.operands[0] = i32::MIN;
+        vm_state.operands[1] = 210;
+        vm_state.operands[2] = 0;
+        vm_state.operands[3] = 20;
+        host.engine_op(Op::CheckCameraProximity, &mut vm_state)
+            .unwrap();
+        assert_eq!(vm_state.check_result, 1);
+
+        // Only x and failing.
+        vm_state.operands[0] = i32::MIN;
+        vm_state.operands[2] = 5;
+        vm_state.operands[3] = 0;
+        host.engine_op(Op::CheckCameraProximity, &mut vm_state)
+            .unwrap();
+        assert_eq!(vm_state.check_result, 0);
+
+        // Neither range: stays false.
+        vm_state.operands[2] = 0;
+        vm_state.operands[3] = 0;
+        host.engine_op(Op::CheckCameraProximity, &mut vm_state)
+            .unwrap();
+        assert_eq!(vm_state.check_result, 0);
+    }
+
+    #[test]
+    fn check_touch_rect_without_touches_is_negative_one() {
+        let mut state = test_state(false);
+        state.touch_down = vec![0; 4];
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 0;
+        vm_state.operands[1] = 0;
+        vm_state.operands[2] = 100;
+        vm_state.operands[3] = 100;
+        host.engine_op(Op::CheckTouchRect, &mut vm_state).unwrap();
+        assert_eq!(vm_state.check_result, -1);
+
+        // A synthetic touch inside the rect returns its index.
+        host.state.touch_down[2] = 1;
+        host.state.touch_x[2] = 50;
+        host.state.touch_y[2] = 50;
+        host.engine_op(Op::CheckTouchRect, &mut vm_state).unwrap();
+        assert_eq!(vm_state.check_result, 2);
+    }
+
+    #[test]
+    fn read_save_ram_reports_missing_save_files() {
+        let mut state = test_state(false);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        host.engine_op(Op::ReadSaveRAM, &mut vm_state).unwrap();
+        assert_eq!(
+            vm_state.check_result, 0,
+            "no SData.bin/SGame.bin in the test source"
+        );
+
+        let mut source = MemorySource::new();
+        source.insert("SGame.bin", vec![0u8; 16]);
+        state.source = Arc::new(source);
+        let mut host = EngineHost { state: &mut state };
+        host.engine_op(Op::ReadSaveRAM, &mut vm_state).unwrap();
+        assert_eq!(vm_state.check_result, 1, "SGame.bin present");
+    }
+
+    #[test]
+    fn box_collision2_is_reported_as_an_explicit_stub() {
+        let mut state = test_state(true);
+        state
+            .entities
+            .reset_object_entity(0, 1, 0, 64 << 16, 64 << 16);
+        state
+            .entities
+            .reset_object_entity(1, 2, 0, 80 << 16, 64 << 16);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = C_SOLID2;
+        vm_state.operands[1] = 0;
+        vm_state.operands[6] = 1;
+        host.engine_op(Op::BoxCollisionTest, &mut vm_state).unwrap();
+        assert_eq!(vm_state.check_result, 0);
+        assert_eq!(host.state.stub_histogram.get("BoxCollision2"), Some(&1));
+        assert!(!host.state.op_histogram.contains_key("BoxCollisionTest"));
+    }
+
+    #[test]
+    fn box_collision_test_platform_lands_the_falling_entity() {
+        let mut state = test_state(true);
+        state
+            .entities
+            .reset_object_entity(0, 1, 0, 100 << 16, 100 << 16);
+        state
+            .entities
+            .reset_object_entity(1, 2, 0, 100 << 16, 90 << 16);
+        state.entities.get_mut(1).unwrap().yvel = 0x20000;
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = C_PLATFORM;
+        vm_state.operands[1] = 0;
+        vm_state.operands[2] = -8;
+        vm_state.operands[3] = -8;
+        vm_state.operands[4] = 8;
+        vm_state.operands[5] = 8;
+        vm_state.operands[6] = 1;
+        vm_state.operands[7] = -8;
+        vm_state.operands[8] = -8;
+        vm_state.operands[9] = 8;
+        vm_state.operands[10] = 8;
+        host.engine_op(Op::BoxCollisionTest, &mut vm_state).unwrap();
+        assert_eq!(vm_state.check_result, 1);
+        assert_eq!(host.state.entities.get(1).unwrap().ypos, 84 << 16);
+        assert_eq!(host.state.op_histogram.get("BoxCollisionTest"), Some(&1));
     }
 }

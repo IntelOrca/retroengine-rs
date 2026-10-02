@@ -10,9 +10,15 @@
 //!   shipped group layout with [`Compiler::finish_group`]: the stage file stores only its own
 //!   code but keeps the global functions and absolute positions.
 //!
-//! The reference engine ignores the `_Bytecode/` directory (underscore prefix); this loader
-//! therefore always compiles `Data/Scripts/**/*.txt`, and `txtScripts` is reported but does not
-//! change the path yet.
+//! # `_Bytecode/` deviation (M7 triage)
+//!
+//! The settled project decision is that the reference engine ignores `_Bytecode/` (the underscore
+//! prefix makes it a non-loaded directory), so the shipped S1/S2 folders are loaded by compiling
+//! `Data/Scripts/**/*.txt`. This loader therefore always takes the compile path and reports but
+//! does not honour `[Game] txtScripts`. For M7 parity this is the *same* path the reference takes
+//! for these assets; if a future data set ships a real `Bytecode/` directory, loading it (the
+//! `retro_script::load_bytecode` entry point already exists) will need to be added here and
+//! validated against the compiler output.
 
 use std::sync::Arc;
 
@@ -64,24 +70,29 @@ pub struct LoadedWorld {
 /// Resolves `--scene`/`--act` to a stage folder and act id using `GameConfig`.
 ///
 /// Resolution order, all case-insensitive:
-/// 1. an exact stage folder match (`Zone01`), keeping `act` (or `1` when not overridden),
-/// 2. a GameConfig scene name match (`GREEN HILL ZONE 1`), using the entry id when `act` was
-///    not explicitly overridden (i.e. is `1`).
+/// 1. an exact stage folder match (`Zone01`),
+/// 2. a GameConfig scene name match (`GREEN HILL ZONE 1`),
+/// 3. without `--scene`, the first scene of the presentation category (normal boot flow up to
+///    the title screen).
 ///
-/// Without `--scene`, the first scene of the presentation category is used, matching the normal
-/// boot flow up to the title screen.
+/// An explicit `act` always wins, including the literal `1` and stage ids such as `B`; when it
+/// is absent the GameConfig entry's own id is used.
 pub fn resolve_scene(
     game_config: &GameConfig,
     requested: Option<&str>,
-    act: u32,
+    act: Option<&str>,
 ) -> Result<(String, String), EngineError> {
+    let resolve_act = |entry_id: &str| {
+        act.map(str::to_owned)
+            .unwrap_or_else(|| entry_id.to_owned())
+    };
     let Some(requested) = requested else {
         let entry = game_config
             .categories
             .first()
             .and_then(|category| category.scenes.first());
         return match entry {
-            Some(entry) => Ok((entry.folder.clone(), entry.id.clone())),
+            Some(entry) => Ok((entry.folder.clone(), resolve_act(&entry.id))),
             None => Err(EngineError::UnknownScene("<default>".to_owned())),
         };
     };
@@ -92,12 +103,7 @@ pub fn resolve_scene(
         .flat_map(|category| &category.scenes)
         .find(|entry| entry.folder.to_ascii_lowercase() == lowered)
     {
-        let id = if act == 1 {
-            entry.id.clone()
-        } else {
-            act.to_string()
-        };
-        return Ok((entry.folder.clone(), id));
+        return Ok((entry.folder.clone(), resolve_act(&entry.id)));
     }
     let normalized: String = requested
         .chars()
@@ -118,12 +124,7 @@ pub fn resolve_scene(
                 == normalized
         })
     {
-        let id = if act == 1 {
-            entry.id.clone()
-        } else {
-            act.to_string()
-        };
-        return Ok((entry.folder.clone(), id));
+        return Ok((entry.folder.clone(), resolve_act(&entry.id)));
     }
     Err(EngineError::UnknownScene(requested.to_owned()))
 }
@@ -297,7 +298,7 @@ pub fn load_scripts(
 pub fn load_world(
     source: &Arc<dyn DataSource>,
     requested_scene: Option<&str>,
-    act: u32,
+    act: Option<&str>,
 ) -> Result<LoadedWorld, EngineError> {
     let detected = detect(source.as_ref())?;
     if detected.version != DataVersion::V4Legacy {
@@ -371,6 +372,57 @@ mod tests {
         }
     }
 
+    fn push_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.push(value.len() as u8);
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    fn game_config_bytes_with_scene(folder: &str, id: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_string(&mut bytes, "Test");
+        push_string(&mut bytes, "");
+        for _ in 0..PALETTE_COUNT {
+            bytes.extend_from_slice(&[0, 0, 0]);
+        }
+        bytes.push(0); // objects
+        bytes.push(0); // variables
+        bytes.push(0); // sfx
+        bytes.push(0); // players
+        // Presentation has the scene, the other categories are empty.
+        bytes.push(1);
+        push_string(&mut bytes, folder);
+        push_string(&mut bytes, id);
+        push_string(&mut bytes, "TEST");
+        bytes.push(1);
+        bytes.extend(std::iter::repeat_n(0u8, 3));
+        bytes
+    }
+
+    fn stage_config_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(0); // load_global_objects
+        for _ in 0..retro_format_v4::stageconfig::STAGE_PALETTE_COUNT {
+            bytes.extend_from_slice(&[0, 0, 0]);
+        }
+        bytes.push(0); // sfx
+        bytes.push(0); // objects
+        bytes
+    }
+
+    fn scene_bytes(title: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_string(&mut bytes, title);
+        bytes.extend_from_slice(&[9; 4]);
+        bytes.push(3);
+        bytes.push(1);
+        bytes.push(0);
+        bytes.push(1);
+        bytes.push(0);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn scene_resolution_prefers_folder_then_name() {
         let mut config = config();
@@ -387,25 +439,35 @@ mod tests {
             highlighted: 1,
         });
         assert_eq!(
-            resolve_scene(&config, None, 1).unwrap(),
+            resolve_scene(&config, None, None).unwrap(),
             ("Title".to_owned(), "1".to_owned())
         );
         assert_eq!(
-            resolve_scene(&config, Some("zone01"), 1).unwrap(),
+            resolve_scene(&config, Some("zone01"), None).unwrap(),
             ("Zone01".to_owned(), "2".to_owned()),
-            "folder match keeps the GameConfig id when act is the default"
+            "folder match uses the GameConfig id when act is absent"
         );
         assert_eq!(
-            resolve_scene(&config, Some("green hill zone 1"), 1).unwrap(),
+            resolve_scene(&config, Some("green hill zone 1"), None).unwrap(),
             ("Zone01".to_owned(), "2".to_owned())
         );
         assert_eq!(
-            resolve_scene(&config, Some("Zone01"), 3).unwrap(),
+            resolve_scene(&config, Some("Zone01"), Some("3")).unwrap(),
             ("Zone01".to_owned(), "3".to_owned()),
             "explicit act overrides the config id"
         );
+        assert_eq!(
+            resolve_scene(&config, Some("Zone01"), Some("1")).unwrap(),
+            ("Zone01".to_owned(), "1".to_owned()),
+            "explicit --act 1 must beat a config id of 2"
+        );
+        assert_eq!(
+            resolve_scene(&config, Some("Zone01"), Some("B")).unwrap(),
+            ("Zone01".to_owned(), "B".to_owned()),
+            "literal act ids are preserved"
+        );
         assert!(matches!(
-            resolve_scene(&config, Some("Missing"), 1),
+            resolve_scene(&config, Some("Missing"), None),
             Err(EngineError::UnknownScene(_))
         ));
     }
@@ -466,6 +528,38 @@ mod tests {
         assert!(standalone.global.is_none());
         assert_eq!(standalone.objects.len(), 2);
         assert_eq!(standalone.objects.get(1).unwrap().script.update.code_pos, 0);
+    }
+
+    #[test]
+    fn explicit_act_one_loads_act_one_despite_config_id_two() {
+        use retro_io::MemorySource;
+
+        let mut source = MemorySource::new();
+        source.insert("Settings.ini", "[Game]\ngameType=1\n");
+        source.insert(
+            "Data/Game/GameConfig.bin",
+            game_config_bytes_with_scene("Zone01", "2"),
+        );
+        source.insert("Data/Stages/Zone01/StageConfig.bin", stage_config_bytes());
+        source.insert("Data/Stages/Zone01/Act1.bin", scene_bytes("FIRST"));
+        source.insert("Data/Stages/Zone01/Act2.bin", scene_bytes("SECOND"));
+        source.insert("Data/Stages/Zone01/ActB.bin", scene_bytes("BONUS"));
+        let source: Arc<dyn retro_io::DataSource> = Arc::new(source);
+
+        // No explicit act: the GameConfig entry id (2) selects Act2.
+        let world = load_world(&source, Some("Zone01"), None).unwrap();
+        assert_eq!(world.act, "2");
+        assert_eq!(world.scene.title, "SECOND");
+
+        // Explicit `--act 1` must select Act1 even though the entry id is "2".
+        let world = load_world(&source, Some("Zone01"), Some("1")).unwrap();
+        assert_eq!(world.act, "1");
+        assert_eq!(world.scene.title, "FIRST");
+
+        // The literal stage id `B` is accepted as-is.
+        let world = load_world(&source, Some("Zone01"), Some("B")).unwrap();
+        assert_eq!(world.act, "B");
+        assert_eq!(world.scene.title, "BONUS");
     }
 
     #[test]

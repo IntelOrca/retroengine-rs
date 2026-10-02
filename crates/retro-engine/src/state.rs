@@ -15,7 +15,7 @@ use retro_scene::{
 };
 
 use crate::profile::EngineSettings;
-use crate::rng::GameRng;
+use crate::rng::GlibcRand;
 
 /// Number of tile layers upstream keeps (`LAYER_COUNT`).
 pub const LAYER_COUNT: usize = 9;
@@ -184,8 +184,8 @@ pub struct EngineState {
     pub entities: EntityStore,
     /// Trig lookup tables.
     pub math: MathTables,
-    /// Deterministic RNG.
-    pub rng: GameRng,
+    /// Deterministic glibc-compatible RNG.
+    pub rng: GlibcRand,
     /// Camera globals.
     pub camera: Camera,
     /// Screen globals.
@@ -255,7 +255,7 @@ impl EngineState {
         collision: Option<SceneCollision>,
         backgrounds: Option<Backgrounds>,
         objects: ObjectRegistry,
-        rng: GameRng,
+        rng: GlibcRand,
     ) -> Self {
         let mut layers = vec![LayerState::default(); LAYER_COUNT];
         if let Some(main) = layers.first_mut() {

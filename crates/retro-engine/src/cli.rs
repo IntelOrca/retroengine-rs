@@ -32,9 +32,10 @@ pub struct Args {
     /// Scene to start: a stage folder (`Zone01`) or a GameConfig scene name
     #[arg(long)]
     pub scene: Option<String>,
-    /// Act number to start
-    #[arg(long, default_value_t = 1)]
-    pub act: u32,
+    /// Act id to start (numeric, or a stage id such as `B`); defaults to the
+    /// GameConfig entry's id
+    #[arg(long)]
+    pub act: Option<String>,
     /// Run without a window using the deterministic headless backend
     #[arg(long)]
     pub headless: bool,
@@ -94,7 +95,12 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     let assets = resolve_assets(&args.assets_dir)?;
     let source = DirSource::new(&assets.root)?;
     let seed = args.seed.unwrap_or(crate::rng::DEFAULT_SEED);
-    let mut engine = Engine::load(Arc::new(source), args.scene.as_deref(), args.act, seed)?;
+    let mut engine = Engine::load(
+        Arc::new(source),
+        args.scene.as_deref(),
+        args.act.as_deref(),
+        seed,
+    )?;
     let (folder, act) = engine.stage_info();
     let folder = folder.to_owned();
     let act = act.to_owned();
@@ -165,7 +171,7 @@ fn report_histograms(engine: &Engine) {
 pub fn resolve_scene_name(
     game_config: &retro_format_v4::GameConfig,
     requested: Option<&str>,
-    act: u32,
+    act: Option<&str>,
 ) -> Result<(String, String), EngineError> {
     loader::resolve_scene(game_config, requested, act)
 }
@@ -190,7 +196,7 @@ mod tests {
     fn parses_required_assets_dir() {
         let args = Args::try_parse_from(["retro-engine", "/tmp/assets"]).unwrap();
         assert_eq!(args.assets_dir, PathBuf::from("/tmp/assets"));
-        assert_eq!(args.act, 1);
+        assert_eq!(args.act, None);
         assert!(!args.headless);
         assert_eq!(args.frames, 0);
         assert!(args.scene.is_none());
@@ -219,7 +225,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.scene.as_deref(), Some("GHZ"));
-        assert_eq!(args.act, 2);
+        assert_eq!(args.act.as_deref(), Some("2"));
         assert!(args.headless);
         assert_eq!(args.frames, 3);
         assert_eq!(args.input, Some(PathBuf::from("replay.bin")));
