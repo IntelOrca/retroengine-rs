@@ -1,9 +1,6 @@
 name: CI
 
-on:
-  push:
-    branches: ["*"]
-  pull_request:
+on: [push, pull_request]
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,3 +38,4 @@ jobs:
         with:
           name: retroengine-windows
           path: target/release/retroengine.exe
+          if-no-files-found: error

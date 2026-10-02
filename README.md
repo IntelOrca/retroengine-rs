@@ -20,7 +20,7 @@ The engine loads unpacked RSDK asset folders, runs headless on Linux CI, and bui
 | `retro-audio` | Audio mixing and streaming |
 | `retro-input` | Input mapping |
 | `retro-parity` | Frame capture and comparison tooling |
-| `retro-engine` | Main engine binary |
+| `retro-engine` | Main engine binary (`retroengine`) |
 | `retro-export` | Asset export/inspection binary |
 | `retro-dev` | Developer utility binary |
 
@@ -32,7 +32,9 @@ Requirements: Rust 1.98.0 (pinned by `rust-toolchain.toml`), `cmake`, and a C/C+
 cargo build --release
 ```
 
-Build artifacts go to `../target` (configured in `.cargo/config.toml`).
+Build artifacts go to `../target` (configured in `.cargo/config.toml`). The engine executable is `retroengine` (`retroengine.exe` on Windows).
+
+`crates/retro-core/src/math_tables.rs` is generated; run `tools/gen_math_tables.sh` to regenerate it after changing the table formulas.
 
 On this server, put the local cmake/ninja first on `PATH`:
 
@@ -44,7 +46,7 @@ cargo build --release
 ## Running headless
 
 ```sh
-../target/release/retro-engine /path/to/assets/S1 --headless --frames 3
+../target/release/retroengine /path/to/assets/S1 --headless --frames 3
 ```
 
 `<ASSETS_DIR>` must be an unpacked RSDK asset folder containing `Data/Game/GameConfig.bin`. At M0 the binary parses and validates arguments, prints the resolved configuration, and exits.
@@ -56,7 +58,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --release
-../target/release/retro-engine /path/to/assets/S1 --headless --frames 3
+../target/release/retroengine /path/to/assets/S1 --headless --frames 3
 ```
 
 ## Windows CI
