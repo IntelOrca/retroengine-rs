@@ -398,10 +398,12 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "clap",
+ "retro-audio",
  "retro-core",
  "retro-format",
  "retro-format-v4",
  "retro-image",
+ "retro-input",
  "retro-io",
  "retro-platform",
  "retro-render",

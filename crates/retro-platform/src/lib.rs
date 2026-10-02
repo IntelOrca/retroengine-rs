@@ -6,8 +6,10 @@ pub mod error;
 pub mod headless;
 #[cfg(feature = "sdl3")]
 pub mod sdl3;
+pub mod storage;
 
 pub use error::PlatformError;
+pub use storage::FsStorage;
 
 /// The engine steps at a fixed 60 Hz.
 pub const TARGET_FPS: u64 = 60;
@@ -285,6 +287,32 @@ pub trait Storage {
     }
 }
 
+impl Storage for Box<dyn Storage> {
+    fn read(&self, path: &str) -> Result<Vec<u8>, PlatformError> {
+        (**self).read(path)
+    }
+
+    fn write(&mut self, path: &str, data: &[u8]) -> Result<(), PlatformError> {
+        (**self).write(path, data)
+    }
+
+    fn exists(&self, path: &str) -> bool {
+        (**self).exists(path)
+    }
+
+    fn list(&self, dir: &str) -> Result<Vec<String>, PlatformError> {
+        (**self).list(dir)
+    }
+
+    fn remove(&mut self, path: &str) -> Result<(), PlatformError> {
+        (**self).remove(path)
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), PlatformError> {
+        (**self).rename(from, to)
+    }
+}
+
 /// Fixed-step frame clock.
 pub trait Clock {
     /// Number of completed frames.
@@ -295,6 +323,23 @@ pub trait Clock {
     fn advance_frame(&mut self);
     /// Blocks until the next frame is due.
     fn sleep_until_next_frame(&self) -> Result<(), PlatformError>;
+}
+
+/// Returns the preferred per-user data directory for the engine.
+///
+/// With the SDL3 feature this is `SDL_GetPrefPath("retroengine-rs", "retroengine")` (the same
+/// location the windowed backend writes user data to); without it there is no OS preference and
+/// `None` is returned. Callers should fall back to their own directory or in-memory storage.
+#[must_use]
+pub fn user_data_dir() -> Option<std::path::PathBuf> {
+    #[cfg(feature = "sdl3")]
+    {
+        ::sdl3::filesystem::get_pref_path("retroengine-rs", "retroengine").ok()
+    }
+    #[cfg(not(feature = "sdl3"))]
+    {
+        None
+    }
 }
 
 /// Number of times the SDL3 backend has initialized SDL in this process.

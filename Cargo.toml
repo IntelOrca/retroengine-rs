@@ -39,7 +39,7 @@ retro-image = { path = "crates/retro-image" }
 retro-input = { path = "crates/retro-input" }
 retro-io = { path = "crates/retro-io" }
 retro-parity = { path = "crates/retro-parity" }
-retro-platform = { path = "crates/retro-platform" }
+retro-platform = { path = "crates/retro-platform", default-features = false }
 retro-render = { path = "crates/retro-render" }
 retro-scene = { path = "crates/retro-scene" }
 retro-script = { path = "crates/retro-script" }

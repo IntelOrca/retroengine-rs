@@ -13,13 +13,19 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = ["sdl3"]
+sdl3 = ["retro-platform/sdl3"]
+
 [dependencies]
 blake3.workspace = true
 clap.workspace = true
+retro-audio.workspace = true
 retro-core.workspace = true
 retro-format.workspace = true
 retro-format-v4.workspace = true
 retro-image.workspace = true
+retro-input.workspace = true
 retro-io.workspace = true
 retro-platform.workspace = true
 retro-render.workspace = true
