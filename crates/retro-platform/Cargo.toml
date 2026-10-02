@@ -1,0 +1,29 @@
+[package]
+name = "retro-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["sdl3"]
+sdl3 = ["dep:sdl3", "dep:sdl3-sys"]
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+sdl3 = { workspace = true, optional = true, features = [
+    "build-from-source-static",
+    "build-from-source-unix-console",
+] }
+sdl3-sys = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sdl3 = { workspace = true, optional = true, features = ["build-from-source-static"] }
+sdl3-sys = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+sdl3 = { workspace = true, optional = true, features = ["build-from-source-static"] }
+sdl3-sys = { workspace = true, optional = true }

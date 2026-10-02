@@ -220,9 +220,6 @@ dependencies = [
 [[package]]
 name = "retro-audio"
 version = "0.1.0"
-dependencies = [
- "retro-core",
-]
 
 [[package]]
 name = "retro-core"
@@ -231,9 +228,6 @@ version = "0.1.0"
 [[package]]
 name = "retro-dev"
 version = "0.1.0"
-dependencies = [
- "retro-core",
-]
 
 [[package]]
 name = "retro-engine"
@@ -242,69 +236,41 @@ dependencies = [
  "blake3",
  "clap",
  "retro-core",
- "retro-parity",
  "retro-platform",
 ]
 
 [[package]]
 name = "retro-export"
 version = "0.1.0"
-dependencies = [
- "retro-core",
- "retro-format-v4",
-]
 
 [[package]]
 name = "retro-format"
 version = "0.1.0"
-dependencies = [
- "retro-core",
- "retro-io",
-]
 
 [[package]]
 name = "retro-format-v4"
 version = "0.1.0"
-dependencies = [
- "retro-core",
- "retro-format",
- "retro-io",
-]
 
 [[package]]
 name = "retro-image"
 version = "0.1.0"
-dependencies = [
- "retro-core",
-]
 
 [[package]]
 name = "retro-input"
 version = "0.1.0"
-dependencies = [
- "retro-core",
- "retro-platform",
-]
 
 [[package]]
 name = "retro-io"
 version = "0.1.0"
-dependencies = [
- "retro-core",
-]
 
 [[package]]
 name = "retro-parity"
 version = "0.1.0"
-dependencies = [
- "retro-core",
-]
 
 [[package]]
 name = "retro-platform"
 version = "0.1.0"
 dependencies = [
- "retro-core",
  "sdl3",
  "sdl3-sys",
 ]
@@ -312,23 +278,14 @@ dependencies = [
 [[package]]
 name = "retro-render"
 version = "0.1.0"
-dependencies = [
- "retro-core",
-]
 
 [[package]]
 name = "retro-scene"
 version = "0.1.0"
-dependencies = [
- "retro-core",
-]
 
 [[package]]
 name = "retro-script"
 version = "0.1.0"
-dependencies = [
- "retro-core",
-]
 
 [[package]]
 name = "rpkg-config"
