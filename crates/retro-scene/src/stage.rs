@@ -163,6 +163,13 @@ impl StageState {
         }
     }
 
+    /// Sets `actNum` from a stage entry id exactly like `LoadActFile`'s
+    /// `ConvertStringToInteger(entry.id, &actID)`: numeric ids parse (`"1"` -> 1), non-numeric
+    /// bonus ids leave a fresh-boot global at 0 (`B` -> 0).
+    pub fn set_act_id(&mut self, act_id: &str) {
+        self.act_num = retro_script::parse_int(act_id).unwrap_or(0);
+    }
+
     /// Reads the stage variable with the given rev03 variable id, or `None` for ids outside the
     /// `stage.*` block.
     #[must_use]
@@ -274,6 +281,20 @@ mod tests {
         assert_eq!(state.water_level, 384);
         assert_eq!(state.active_layers, [1, 9, 0, 0]);
         assert_eq!(state.mid_point, 3);
+    }
+
+    #[test]
+    fn act_num_parses_numeric_ids_and_defaults_bonus_to_zero() {
+        let mut state = StageState::from_scene(&scene());
+        assert_eq!(state.act_num, 0, "fresh scene defaults to act 0");
+        state.set_act_id("1");
+        assert_eq!(state.act_num, 1);
+        state.set_act_id("2");
+        assert_eq!(state.act_num, 2);
+        state.set_act_id("B");
+        assert_eq!(state.act_num, 0, "bonus acts are not numeric");
+        state.set_act_id("0x10");
+        assert_eq!(state.act_num, 16, "upstream parser accepts base prefixes");
     }
 
     #[test]
