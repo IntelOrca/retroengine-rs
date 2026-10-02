@@ -137,11 +137,17 @@ impl<'a> Cursor<'a> {
         self.pos = end;
         Ok(slice)
     }
+
+    /// Bytes left to read. Every block entry needs at least one byte, so this caps untrusted
+    /// preallocations from the declared entry counts.
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
 }
 
 fn read_blocks_i32(cursor: &mut Cursor<'_>) -> Result<Vec<i32>, ScriptError> {
     let count = cursor.u32()? as usize;
-    let mut values = Vec::with_capacity(count);
+    let mut values = Vec::with_capacity(count.min(cursor.remaining()));
     while values.len() < count {
         let header = cursor.u8()?;
         let block = (header & 0x7F) as usize;
@@ -170,7 +176,7 @@ fn read_blocks_i32(cursor: &mut Cursor<'_>) -> Result<Vec<i32>, ScriptError> {
 
 fn read_blocks_u32(cursor: &mut Cursor<'_>) -> Result<Vec<u32>, ScriptError> {
     let count = cursor.u32()? as usize;
-    let mut values = Vec::with_capacity(count);
+    let mut values = Vec::with_capacity(count.min(cursor.remaining()));
     while values.len() < count {
         let header = cursor.u8()?;
         let block = (header & 0x7F) as usize;
@@ -453,6 +459,25 @@ mod tests {
             load_bytecode(&bytes),
             Err(ScriptError::InvalidState(_))
         ));
+    }
+
+    #[test]
+    fn huge_declared_counts_are_rejected_without_allocating() {
+        // A 4-byte file declaring 0xFFFFFFFF code words used to attempt a ~17 GB allocation
+        // before reading any block data.
+        assert!(matches!(
+            load_bytecode(&[0xFF, 0xFF, 0xFF, 0xFF]),
+            Err(ScriptError::Truncated)
+        ));
+        // One block header plus one entry still runs out long before the declared count.
+        assert!(matches!(
+            load_bytecode(&[0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00]),
+            Err(ScriptError::Truncated)
+        ));
+        // The jump table section has the same preallocation path.
+        let mut bytes = vec![0, 0, 0, 0];
+        bytes.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x02, 0x00, 0x00]);
+        assert!(matches!(load_bytecode(&bytes), Err(ScriptError::Truncated)));
     }
 
     #[test]
