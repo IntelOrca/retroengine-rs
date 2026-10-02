@@ -361,6 +361,7 @@ name = "retro-script"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "retro-format-v4",
  "retro-io",
  "serde",
  "thiserror",

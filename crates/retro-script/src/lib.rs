@@ -1,25 +1,34 @@
-//! Bytecode loader, disassembler and virtual machine for RSDKv4 script data.
+//! Bytecode loader, disassembler, text compiler and virtual machine for RSDKv4 script data.
 //!
 //! This crate is the foundation for the RSDKv4 (Origins rev03) script pipeline:
 //!
 //! * [`opcodes`] maps the encoded opcode bytes of every revision to canonical [`opcodes::Op`]
 //!   values, with upstream operand counts.
 //! * [`bytecode`] loads and writes the `_Bytecode/*.bin` container.
+//! * [`compiler`] compiles the `Data/Scripts/**/*.txt` RetroScript v4 sources when `Bytecode/`
+//!   is absent, reproducing upstream `ParseScriptFile` semantics (including global/stage group
+//!   linking and `#platform` selection).
 //! * [`vm`] executes bytecode; engine operations, engine variables and `foreach` iteration are
 //!   delegated to a [`vm::ScriptHost`] implementation.
 //! * [`disasm`] renders bytecode as deterministic text.
 //!
-//! The text compiler (work package WP2b) builds against the same opcode and variable tables.
 //! Only v4 tables are ported so far; [`version::ScriptVersion`] keeps the API ready for v2/v3.
 //!
 //! # Example
 //!
 //! ```
-//! use retro_script::{bytecode, vm, VmState};
+//! use retro_script::{bytecode, compiler, vm, VmState};
 //!
 //! let bytes = bytecode::write_bytecode(&bytecode::new_empty()).unwrap();
 //! let file = bytecode::load_bytecode(&bytes).unwrap();
 //! assert!(file.code.is_empty());
+//!
+//! let compiled = compiler::compile_script(
+//!     "event ObjectUpdate\nend event\n",
+//!     &compiler::CompileOptions::default(),
+//! )
+//! .unwrap();
+//! assert_eq!(compiled.code, vec![0]);
 //!
 //! let mut vm = vm::Vm::new(file);
 //! assert_eq!(vm.find_function("main"), None);
@@ -30,6 +39,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bytecode;
+pub mod compiler;
 pub mod disasm;
 pub mod error;
 pub mod opcodes;
@@ -40,6 +50,10 @@ pub mod vm;
 pub use bytecode::{
     Access, EMPTY_EVENT, FUNCTION_COUNT, JUMPTABLE_COUNT, ObjectScript, SCRIPTCODE_COUNT,
     ScriptFile, ScriptFunction, ScriptPtr, load_bytecode, new_empty, write_bytecode,
+};
+pub use compiler::{
+    CompileError, CompileOptions, Compiler, GroupMark, PlatformMode, SceneNames, SymbolTables,
+    compile_group, compile_object_script, compile_script,
 };
 pub use error::ScriptError;
 pub use opcodes::{
