@@ -232,6 +232,15 @@ pub trait AudioDevice {
     fn submit(&mut self, frames: &[f32]) -> Result<usize, PlatformError>;
     /// Frames currently queued for playback.
     fn queued_frames(&self) -> usize;
+    /// Starts playback once the caller has queued its prebuffer.
+    ///
+    /// Some backends (SDL's simplified device stream among them) open the device paused so the
+    /// caller can fill the queue before the hardware starts draining it. Backends that start
+    /// immediately, and capture-only backends, keep the no-op default. Callers may start more
+    /// than once; implementations should make repeated starts harmless.
+    fn start(&mut self) -> Result<(), PlatformError> {
+        Ok(())
+    }
     /// Closes the device.
     fn close(&mut self) -> Result<(), PlatformError>;
     /// Human-readable device/driver description for startup diagnostics.
