@@ -611,35 +611,14 @@ impl Engine {
     }
 
     /// Deterministic simplified camera follow.
+    ///
+    /// Upstream only recomputes `xScrollOffset`/`yScrollOffset` from the camera while
+    /// `cameraEnabled == 1` (`Scene.cpp:251-579` call `SetPlayerScreenPosition` under that
+    /// guard). Scenes that keep the camera disabled (the title screens) drive the scroll
+    /// themselves through `screen.xoffset`/`screen.yoffset`, so an unconditional follow here
+    /// would clobber the script-set values every frame.
     fn update_camera(&mut self) {
-        let target = usize::try_from(self.state.camera.target).ok();
-        if self.state.camera.enabled == 1
-            && let Some(target) = target
-            && let Some(entity) = self.state.entities.get(target).copied()
-        {
-            let half_x = self.state.screen.center_x();
-            let half_y = self.state.screen.center_y();
-            let target_x = entity.xpos >> 16;
-            let target_y = (entity.ypos >> 16) + self.state.camera.adjust_y;
-            let min_x = self.state.stage.cur_x_boundary1.wrapping_add(half_x);
-            let max_x = self.state.stage.cur_x_boundary2.wrapping_sub(half_x);
-            let min_y = self.state.stage.cur_y_boundary1.wrapping_add(half_y);
-            let max_y = self.state.stage.cur_y_boundary2.wrapping_sub(half_y);
-            self.state.camera.xpos = if min_x <= max_x {
-                target_x.clamp(min_x, max_x)
-            } else {
-                target_x
-            };
-            self.state.camera.ypos = if min_y <= max_y {
-                target_y.clamp(min_y, max_y)
-            } else {
-                target_y
-            };
-        }
-        self.state.screen.x_scroll =
-            self.state.camera.shake_x + self.state.camera.xpos - self.state.screen.center_x();
-        self.state.screen.y_scroll =
-            self.state.camera.shake_y + self.state.camera.ypos - self.state.screen.center_y();
+        follow_camera(&mut self.state);
     }
 
     /// Hashes the canonical engine state.
@@ -841,6 +820,45 @@ impl Engine {
     pub fn framebuffer(&self) -> &retro_render::Framebuffer {
         &self.state.render.framebuffer
     }
+}
+
+/// Deterministic simplified camera follow, split out for unit testing.
+///
+/// Upstream only recomputes `xScrollOffset`/`yScrollOffset` inside `SetPlayerScreenPosition`,
+/// which `ProcessStage` calls under `cameraEnabled == 1 && cameraTarget > -1`
+/// (`Scene.cpp:250-262`). Scenes that keep the camera disabled or targetless (the title
+/// screens) drive the scroll themselves through `screen.xoffset`/`screen.yoffset`, so an
+/// unconditional follow here would clobber the script-set values every frame.
+pub(crate) fn follow_camera(state: &mut EngineState) {
+    if state.camera.enabled != 1 {
+        return;
+    }
+    let Some(target) = usize::try_from(state.camera.target).ok() else {
+        return;
+    };
+    let Some(entity) = state.entities.get(target).copied() else {
+        return;
+    };
+    let half_x = state.screen.center_x();
+    let half_y = state.screen.center_y();
+    let target_x = entity.xpos >> 16;
+    let target_y = (entity.ypos >> 16) + state.camera.adjust_y;
+    let min_x = state.stage.cur_x_boundary1.wrapping_add(half_x);
+    let max_x = state.stage.cur_x_boundary2.wrapping_sub(half_x);
+    let min_y = state.stage.cur_y_boundary1.wrapping_add(half_y);
+    let max_y = state.stage.cur_y_boundary2.wrapping_sub(half_y);
+    state.camera.xpos = if min_x <= max_x {
+        target_x.clamp(min_x, max_x)
+    } else {
+        target_x
+    };
+    state.camera.ypos = if min_y <= max_y {
+        target_y.clamp(min_y, max_y)
+    } else {
+        target_y
+    };
+    state.screen.x_scroll = state.camera.shake_x + state.camera.xpos - half_x;
+    state.screen.y_scroll = state.camera.shake_y + state.camera.ypos - half_y;
 }
 
 fn place_scene_entities(store: &mut EntityStore, entities: &[SceneEntity]) {
