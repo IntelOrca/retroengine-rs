@@ -7,7 +7,10 @@
 //! * startup events run once per object type in object-list order against the temp slot,
 //! * update events run per entity slot in ascending order,
 //! * type groups are rebuilt after the update pass from the pre-update process flags,
-//! * the camera follows `camera.target` once per frame (simplified, see below).
+//! * the camera follows `camera.target` once per frame (simplified, see below),
+//! * a `LoadStage` request queued by a script op is consumed at the start of the next frame
+//!   (`STAGEMODE_LOAD`): the scene is torn down and rebuilt, startup events run and that frame
+//!   skips updates/draw while still presenting.
 //!
 //! The state hash is a canonical little-endian serialisation of all entity slots, the object
 //! list, camera/screen/stage metadata, global VM state and the RNG state, fed through BLAKE3.
@@ -37,7 +40,8 @@ use retro_platform::Storage;
 use retro_render::ChunkEntry;
 use retro_render::layers::{LAYER_3DFLOOR, LAYER_3DSKY, LAYER_HSCROLL, LAYER_VSCROLL, LayerView};
 use retro_scene::{
-    DRAWLAYER_COUNT, ENTITY_COUNT, EntityStore, OBJECT_COUNT, SCENE_ENTITY_START, TEMPENTITY_START,
+    Camera, DRAWLAYER_COUNT, ENTITY_COUNT, EntityStore, OBJECT_COUNT, SCENE_ENTITY_START,
+    StageLayout, StageState, TEMPENTITY_START,
 };
 use retro_script::{ScriptEvent, ScriptFile, Vm, VmState};
 
@@ -45,11 +49,11 @@ use crate::EngineError;
 use crate::audio::AudioState;
 use crate::host::EngineHost;
 use crate::input::{EngineInput, PRESS_BUTTONS, apply_players};
-use crate::loader;
+use crate::loader::{self, SceneAssets};
 use crate::profile::EngineSettings;
 use crate::rng::DEFAULT_SEED;
 use crate::save::{SaveState, seed_memory_storage};
-use crate::state::EngineState;
+use crate::state::{EngineState, STAGEMODE_NORMAL};
 
 /// The compiled script file and its VM execution state.
 pub struct ScriptRuntime {
@@ -163,6 +167,18 @@ impl Engine {
         state.save = save;
         let act_id = state.act.clone();
         state.stage.set_act_id(&act_id);
+        // `ProcessStage` enters `STAGEMODE_NORMAL` before `LoadStageFiles`, so startup events see
+        // a running stage (`stage.state`); scripts later set `STAGE_FROZEN`/`STAGE_RUNNING`.
+        state.stage.state = STAGEMODE_NORMAL;
+        // When the requested scene is a GameConfig entry, point `stage.activeList`/`stage.listPos`
+        // at it and record the list size so `ActFinish`'s `stage.listPos++` advances correctly.
+        if let Some((list, pos, size)) =
+            loader::engine_list_position(&state.game_config, &state.stage_folder, &state.act)
+        {
+            state.stage.active_list = list;
+            state.stage.list_pos = pos;
+            state.stage.list_size = size;
+        }
         // `[Window] DimLimit` is stored in seconds and converted to frames when settings load.
         state.render.dim_limit = state.settings.dim_limit_frames;
         state.apply_game_palette();
@@ -227,6 +243,27 @@ impl Engine {
 
     /// Runs startup events for every registered object type, in object-list order.
     pub fn run_startup(&mut self) -> Result<(), EngineError> {
+        // `ProcessStartupObjects` rewinds the script frame lists and animation data and resets
+        // every object's sheet/animation before the setup pass.
+        for frames in &mut self.state.object_frames {
+            frames.clear();
+        }
+        self.state.animations.clear();
+        self.state.animation_ids.clear();
+        self.state.animation_sheet_ids.clear();
+        for index in 0..self.state.objects.len() {
+            if let Some(entry) = self.state.objects.get_mut(index) {
+                entry.sprite_sheet_id = 0;
+                entry.animation_file = None;
+            }
+        }
+        // `ProcessStartupObjects` derives the object borders from `SCREEN_XSIZE`.
+        self.state.object_borders = [
+            0x80,
+            self.state.screen.xsize + 0x80,
+            0x20,
+            self.state.screen.xsize + 0x20,
+        ];
         self.state.object_entity_pos = TEMPENTITY_START;
         self.scripts.vm_state.array_position[8] = TEMPENTITY_START as i32;
         self.scripts.vm_state.foreach_stack.clear();
@@ -260,11 +297,233 @@ impl Engine {
         Ok(())
     }
 
+    /// Applies a pending `LoadStage` request: the upstream `STAGEMODE_LOAD` handoff.
+    ///
+    /// `FUNC_LOADSTAGE` only sets `stageMode = STAGEMODE_LOAD`; the next `ProcessStage` call
+    /// resets the frame state, runs `LoadStageFiles` and skips that frame's updates/draw. This is
+    /// the port of that handoff. `stage.activeList`/`stage.listPos` select the GameConfig entry.
+    fn apply_deferred_load(&mut self) -> Result<(), EngineError> {
+        self.state.load_stage_requested = false;
+        let (folder, act, list_size) = {
+            let (entry, size) = loader::stage_list_entry(
+                &self.state.game_config,
+                self.state.stage.active_list,
+                self.state.stage.list_pos,
+            )?;
+            (entry.folder.clone(), entry.id.clone(), size)
+        };
+        let assets = loader::load_scene_assets(
+            &self.state.source,
+            &self.state.game_config,
+            &self.state.settings,
+            &folder,
+            &act,
+        )?;
+        // `CheckCurrentStageFolder`: the same folder reuses the linked scripts, tiles, collision
+        // and background metadata and only reloads the act layout and entities.
+        if self.state.stage_folder == folder {
+            self.prepare_act_reload();
+            self.apply_act_reload(act, list_size, assets)?;
+        } else {
+            self.apply_full_scene_load(folder, act, list_size, assets)?;
+        }
+        self.run_startup()?;
+        Ok(())
+    }
+
+    /// The `STAGEMODE_LOAD` reset that runs before `LoadStageFiles`.
+    ///
+    /// `ResetBackgroundSettings` zeroes the per-layer deformation/auto-scroll state. Resetting the
+    /// camera matters for script-driven scroll: the title's `screen.xoffset` writes are
+    /// authoritative while `cameraTarget == -1`, and zones re-point `camera.target` from their
+    /// setup scripts.
+    fn prepare_act_reload(&mut self) {
+        self.state.render.fade_mode = 0;
+        self.state.camera = Camera::scene_load();
+        self.state.screen.x_scroll = 0;
+        self.state.screen.y_scroll = 0;
+        self.state.music_track = 0;
+        self.state.audio.reset_stage_tracks();
+        self.reset_background_settings();
+    }
+
+    /// `ResetBackgroundSettings`: zeroes deformation offsets, layer auto-scroll positions, the
+    /// parallax auto-scroll positions and all four deformation tables.
+    fn reset_background_settings(&mut self) {
+        for layer in &mut self.state.layers {
+            layer.deformation_offset = 0;
+            layer.deformation_offset_w = 0;
+            layer.scroll_pos = 0;
+        }
+        for table in [&mut self.state.h_parallax, &mut self.state.v_parallax] {
+            table.scroll_pos.fill(0);
+        }
+        for data in &mut self.state.render.deform_data {
+            data.fill(0);
+        }
+    }
+
+    /// Full `LoadStageFiles` path for a different stage folder: relinks the scripts, rebuilds the
+    /// tile layers/palettes and re-seeds the act, entities and stage globals.
+    fn apply_full_scene_load(
+        &mut self,
+        folder: String,
+        act: String,
+        list_size: i32,
+        assets: SceneAssets,
+    ) -> Result<(), EngineError> {
+        let SceneAssets {
+            scene,
+            stage_config,
+            collision,
+            backgrounds,
+            tiles16,
+            tiles128,
+            scripts,
+        } = assets;
+        // The output device survives the reload; `reload_for_scene` rebuilds the sfx/track tables
+        // from the new configs and silences the mixer (`StopAllSfx` + `SetMusicTrack("", ...)`).
+        let mut audio = std::mem::take(&mut self.state.audio);
+        audio.reload_for_scene(
+            Arc::clone(&self.state.source),
+            &self.state.game_config,
+            &stage_config,
+            &self.raw_settings.audio,
+        );
+        let source = Arc::clone(&self.state.source);
+        let settings = self.state.settings.clone();
+        let game_config = self.state.game_config.clone();
+        let rng = self.state.rng.clone();
+        let mut state = EngineState::new(
+            source,
+            settings,
+            game_config,
+            folder,
+            act.clone(),
+            scene,
+            stage_config,
+            collision,
+            backgrounds,
+            scripts.objects,
+            rng,
+        );
+        state.audio = audio;
+        // State that lives on across `LoadStageFiles`: save RAM, input, RNG (already carried),
+        // menus, diagnostics and the frame counter. Global VM variables are restored below.
+        state.save = std::mem::replace(&mut self.state.save, SaveState::in_memory());
+        state.input = self.state.input;
+        state.input_press = self.state.input_press;
+        state.touch_down = std::mem::take(&mut self.state.touch_down);
+        state.touch_x = std::mem::take(&mut self.state.touch_x);
+        state.touch_y = std::mem::take(&mut self.state.touch_y);
+        state.frame = self.state.frame;
+        state.menu1_selection = self.state.menu1_selection;
+        state.menu2_selection = self.state.menu2_selection;
+        state.op_histogram = std::mem::take(&mut self.state.op_histogram);
+        state.stub_histogram = std::mem::take(&mut self.state.stub_histogram);
+        // `activeStageList`/`stageListPosition` are script globals upstream and survive the load.
+        state.stage.active_list = self.state.stage.active_list;
+        state.stage.list_pos = self.state.stage.list_pos;
+        state.stage.list_size = list_size;
+        state.stage.player_list_pos = self.state.stage.player_list_pos;
+        state.stage.debug_mode = self.state.stage.debug_mode;
+        state.stage.state = STAGEMODE_NORMAL;
+        state.stage.set_act_id(&act);
+        state.render.dim_limit = state.settings.dim_limit_frames;
+        state.apply_game_palette();
+        state.apply_stage_palette();
+        if let Some(tiles16) = &tiles16 {
+            state.apply_tile_sheet(tiles16);
+        }
+        if let Some(tiles128) = &tiles128 {
+            state
+                .render
+                .tiles
+                .chunks
+                .extend(tiles128.entries.iter().map(|entry| ChunkEntry {
+                    gfx_data_pos: entry.gfx_data_pos(),
+                    direction: entry.direction,
+                    visual_plane: entry.visual_plane,
+                }));
+        }
+        state.entities.reset_scene();
+        place_scene_entities(&mut state.entities, &state.scene.entities);
+        self.state = state;
+        // `ClearScriptData` empties the script code and VM execution state; global variables
+        // persist because `LoadStageFiles` never re-reads `GameConfig.bin` into them.
+        self.scripts.vm = Vm::new(scripts.file);
+        let globals = std::mem::take(&mut self.scripts.vm_state.global_variables);
+        let mut array_position = [0i32; 9];
+        array_position[8] = TEMPENTITY_START as i32;
+        self.scripts.vm_state = VmState {
+            global_variables: globals,
+            array_position,
+            ..VmState::default()
+        };
+        Ok(())
+    }
+
+    /// `CheckCurrentStageFolder` reload path: the same folder with a different act.
+    ///
+    /// Upstream skips the config/script/graphics/collision/background reload and only runs
+    /// `LoadStageChunks`, `LoadActLayout`, `Init3DFloorBuffer` and `ProcessStartupObjects`.
+    fn apply_act_reload(
+        &mut self,
+        act: String,
+        list_size: i32,
+        assets: SceneAssets,
+    ) -> Result<(), EngineError> {
+        self.state.act = act.clone();
+        self.state.scene = assets.scene;
+        let (width, height, layout) = {
+            let scene = &self.state.scene;
+            (scene.width, scene.height, scene.layout.clone())
+        };
+        // `LoadActLayout` clears and refills tile layer 0 and leaves the background layers alone.
+        if let Some(main) = self.state.layers.first_mut() {
+            main.xsize = i32::from(width);
+            main.ysize = i32::from(height);
+            main.layer_type = LAYER_HSCROLL;
+            main.tiles.fill(0);
+            main.line_scroll.fill(0);
+            for y in 0..i32::from(height) {
+                for x in 0..i32::from(width) {
+                    let chunk = layout
+                        .get(usize::try_from(y * i32::from(width) + x).unwrap_or(usize::MAX))
+                        .copied()
+                        .unwrap_or(0);
+                    main.set_entry(x, y, chunk);
+                }
+            }
+        }
+        let mut stage = StageState::from_scene(&self.state.scene);
+        stage.active_list = self.state.stage.active_list;
+        stage.list_pos = self.state.stage.list_pos;
+        stage.list_size = list_size;
+        stage.player_list_pos = self.state.stage.player_list_pos;
+        stage.debug_mode = self.state.stage.debug_mode;
+        stage.state = STAGEMODE_NORMAL;
+        self.state.stage = stage;
+        self.state.stage.set_act_id(&act);
+        // Collision code reads `stageLayouts[0]` directly upstream, so the context must follow the
+        // new act's layout.
+        if let Some(collision) = self.state.collision.as_mut() {
+            collision.layout = StageLayout::from_scene(&self.state.scene);
+        }
+        self.state.entities.reset_scene();
+        place_scene_entities(&mut self.state.entities, &self.state.scene.entities);
+        Ok(())
+    }
+
     /// Runs one 60 Hz frame.
     ///
     /// Ordering matches `ProcessStage`'s `STAGEMODE_NORMAL`: fade decay, clock, object updates,
     /// camera follow, parallax auto-scroll, then `DrawStageGFX` (which runs `ObjectDraw` events
     /// through the draw lists, interleaved with the tile layers) and the fade rectangle.
+    ///
+    /// A `LoadStage` request queued by an update or draw event is consumed at the start of the
+    /// next frame, exactly like upstream's `STAGEMODE_LOAD` (which resets the frame state, runs
+    /// `LoadStageFiles` and skips that frame's updates and draw).
     pub fn run_frame(&mut self) -> Result<(), EngineError> {
         self.poll_input();
         // `ProcessInput` runs before the frame: any press/hold resets the idle-dimming timer,
@@ -279,6 +538,15 @@ impl Engine {
                 .count()
                 > 1;
         self.state.render.update_dim_timer(input_active, false);
+        if self.state.load_stage_requested {
+            self.apply_deferred_load()?;
+            // The load frame still presents (`FlipScreen`): dimming runs, the frame counter
+            // advances and audio mixes, but no updates or drawing happen.
+            self.state.render.process_dimming();
+            self.state.frame += 1;
+            self.state.audio.tick();
+            return Ok(());
+        }
         if self.state.render.fade_mode > 0 {
             self.state.render.fade_mode -= 1;
         }

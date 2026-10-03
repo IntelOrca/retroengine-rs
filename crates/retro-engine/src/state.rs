@@ -32,6 +32,8 @@ pub const TILE_LAYER_HEIGHT: usize = 0x100;
 pub const PARALLAX_COUNT: usize = 0x100;
 /// `ENGINE_MAINGAME`, the only engine mode modelled by M3.
 pub const ENGINE_MAINGAME: i32 = 1;
+/// `STAGEMODE_NORMAL`: the stage mode `ProcessStage` enters after finishing `STAGEMODE_LOAD`.
+pub const STAGEMODE_NORMAL: i32 = 1;
 /// Number of text menus upstream keeps (`TEXTMENU_COUNT`).
 pub const TEXT_MENU_COUNT: usize = 0x2;
 /// Maximum characters stored per text menu (`TEXTDATA_COUNT`).
@@ -310,7 +312,8 @@ pub struct EngineState {
     pub op_histogram: BTreeMap<String, u64>,
     /// Ops implemented as deterministic stubs, by name.
     pub stub_histogram: BTreeMap<String, u64>,
-    /// Set by `LoadStage`; a real scene switch is deferred to the next milestone.
+    /// Set by `LoadStage`; the runtime applies the scene switch at the start of the next frame,
+    /// mirroring upstream's `stageMode = STAGEMODE_LOAD` handoff.
     pub load_stage_requested: bool,
 }
 

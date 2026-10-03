@@ -17,12 +17,14 @@
 //!   explicit stubs (see [`EngineState::stub_histogram`]); `TouchCollision`, `BoxCollision`,
 //!   `PlatformCollision`, `Get16x16TileInfo`, `Set16x16TileInfo` and `Copy16x16Tile` are fully
 //!   ported.
-//! * `stage.deformationData0..3` live in [`retro_render::RenderState::deform_data`] and are
-//!   written by `SetLayerDeformation`; they feed the tile-layer deformation paths (M4).
+//! * `stage.deformationData0..3` are script-visible views of
+//!   [`retro_render::RenderState::deform_data`]; `SetLayerDeformation` fills them and the tile
+//!   layer renderers sample them.
 //! * The legacy v4 text system (`LoadFontFile`/`LoadTextFile`/`GetTextInfo`/`DrawText`) and the
 //!   title/HUD number and act-name draws are ported for rev00..rev03; the newer menu ops
 //!   (`DrawMenu`, `SetupMenu`, ...) remain stubs.
-//! * `LoadStage` sets a flag instead of switching scenes mid-frame.
+//! * `LoadStage` records a deferred scene-load request; the runtime applies it at the start of
+//!   the next frame, matching `FUNC_LOADSTAGE` + `ProcessStage`'s `STAGEMODE_LOAD`.
 
 use retro_format_v4::{AnimationFile, Hitbox};
 use retro_scene::collision::{
@@ -46,6 +48,10 @@ const VAR_VALUE47: i32 = 120;
 const VAR_STAGE_FIRST: i32 = 121;
 /// Last rev03 stage variable id (`stage.debugMode`).
 const VAR_STAGE_LAST: i32 = 147;
+/// First rev03 deformation table variable (`stage.deformationData0`).
+const VAR_STAGE_DEFORM_FIRST: i32 = 139;
+/// Last rev03 deformation table variable (`stage.deformationData3`).
+const VAR_STAGE_DEFORM_LAST: i32 = 142;
 /// `stage.entityPos`.
 const VAR_STAGE_ENTITY_POS: i32 = 148;
 /// First rev03 screen variable id (`screen.cameraEnabled`).
@@ -398,6 +404,39 @@ impl EngineHost<'_> {
             210 => layer.deformation_offset = value,
             211 => layer.deformation_offset_w = value,
             _ => {}
+        }
+    }
+
+    /// `stage.deformationData0..3` reads: upstream indexes `bgDeformationDataN[arrayVal]`
+    /// (`Script.cpp:3958-3961`).
+    fn read_stage_deform_var(&self, var: i32, array_index: i32) -> i32 {
+        let Ok(index) = usize::try_from(array_index) else {
+            return 0;
+        };
+        let table = usize::try_from(var - VAR_STAGE_DEFORM_FIRST).unwrap_or(0);
+        self.state
+            .render
+            .deform_data
+            .get(table)
+            .and_then(|data| data.get(index))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// `stage.deformationData0..3` writes (`Script.cpp:6128-6131`).
+    fn write_stage_deform_var(&mut self, var: i32, array_index: i32, value: i32) {
+        let Ok(index) = usize::try_from(array_index) else {
+            return;
+        };
+        let table = usize::try_from(var - VAR_STAGE_DEFORM_FIRST).unwrap_or(0);
+        if let Some(slot) = self
+            .state
+            .render
+            .deform_data
+            .get_mut(table)
+            .and_then(|data| data.get_mut(index))
+        {
+            *slot = value;
         }
     }
 
@@ -1187,8 +1226,10 @@ impl ScriptHost for EngineHost<'_> {
                 state.check_result = i32::from(self.state.save.write_save_ram());
             }
             Op::LoadStage => {
+                // `FUNC_LOADSTAGE` only flips the stage mode (`stageMode = STAGEMODE_LOAD`); the
+                // actual teardown/load happens at the start of the next `ProcessStage` call.
+                self.state.record_op("LoadStage");
                 self.state.load_stage_requested = true;
-                self.state.record_stub(stub_name(op));
             }
             Op::GetTextInfo => {
                 self.state.record_op("GetTextInfo");
@@ -1374,6 +1415,8 @@ impl ScriptHost for EngineHost<'_> {
                         .map(|index| entity.values[index])
                 })
                 .unwrap_or(0)
+        } else if (VAR_STAGE_DEFORM_FIRST..=VAR_STAGE_DEFORM_LAST).contains(&var) {
+            self.read_stage_deform_var(var, array_index)
         } else if (VAR_STAGE_FIRST..=VAR_STAGE_LAST).contains(&var) {
             self.state.stage.read(var, array_index).unwrap_or(0)
         } else if var == VAR_STAGE_ENTITY_POS {
@@ -1459,6 +1502,8 @@ impl ScriptHost for EngineHost<'_> {
             {
                 entity.values[index] = value;
             }
+        } else if (VAR_STAGE_DEFORM_FIRST..=VAR_STAGE_DEFORM_LAST).contains(&var) {
+            self.write_stage_deform_var(var, array_index, value);
         } else if (VAR_STAGE_FIRST..=VAR_STAGE_LAST).contains(&var) {
             self.state.stage.write(var, array_index, value);
         } else if (VAR_SCREEN_FIRST..=VAR_SCREEN_LAST).contains(&var) {
@@ -1546,7 +1591,6 @@ fn stub_name(op: Op) -> &'static str {
         Op::SetPaletteEntry => "SetPaletteEntry",
         Op::ReadSaveRAM => "ReadSaveRAM",
         Op::WriteSaveRAM => "WriteSaveRAM",
-        Op::LoadStage => "LoadStage",
         Op::GetTextInfo => "GetTextInfo",
         Op::LoadTextFile => "LoadTextFile",
         Op::LoadFontFile => "LoadFontFile",
@@ -3446,6 +3490,46 @@ mod tests {
         host.engine_op(Op::DrawText, &mut vm_state).unwrap();
         assert_eq!(host.state.render.framebuffer.get(0, 0), 0xF800);
         assert_eq!(host.state.render.framebuffer.get(0, 4), 0xF800);
+    }
+
+    #[test]
+    fn load_stage_op_queues_a_deferred_request() {
+        let mut state = test_state(false);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        host.engine_op(Op::LoadStage, &mut vm_state).unwrap();
+        assert!(host.state.load_stage_requested);
+        assert_eq!(host.state.op_histogram.get("LoadStage"), Some(&1));
+        assert!(
+            !host.state.stub_histogram.contains_key("LoadStage"),
+            "LoadStage is implemented, not a stub"
+        );
+    }
+
+    #[test]
+    fn stage_deformation_data_variables_round_trip() {
+        let mut state = test_state(false);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        // `stage.deformationData0..3` are rev03 variable ids 139..=142 and index the render
+        // state's four deformation tables.
+        for (offset, var) in (139..=142).enumerate() {
+            host.write_engine_var(var, 5, 100 + offset as i32, &mut vm_state)
+                .unwrap();
+            assert_eq!(
+                host.state.render.deform_data[offset][5],
+                100 + offset as i32,
+                "deformationData{offset} write"
+            );
+            assert_eq!(
+                host.read_engine_var(var, 5, &mut vm_state).unwrap(),
+                100 + offset as i32,
+                "deformationData{offset} read"
+            );
+        }
+        // Out-of-range indices are ignored, not panics.
+        host.write_engine_var(139, -1, 7, &mut vm_state).unwrap();
+        assert_eq!(host.read_engine_var(139, -1, &mut vm_state).unwrap(), 0);
     }
 
     #[test]
