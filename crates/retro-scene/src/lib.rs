@@ -31,8 +31,8 @@ pub use collision::{
 pub use entity::EntityStore;
 pub use entity::{
     DRAWLAYER_COUNT, ENTITY_COUNT, ENTITY_SLOT_COUNT, ENTITY_STORAGE_START, Entity,
-    FLOOR_SENSOR_COUNT, OBJECT_COUNT, SCENE_ENTITY_START, TEMPENTITY_START, TYPEGROUP_COUNT,
-    TypeGroupList,
+    FLOOR_SENSOR_COUNT, OBJECT_COUNT, PRIORITY_ALWAYS, SCENE_ENTITY_START, TEMPENTITY_START,
+    TYPEGROUP_COUNT, TypeGroupList,
 };
 pub use math::MathTables;
 pub use objects::{ObjectEntry, ObjectRegistry, strip_spaces};

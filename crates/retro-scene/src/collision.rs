@@ -5,12 +5,12 @@
 //! `BoxCollision`) operate on the [`EntityStore`] slot selected by `objectEntityPos`, return
 //! upstream's `scriptEng.checkResult`, and update the entity exactly like the reference.
 //!
-//! `ProcessObjectMovement` is a documented divergence: the full upstream implementation is
-//! `ProcessAirCollision`/`ProcessPathGrip` plus the hitbox-driven `ProcessTileCollisions`
-//! (~1000 lines). This port performs the same fixed-point integration and a deterministic
-//! three-sensor floor probe using [`SceneCollision::find_floor_position`], but does not
-//! implement path grip, slope/wall pushing, or ceiling movement. It never panics and is fully
-//! deterministic; see the M3 report for the explicit gap list.
+//! `ProcessObjectMovement` is the full upstream implementation: `ProcessTileCollisions`
+//! dispatches to `ProcessAirCollision` or `ProcessPathGrip` based on `gravity`, using the four
+//! moving probes (`FloorCollision`/`LWallCollision`/`RoofCollision`/`RWallCollision`) and the
+//! path-grip `Find*Position` family. Fixed-point arithmetic, sensor stepping, tolerance
+//! constants and flip handling match the reference; signed overflow wraps instead of being
+//! undefined, so the routines never panic.
 
 use serde::Serialize;
 
@@ -559,6 +559,312 @@ impl SceneCollision {
             step += 16;
         }
         sensor
+    }
+
+    /// `FloorCollision`: steps a floor probe down through up to three 16px tiles and snaps it
+    /// onto the first floor surface it crosses. Unlike [`Self::find_floor_position`], the probe
+    /// starts at the sensor position and the surface must be within 14px below (or 17px above)
+    /// the start.
+    fn floor_collision(&self, plane: usize, sensor: &mut CollisionSensor) {
+        let start_y = sensor.ypos >> 16;
+        let mut step = 0;
+        while step < 16 * 3 {
+            if !sensor.collided {
+                let x_pos = sensor.xpos >> 16;
+                let y_pos = (sensor.ypos >> 16).wrapping_sub(16).wrapping_add(step);
+                if x_pos > -1 && y_pos > -1 {
+                    let chunk_y = y_pos >> 7;
+                    let tile_y = (y_pos & 0x7F) >> 4;
+                    let (_layout_chunk, tile, tile_index) = self.object_chunk(x_pos, y_pos);
+                    let flags = Self::tile_flag(&tile, plane);
+                    if flags != SOLID_LRB && flags != SOLID_NONE {
+                        let column = (x_pos & 15) as usize;
+                        match tile.direction {
+                            FLIP_NONE => {
+                                let mask = i32::from(self.floor_height(plane, column, tile_index));
+                                if (y_pos & 15) > mask - 16 + step && mask < 15 {
+                                    sensor.ypos = mask + (chunk_y << 7) + (tile_y << 4);
+                                    sensor.collided = true;
+                                    sensor.angle = (self.angle(plane, tile_index) & 0xFF) as i32;
+                                }
+                            }
+                            FLIP_X => {
+                                let mask = i32::from(self.floor_height(
+                                    plane,
+                                    15 - (x_pos & 15) as usize,
+                                    tile_index,
+                                ));
+                                if (y_pos & 15) > mask - 16 + step && mask < 15 {
+                                    sensor.ypos = mask + (chunk_y << 7) + (tile_y << 4);
+                                    sensor.collided = true;
+                                    sensor.angle =
+                                        0x100 - ((self.angle(plane, tile_index) & 0xFF) as i32);
+                                }
+                            }
+                            FLIP_Y => {
+                                let mask = i32::from(self.roof_height(plane, column, tile_index));
+                                if (y_pos & 15) > 15 - mask - 16 + step {
+                                    sensor.ypos = 15 - mask + (chunk_y << 7) + (tile_y << 4);
+                                    sensor.collided = true;
+                                    let c_angle = ((self.angle(plane, tile_index) & 0xFF00_0000)
+                                        >> 24)
+                                        as i32;
+                                    sensor.angle = 0x180 - c_angle;
+                                }
+                            }
+                            _ => {
+                                let mask = i32::from(self.roof_height(
+                                    plane,
+                                    15 - (x_pos & 15) as usize,
+                                    tile_index,
+                                ));
+                                if (y_pos & 15) > 15 - mask - 16 + step {
+                                    sensor.ypos = 15 - mask + (chunk_y << 7) + (tile_y << 4);
+                                    sensor.collided = true;
+                                    let c_angle = ((self.angle(plane, tile_index) & 0xFF00_0000)
+                                        >> 24)
+                                        as i32;
+                                    sensor.angle = 0x100 - (0x180 - c_angle);
+                                }
+                            }
+                        }
+                    }
+                    if sensor.collided {
+                        if sensor.angle < 0 {
+                            sensor.angle += 0x100;
+                        }
+                        if sensor.angle >= 0x100 {
+                            sensor.angle -= 0x100;
+                        }
+                        if sensor.ypos - start_y > 14 || sensor.ypos - start_y < -17 {
+                            sensor.ypos = start_y.wrapping_shl(16);
+                            sensor.collided = false;
+                        }
+                    }
+                }
+            }
+            step += 16;
+        }
+    }
+
+    /// `LWallCollision`: steps a left-wall probe through up to three 16px tiles and snaps it onto
+    /// the first wall surface it crosses. The sensor angle is left untouched (upstream reads it
+    /// only in `FindLWallPosition`).
+    fn lwall_collision(&self, plane: usize, sensor: &mut CollisionSensor) {
+        let start_x = sensor.xpos >> 16;
+        let mut step = 0;
+        while step < 16 * 3 {
+            if !sensor.collided {
+                let x_pos = (sensor.xpos >> 16).wrapping_sub(16).wrapping_add(step);
+                let y_pos = sensor.ypos >> 16;
+                if x_pos > -1 && y_pos > -1 {
+                    let chunk_x = x_pos >> 7;
+                    let tile_x = (x_pos & 0x7F) >> 4;
+                    let (_layout_chunk, tile, tile_index) = self.object_chunk(x_pos, y_pos);
+                    let flags = Self::tile_flag(&tile, plane);
+                    if flags != SOLID_TOP && flags < SOLID_NONE {
+                        let row = (y_pos & 15) as usize;
+                        match tile.direction {
+                            FLIP_NONE => {
+                                let mask = i32::from(self.left_wall_height(plane, row, tile_index));
+                                if (x_pos & 15) > mask - 16 + step {
+                                    sensor.xpos = mask + (chunk_x << 7) + (tile_x << 4);
+                                    sensor.collided = true;
+                                }
+                            }
+                            FLIP_X => {
+                                let mask =
+                                    i32::from(self.right_wall_height(plane, row, tile_index));
+                                if (x_pos & 15) > 15 - mask - 16 + step {
+                                    sensor.xpos = 15 - mask + (chunk_x << 7) + (tile_x << 4);
+                                    sensor.collided = true;
+                                }
+                            }
+                            FLIP_Y => {
+                                let mask = i32::from(self.left_wall_height(
+                                    plane,
+                                    15 - (y_pos & 15) as usize,
+                                    tile_index,
+                                ));
+                                if (x_pos & 15) > mask - 16 + step {
+                                    sensor.xpos = mask + (chunk_x << 7) + (tile_x << 4);
+                                    sensor.collided = true;
+                                }
+                            }
+                            _ => {
+                                let mask = i32::from(self.right_wall_height(
+                                    plane,
+                                    15 - (y_pos & 15) as usize,
+                                    tile_index,
+                                ));
+                                if (x_pos & 15) > 15 - mask - 16 + step {
+                                    sensor.xpos = 15 - mask + (chunk_x << 7) + (tile_x << 4);
+                                    sensor.collided = true;
+                                }
+                            }
+                        }
+                    }
+                    if sensor.collided
+                        && (sensor.xpos - start_x > 15 || sensor.xpos - start_x < -15)
+                    {
+                        sensor.xpos = start_x.wrapping_shl(16);
+                        sensor.collided = false;
+                    }
+                }
+            }
+            step += 16;
+        }
+    }
+
+    /// `RoofCollision`: steps a roof probe up through up to three 16px tiles and snaps it onto
+    /// the first ceiling surface it crosses (within 14px of the start in either direction).
+    fn roof_collision(&self, plane: usize, sensor: &mut CollisionSensor) {
+        let start_y = sensor.ypos >> 16;
+        let mut step = 0;
+        while step < 16 * 3 {
+            if !sensor.collided {
+                let x_pos = sensor.xpos >> 16;
+                let y_pos = (sensor.ypos >> 16).wrapping_add(16).wrapping_sub(step);
+                if x_pos > -1 && y_pos > -1 {
+                    let chunk_y = y_pos >> 7;
+                    let tile_y = (y_pos & 0x7F) >> 4;
+                    let (_layout_chunk, tile, tile_index) = self.object_chunk(x_pos, y_pos);
+                    let flags = Self::tile_flag(&tile, plane);
+                    if flags != SOLID_TOP && flags < SOLID_NONE {
+                        let column = (x_pos & 15) as usize;
+                        match tile.direction {
+                            FLIP_NONE => {
+                                let mask = i32::from(self.roof_height(plane, column, tile_index));
+                                if (y_pos & 15) < mask + 16 - step {
+                                    sensor.ypos = mask + (chunk_y << 7) + (tile_y << 4);
+                                    sensor.collided = true;
+                                    sensor.angle = ((self.angle(plane, tile_index) & 0xFF00_0000)
+                                        >> 24)
+                                        as i32;
+                                }
+                            }
+                            FLIP_X => {
+                                let mask = i32::from(self.roof_height(
+                                    plane,
+                                    15 - (x_pos & 15) as usize,
+                                    tile_index,
+                                ));
+                                if (y_pos & 15) < mask + 16 - step {
+                                    sensor.ypos = mask + (chunk_y << 7) + (tile_y << 4);
+                                    sensor.collided = true;
+                                    sensor.angle = 0x100
+                                        - ((self.angle(plane, tile_index) & 0xFF00_0000) >> 24)
+                                            as i32;
+                                }
+                            }
+                            FLIP_Y => {
+                                let mask = i32::from(self.floor_height(plane, column, tile_index));
+                                if (y_pos & 15) < 15 - mask + 16 - step {
+                                    sensor.ypos = 15 - mask + (chunk_y << 7) + (tile_y << 4);
+                                    sensor.collided = true;
+                                    sensor.angle =
+                                        0x180 - (self.angle(plane, tile_index) & 0xFF) as i32;
+                                }
+                            }
+                            _ => {
+                                let mask = i32::from(self.floor_height(
+                                    plane,
+                                    15 - (x_pos & 15) as usize,
+                                    tile_index,
+                                ));
+                                if (y_pos & 15) < 15 - mask + 16 - step {
+                                    sensor.ypos = 15 - mask + (chunk_y << 7) + (tile_y << 4);
+                                    sensor.collided = true;
+                                    sensor.angle = 0x100
+                                        - (0x180 - (self.angle(plane, tile_index) & 0xFF) as i32);
+                                }
+                            }
+                        }
+                    }
+                    if sensor.collided {
+                        if sensor.angle < 0 {
+                            sensor.angle += 0x100;
+                        }
+                        if sensor.angle >= 0x100 {
+                            sensor.angle -= 0x100;
+                        }
+                        if sensor.ypos - start_y > 14 || sensor.ypos - start_y < -14 {
+                            sensor.ypos = start_y.wrapping_shl(16);
+                            sensor.collided = false;
+                        }
+                    }
+                }
+            }
+            step += 16;
+        }
+    }
+
+    /// `RWallCollision`: steps a right-wall probe through up to three 16px tiles and snaps it
+    /// onto the first wall surface it crosses. The sensor angle is left untouched.
+    fn rwall_collision(&self, plane: usize, sensor: &mut CollisionSensor) {
+        let start_x = sensor.xpos >> 16;
+        let mut step = 0;
+        while step < 16 * 3 {
+            if !sensor.collided {
+                let x_pos = (sensor.xpos >> 16).wrapping_add(16).wrapping_sub(step);
+                let y_pos = sensor.ypos >> 16;
+                if x_pos > -1 && y_pos > -1 {
+                    let chunk_x = x_pos >> 7;
+                    let tile_x = (x_pos & 0x7F) >> 4;
+                    let (_layout_chunk, tile, tile_index) = self.object_chunk(x_pos, y_pos);
+                    let flags = Self::tile_flag(&tile, plane);
+                    if flags != SOLID_TOP && flags < SOLID_NONE {
+                        let row = (y_pos & 15) as usize;
+                        match tile.direction {
+                            FLIP_NONE => {
+                                let mask =
+                                    i32::from(self.right_wall_height(plane, row, tile_index));
+                                if (x_pos & 15) < mask + 16 - step {
+                                    sensor.xpos = mask + (chunk_x << 7) + (tile_x << 4);
+                                    sensor.collided = true;
+                                }
+                            }
+                            FLIP_X => {
+                                let mask = i32::from(self.left_wall_height(plane, row, tile_index));
+                                if (x_pos & 15) < 15 - mask + 16 - step {
+                                    sensor.xpos = 15 - mask + (chunk_x << 7) + (tile_x << 4);
+                                    sensor.collided = true;
+                                }
+                            }
+                            FLIP_Y => {
+                                let mask = i32::from(self.right_wall_height(
+                                    plane,
+                                    15 - (y_pos & 15) as usize,
+                                    tile_index,
+                                ));
+                                if (x_pos & 15) < mask + 16 - step {
+                                    sensor.xpos = mask + (chunk_x << 7) + (tile_x << 4);
+                                    sensor.collided = true;
+                                }
+                            }
+                            _ => {
+                                let mask = i32::from(self.left_wall_height(
+                                    plane,
+                                    15 - (y_pos & 15) as usize,
+                                    tile_index,
+                                ));
+                                if (x_pos & 15) < 15 - mask + 16 - step {
+                                    sensor.xpos = 15 - mask + (chunk_x << 7) + (tile_x << 4);
+                                    sensor.collided = true;
+                                }
+                            }
+                        }
+                    }
+                    if sensor.collided
+                        && (sensor.xpos - start_x > 15 || sensor.xpos - start_x < -15)
+                    {
+                        sensor.xpos = start_x.wrapping_shl(16);
+                        sensor.collided = false;
+                    }
+                }
+            }
+            step += 16;
+        }
     }
 
     fn in_bounds(&self, x_pos: i32, y_pos: i32) -> bool {
@@ -1600,80 +1906,1065 @@ impl SceneCollision {
         0
     }
 
-    /// Deterministic movement: fixed-point integration plus a three-sensor floor probe.
+    /// `SetPathGripSensors`: places the seven path-grip sensors around `entity` for its current
+    /// collision mode and updates the active hitbox extents (upstream's `collisionLeft` etc.).
     ///
-    /// This is a documented simplification of upstream
-    /// `FUNC_PROCESSOBJECTMOVEMENT`/`ProcessTileCollisions`: path grip, wall pushing and ceiling
-    /// handling are not implemented. Returns whether a floor was found.
-    pub fn process_object_movement(&mut self, store: &mut EntityStore, slot: usize) -> bool {
-        let Some(entity) = store.get(slot) else {
-            return false;
-        };
-        if entity.tile_collisions == 0 {
-            if let Some(entity) = store.get_mut(slot) {
-                entity.xpos = entity.xpos.wrapping_add(entity.xvel);
-                entity.ypos = entity.ypos.wrapping_add(entity.yvel);
-            }
-            return false;
-        }
-        let plane = usize::from(entity.collision_plane);
-        let angle = entity.angle;
-        let speed = entity.speed;
-        let mut tolerance = 15;
-        if speed < 0x60000 {
-            tolerance = if (angle as i8) == 0 { 8 } else { 15 };
-        }
-        self.collision_tolerance = tolerance;
-        let previous = *store.get_or_blank(slot);
-        if let Some(entity) = store.get_mut(slot) {
-            entity.xpos = entity.xpos.wrapping_add(entity.xvel);
-            entity.ypos = entity.ypos.wrapping_add(entity.yvel);
-            entity.floor_sensors = [0; crate::entity::FLOOR_SENSOR_COUNT];
-        }
-        let moving_down = previous.yvel >= 0;
-        let mut on_ground = false;
-        if moving_down {
-            let mut sensed: [CollisionSensor; 3] = [CollisionSensor::default(); 3];
-            for (index, offset) in [-8, 0, 8].into_iter().enumerate() {
-                let x = previous
+    /// Returns `(left, top, right, bottom)` for the mode's hitbox direction, or `None` for an
+    /// unknown collision mode (upstream leaves the globals untouched then).
+    fn set_path_grip_sensors(
+        &self,
+        entity: &Entity,
+        hitbox: &Hitbox,
+        sensors: &mut [CollisionSensor; 7],
+    ) -> Option<(i32, i32, i32, i32)> {
+        match entity.collision_mode {
+            CMODE_FLOOR => {
+                let left = i32::from(hitbox.left[0]);
+                let top = i32::from(hitbox.top[0]);
+                let right = i32::from(hitbox.right[0]);
+                let bottom = i32::from(hitbox.bottom[0]);
+                sensors[0].ypos = sensors[4].ypos.wrapping_add(bottom.wrapping_shl(16));
+                sensors[1].ypos = sensors[0].ypos;
+                sensors[2].ypos = sensors[0].ypos;
+                sensors[3].ypos = sensors[4].ypos.wrapping_add(0x40000);
+                sensors[5].ypos = sensors[0].ypos;
+                sensors[6].ypos = sensors[0].ypos;
+
+                sensors[0].xpos = sensors[4]
                     .xpos
-                    .wrapping_add(offset << 16)
-                    .wrapping_add(previous.xvel);
-                let y = previous
-                    .ypos
-                    .wrapping_add(16 << 16)
-                    .wrapping_add(previous.yvel);
-                // Upstream's `FloorCollision` measures the vertical snap distance against the
-                // probe's own Y (`startY = sensor->ypos >> 16`, `Collision.cpp:399`).
-                let start_y = y >> 16;
-                sensed[index] = self.find_floor_position(
-                    plane,
-                    CollisionSensor::new(x, y, previous.angle),
-                    start_y,
-                );
+                    .wrapping_add((i32::from(hitbox.left[1]) - 1).wrapping_shl(16));
+                sensors[1].xpos = sensors[4].xpos;
+                sensors[2].xpos = sensors[4]
+                    .xpos
+                    .wrapping_add(i32::from(hitbox.right[1]).wrapping_shl(16));
+                sensors[5].xpos = sensors[4]
+                    .xpos
+                    .wrapping_add(i32::from(hitbox.left[1]).wrapping_shl(15));
+                sensors[6].xpos = sensors[4]
+                    .xpos
+                    .wrapping_add(i32::from(hitbox.right[1]).wrapping_shl(15));
+
+                if entity.speed > 0 {
+                    sensors[3].xpos = sensors[4].xpos.wrapping_add((right + 1).wrapping_shl(16));
+                } else {
+                    sensors[3].xpos = sensors[4].xpos.wrapping_add((left - 1).wrapping_shl(16));
+                }
+                Some((left, top, right, bottom))
             }
-            if sensed[1].collided {
-                on_ground = true;
-                if let Some(entity) = store.get_mut(slot) {
-                    entity.ypos = (sensed[1].ypos - 16) << 16;
-                    entity.yvel = 0;
-                    entity.angle = sensed[1].angle;
-                    // Upstream's `ProcessAirCollision` landing branch clears `gravity`
-                    // (`Collision.cpp:874`); the player scripts keep flailing in `Player_State_Air`
-                    // until it is `GRAVITY_GROUND`.
-                    entity.gravity = 0;
-                    entity.rotation = sensed[1].angle << 1;
-                    if sensed[1].angle < 0x20 || sensed[1].angle > 0xE0 {
-                        entity.control_lock = 0;
+            CMODE_LWALL => {
+                let left = i32::from(hitbox.left[2]);
+                let top = i32::from(hitbox.top[2]);
+                let right = i32::from(hitbox.right[2]);
+                let bottom = i32::from(hitbox.bottom[2]);
+                sensors[0].xpos = sensors[4].xpos.wrapping_add(right.wrapping_shl(16));
+                sensors[1].xpos = sensors[0].xpos;
+                sensors[2].xpos = sensors[0].xpos;
+                sensors[3].xpos = sensors[4].xpos.wrapping_add(0x40000);
+                sensors[0].ypos = sensors[4]
+                    .ypos
+                    .wrapping_add((i32::from(hitbox.top[3]) - 1).wrapping_shl(16));
+                sensors[1].ypos = sensors[4].ypos;
+                sensors[2].ypos = sensors[4]
+                    .ypos
+                    .wrapping_add(i32::from(hitbox.bottom[3]).wrapping_shl(16));
+                if entity.speed > 0 {
+                    sensors[3].ypos = sensors[4].ypos.wrapping_add(top.wrapping_shl(16));
+                } else {
+                    sensors[3].ypos = sensors[4].ypos.wrapping_add((bottom - 1).wrapping_shl(16));
+                }
+                Some((left, top, right, bottom))
+            }
+            CMODE_ROOF => {
+                let left = i32::from(hitbox.left[4]);
+                let top = i32::from(hitbox.top[4]);
+                let right = i32::from(hitbox.right[4]);
+                let bottom = i32::from(hitbox.bottom[4]);
+                sensors[0].ypos = sensors[4].ypos.wrapping_add((top - 1).wrapping_shl(16));
+                sensors[1].ypos = sensors[0].ypos;
+                sensors[2].ypos = sensors[0].ypos;
+                sensors[3].ypos = sensors[4].ypos.wrapping_sub(0x40000);
+                sensors[0].xpos = sensors[4]
+                    .xpos
+                    .wrapping_add((i32::from(hitbox.left[5]) - 1).wrapping_shl(16));
+                sensors[1].xpos = sensors[4].xpos;
+                sensors[2].xpos = sensors[4]
+                    .xpos
+                    .wrapping_add(i32::from(hitbox.right[5]).wrapping_shl(16));
+                if entity.speed < 0 {
+                    sensors[3].xpos = sensors[4].xpos.wrapping_add((right + 1).wrapping_shl(16));
+                } else {
+                    sensors[3].xpos = sensors[4].xpos.wrapping_add((left - 1).wrapping_shl(16));
+                }
+                Some((left, top, right, bottom))
+            }
+            CMODE_RWALL => {
+                let left = i32::from(hitbox.left[6]);
+                let top = i32::from(hitbox.top[6]);
+                let right = i32::from(hitbox.right[6]);
+                let bottom = i32::from(hitbox.bottom[6]);
+                sensors[0].xpos = sensors[4].xpos.wrapping_add((left - 1).wrapping_shl(16));
+                sensors[1].xpos = sensors[0].xpos;
+                sensors[2].xpos = sensors[0].xpos;
+                sensors[3].xpos = sensors[4].xpos.wrapping_sub(0x40000);
+                sensors[0].ypos = sensors[4]
+                    .ypos
+                    .wrapping_add((i32::from(hitbox.top[7]) - 1).wrapping_shl(16));
+                sensors[1].ypos = sensors[4].ypos;
+                sensors[2].ypos = sensors[4]
+                    .ypos
+                    .wrapping_add(i32::from(hitbox.bottom[7]).wrapping_shl(16));
+                if entity.speed > 0 {
+                    sensors[3].ypos = sensors[4].ypos.wrapping_add(bottom.wrapping_shl(16));
+                } else {
+                    sensors[3].ypos = sensors[4].ypos.wrapping_add((top - 1).wrapping_shl(16));
+                }
+                Some((left, top, right, bottom))
+            }
+            _ => None,
+        }
+    }
+
+    /// `ProcessAirCollision`: sub-stepped collision for entities with `gravity == 1`.
+    ///
+    /// Returns upstream's `checkResult`: `1` on floor contact, `2` on ceiling contact, `0`
+    /// otherwise.
+    fn process_air_collision(&self, store: &mut EntityStore, slot: usize, hitbox: &Hitbox) -> i32 {
+        let mut entity = *store.get_or_blank(slot);
+        let plane = usize::from(entity.collision_plane);
+        let collision_left = i32::from(hitbox.left[0]);
+        let collision_top = i32::from(hitbox.top[0]);
+        let collision_right = i32::from(hitbox.right[0]);
+        let collision_bottom = i32::from(hitbox.bottom[0]);
+
+        let mut moving_down: u8 = 0;
+        let mut moving_up: u8 = 0;
+        let mut moving_left: u8 = 0;
+        let mut moving_right: u8 = 0;
+        let mut sensors = [CollisionSensor::default(); 7];
+
+        if entity.xvel >= 0 {
+            moving_right = 1;
+            sensors[0].ypos = entity.ypos.wrapping_add(0x40000);
+            sensors[0].collided = false;
+            sensors[0].xpos = entity.xpos.wrapping_add(collision_right.wrapping_shl(16));
+        }
+        if entity.xvel <= 0 {
+            moving_left = 1;
+            sensors[1].ypos = entity.ypos.wrapping_add(0x40000);
+            sensors[1].collided = false;
+            sensors[1].xpos = entity
+                .xpos
+                .wrapping_add((collision_left - 1).wrapping_shl(16));
+        }
+        sensors[2].xpos = entity
+            .xpos
+            .wrapping_add(i32::from(hitbox.left[1]).wrapping_shl(16));
+        sensors[3].xpos = entity
+            .xpos
+            .wrapping_add(i32::from(hitbox.right[1]).wrapping_shl(16));
+        sensors[2].collided = false;
+        sensors[3].collided = false;
+        sensors[4].xpos = sensors[2].xpos;
+        sensors[5].xpos = sensors[3].xpos;
+        sensors[4].collided = false;
+        sensors[5].collided = false;
+        if entity.yvel >= 0 {
+            moving_down = 1;
+            sensors[2].ypos = entity.ypos.wrapping_add(collision_bottom.wrapping_shl(16));
+            sensors[3].ypos = entity.ypos.wrapping_add(collision_bottom.wrapping_shl(16));
+        }
+
+        if entity.xvel.wrapping_abs() > 0x10000 || entity.yvel < 0 {
+            moving_up = 1;
+            sensors[4].ypos = entity
+                .ypos
+                .wrapping_add((collision_top - 1).wrapping_shl(16));
+            sensors[5].ypos = entity
+                .ypos
+                .wrapping_add((collision_top - 1).wrapping_shl(16));
+        }
+
+        let mut cnt = if entity.xvel.wrapping_abs() <= entity.yvel.wrapping_abs() {
+            (entity.yvel.wrapping_abs() >> 19) + 1
+        } else {
+            (entity.xvel.wrapping_abs() >> 19) + 1
+        };
+        let mut xvel = entity.xvel / cnt;
+        let mut yvel = entity.yvel / cnt;
+        let mut xvel2 = entity.xvel.wrapping_sub(xvel.wrapping_mul(cnt - 1));
+        let yvel2 = entity.yvel.wrapping_sub(yvel.wrapping_mul(cnt - 1));
+        let mut check_result = 0;
+
+        while cnt > 0 {
+            if cnt < 2 {
+                xvel = xvel2;
+                yvel = yvel2;
+            }
+            cnt -= 1;
+
+            if moving_right == 1 {
+                sensors[0].xpos = sensors[0].xpos.wrapping_add(xvel);
+                sensors[0].ypos = sensors[0].ypos.wrapping_add(yvel);
+                self.lwall_collision(plane, &mut sensors[0]);
+                if sensors[0].collided {
+                    moving_right = 2;
+                } else if entity.xvel < 0x20000 {
+                    sensors[0].ypos = sensors[0].ypos.wrapping_sub(0x80000);
+                    self.lwall_collision(plane, &mut sensors[0]);
+                    if sensors[0].collided {
+                        moving_right = 2;
                     }
-                    entity.floor_sensors[0] = u8::from(sensed[0].collided);
-                    entity.floor_sensors[1] = 1;
-                    entity.floor_sensors[2] = u8::from(sensed[2].collided);
+                    sensors[0].ypos = sensors[0].ypos.wrapping_add(0x80000);
+                }
+            }
+
+            if moving_left == 1 {
+                sensors[1].xpos = sensors[1].xpos.wrapping_add(xvel);
+                sensors[1].ypos = sensors[1].ypos.wrapping_add(yvel);
+                self.rwall_collision(plane, &mut sensors[1]);
+                if sensors[1].collided {
+                    moving_left = 2;
+                } else if entity.xvel > -0x20000 {
+                    sensors[1].ypos = sensors[1].ypos.wrapping_sub(0x80000);
+                    self.rwall_collision(plane, &mut sensors[1]);
+                    if sensors[1].collided {
+                        moving_left = 2;
+                    }
+                    sensors[1].ypos = sensors[1].ypos.wrapping_add(0x80000);
+                }
+            }
+
+            if moving_right == 2 {
+                entity.xvel = 0;
+                entity.speed = 0;
+                entity.xpos = sensors[0]
+                    .xpos
+                    .wrapping_sub(collision_right)
+                    .wrapping_shl(16);
+                sensors[2].xpos = entity
+                    .xpos
+                    .wrapping_add((collision_left + 1).wrapping_shl(16));
+                sensors[3].xpos = entity
+                    .xpos
+                    .wrapping_add((collision_right - 2).wrapping_shl(16));
+                sensors[4].xpos = sensors[2].xpos;
+                sensors[5].xpos = sensors[3].xpos;
+                xvel = 0;
+                xvel2 = 0;
+                moving_right = 3;
+            }
+
+            if moving_left == 2 {
+                entity.xvel = 0;
+                entity.speed = 0;
+                entity.xpos = (sensors[1].xpos.wrapping_sub(collision_left) + 1).wrapping_shl(16);
+                sensors[2].xpos = entity
+                    .xpos
+                    .wrapping_add((collision_left + 1).wrapping_shl(16));
+                sensors[3].xpos = entity
+                    .xpos
+                    .wrapping_add((collision_right - 2).wrapping_shl(16));
+                sensors[4].xpos = sensors[2].xpos;
+                sensors[5].xpos = sensors[3].xpos;
+                xvel = 0;
+                xvel2 = 0;
+                moving_left = 3;
+            }
+
+            if moving_down == 1 {
+                for sensor in &mut sensors[2..4] {
+                    if !sensor.collided {
+                        sensor.xpos = sensor.xpos.wrapping_add(xvel);
+                        sensor.ypos = sensor.ypos.wrapping_add(yvel);
+                        self.floor_collision(plane, sensor);
+                    }
+                }
+                if sensors[2].collided || sensors[3].collided {
+                    moving_down = 2;
+                    cnt = 0;
+                }
+            }
+
+            if moving_up == 1 {
+                for sensor in &mut sensors[4..6] {
+                    if !sensor.collided {
+                        sensor.xpos = sensor.xpos.wrapping_add(xvel);
+                        sensor.ypos = sensor.ypos.wrapping_add(yvel);
+                        self.roof_collision(plane, sensor);
+                    }
+                }
+                if sensors[4].collided || sensors[5].collided {
+                    moving_up = 2;
+                    cnt = 0;
                 }
             }
         }
-        on_ground
+
+        if moving_right < 2 && moving_left < 2 {
+            entity.xpos = entity.xpos.wrapping_add(entity.xvel);
+        }
+
+        if moving_up < 2 && moving_down < 2 {
+            entity.ypos = entity.ypos.wrapping_add(entity.yvel);
+            if let Some(target) = store.get_mut(slot) {
+                *target = entity;
+            }
+            return 0;
+        }
+
+        if moving_down == 2 {
+            entity.gravity = 0;
+            if sensors[2].collided && sensors[3].collided {
+                if sensors[2].ypos >= sensors[3].ypos {
+                    entity.ypos = sensors[3]
+                        .ypos
+                        .wrapping_sub(collision_bottom)
+                        .wrapping_shl(16);
+                    entity.angle = sensors[3].angle;
+                } else {
+                    entity.ypos = sensors[2]
+                        .ypos
+                        .wrapping_sub(collision_bottom)
+                        .wrapping_shl(16);
+                    entity.angle = sensors[2].angle;
+                }
+            } else if sensors[2].collided {
+                entity.ypos = sensors[2]
+                    .ypos
+                    .wrapping_sub(collision_bottom)
+                    .wrapping_shl(16);
+                entity.angle = sensors[2].angle;
+            } else if sensors[3].collided {
+                entity.ypos = sensors[3]
+                    .ypos
+                    .wrapping_sub(collision_bottom)
+                    .wrapping_shl(16);
+                entity.angle = sensors[3].angle;
+            }
+            if entity.angle > 0xA0 && entity.angle < 0xE0 && entity.collision_mode != CMODE_LWALL {
+                entity.collision_mode = CMODE_LWALL;
+                entity.xpos = entity.xpos.wrapping_sub(0x40000);
+            }
+            if entity.angle > 0x20 && entity.angle < 0x60 && entity.collision_mode != CMODE_RWALL {
+                entity.collision_mode = CMODE_RWALL;
+                entity.xpos = entity.xpos.wrapping_add(0x40000);
+            }
+            if entity.angle < 0x20 || entity.angle > 0xE0 {
+                entity.control_lock = 0;
+            }
+            entity.rotation = entity.angle.wrapping_shl(1);
+
+            let mut speed;
+            if entity.down != 0 {
+                if entity.angle < 128 {
+                    if entity.angle < 16 {
+                        speed = entity.xvel;
+                    } else if entity.angle >= 32 {
+                        speed = if entity.xvel.wrapping_abs() <= entity.yvel.wrapping_abs() {
+                            entity.yvel.wrapping_add(entity.yvel / 12)
+                        } else {
+                            entity.xvel
+                        };
+                    } else {
+                        speed = if entity.xvel.wrapping_abs() <= (entity.yvel >> 1).wrapping_abs() {
+                            (entity.yvel.wrapping_add(entity.yvel / 12)) >> 1
+                        } else {
+                            entity.xvel
+                        };
+                    }
+                } else if entity.angle > 240 {
+                    speed = entity.xvel;
+                } else if entity.angle <= 224 {
+                    speed = if entity.xvel.wrapping_abs() <= entity.yvel.wrapping_abs() {
+                        -(entity.yvel.wrapping_add(entity.yvel / 12))
+                    } else {
+                        entity.xvel
+                    };
+                } else {
+                    speed = if entity.xvel.wrapping_abs() <= (entity.yvel >> 1).wrapping_abs() {
+                        -((entity.yvel.wrapping_add(entity.yvel / 12)) >> 1)
+                    } else {
+                        entity.xvel
+                    };
+                }
+            } else if entity.angle < 0x80 {
+                if entity.angle < 0x10 {
+                    speed = entity.xvel;
+                } else if entity.angle >= 0x20 {
+                    speed = if entity.xvel.wrapping_abs() <= entity.yvel.wrapping_abs() {
+                        entity.yvel
+                    } else {
+                        entity.xvel
+                    };
+                } else {
+                    speed = if entity.xvel.wrapping_abs() <= (entity.yvel >> 1).wrapping_abs() {
+                        entity.yvel >> 1
+                    } else {
+                        entity.xvel
+                    };
+                }
+            } else if entity.angle > 0xF0 {
+                speed = entity.xvel;
+            } else if entity.angle <= 0xE0 {
+                speed = if entity.xvel.wrapping_abs() <= entity.yvel.wrapping_abs() {
+                    -entity.yvel
+                } else {
+                    entity.xvel
+                };
+            } else {
+                speed = if entity.xvel.wrapping_abs() <= (entity.yvel >> 1).wrapping_abs() {
+                    -(entity.yvel >> 1)
+                } else {
+                    entity.xvel
+                };
+            }
+
+            speed = speed.clamp(-0x180000, 0x180000);
+            entity.speed = speed;
+            entity.yvel = 0;
+            check_result = 1;
+        }
+
+        if moving_up == 2 {
+            let mut sensor_angle = 0;
+            if sensors[4].collided && sensors[5].collided {
+                if sensors[4].ypos <= sensors[5].ypos {
+                    entity.ypos =
+                        (sensors[5].ypos.wrapping_sub(collision_top) + 1).wrapping_shl(16);
+                    sensor_angle = sensors[5].angle;
+                } else {
+                    entity.ypos =
+                        (sensors[4].ypos.wrapping_sub(collision_top) + 1).wrapping_shl(16);
+                    sensor_angle = sensors[4].angle;
+                }
+            } else if sensors[4].collided {
+                entity.ypos = (sensors[4].ypos.wrapping_sub(collision_top) + 1).wrapping_shl(16);
+                sensor_angle = sensors[4].angle;
+            } else if sensors[5].collided {
+                entity.ypos = (sensors[5].ypos.wrapping_sub(collision_top) + 1).wrapping_shl(16);
+                sensor_angle = sensors[5].angle;
+            }
+            sensor_angle &= 0xFF;
+
+            let angle = retro_core::math::arc_tan(entity.xvel, entity.yvel);
+            if sensor_angle > 0x40 && sensor_angle < 0x62 && angle > 0xA0 && angle < 0xC2 {
+                entity.gravity = 0;
+                entity.angle = sensor_angle;
+                entity.rotation = entity.angle.wrapping_shl(1);
+                entity.collision_mode = CMODE_RWALL;
+                entity.xpos = entity.xpos.wrapping_add(0x40000);
+                entity.ypos = entity.ypos.wrapping_sub(0x20000);
+                if entity.angle <= 0x60 {
+                    entity.speed = entity.yvel;
+                } else {
+                    entity.speed = entity.yvel >> 1;
+                }
+            }
+            if sensor_angle > 0x9E && sensor_angle < 0xC0 && angle > 0xBE && angle < 0xE0 {
+                entity.gravity = 0;
+                entity.angle = sensor_angle;
+                entity.rotation = entity.angle.wrapping_shl(1);
+                entity.collision_mode = CMODE_LWALL;
+                entity.xpos = entity.xpos.wrapping_sub(0x40000);
+                entity.ypos = entity.ypos.wrapping_sub(0x20000);
+                if entity.angle >= 0xA0 {
+                    entity.speed = -entity.yvel;
+                } else {
+                    entity.speed = -entity.yvel >> 1;
+                }
+            }
+            if entity.yvel < 0 {
+                entity.yvel = 0;
+            }
+            check_result = 2;
+        }
+
+        if let Some(target) = store.get_mut(slot) {
+            *target = entity;
+        }
+        check_result
     }
+
+    /// `ProcessPathGrip`: ground movement along slopes, walls and ceilings (`gravity != 1`).
+    fn process_path_grip(&self, store: &mut EntityStore, slot: usize, hitbox: &Hitbox) {
+        let mut entity = *store.get_or_blank(slot);
+        let plane = usize::from(entity.collision_plane);
+        let mut sensors = [CollisionSensor::default(); 7];
+        sensors[4].xpos = entity.xpos;
+        sensors[4].ypos = entity.ypos;
+        for sensor in sensors.iter_mut() {
+            sensor.angle = entity.angle;
+            sensor.collided = false;
+        }
+        let (mut collision_left, mut collision_top, mut collision_right, mut collision_bottom) =
+            self.set_path_grip_sensors(&entity, hitbox, &mut sensors)
+                .unwrap_or((0, 0, 0, 0));
+        let mut abs_speed = entity.speed.wrapping_abs();
+        let mut check_dist = abs_speed >> 18;
+        abs_speed &= 0x3FFFF;
+        let c_mode = entity.collision_mode;
+
+        while check_dist > -1 {
+            let (mut cos_value, mut sin_value);
+            if check_dist >= 1 {
+                cos_value = cos256(entity.angle).wrapping_shl(10);
+                sin_value = sin256(entity.angle).wrapping_shl(10);
+                check_dist -= 1;
+            } else {
+                cos_value = abs_speed.wrapping_mul(cos256(entity.angle)) >> 8;
+                sin_value = abs_speed.wrapping_mul(sin256(entity.angle)) >> 8;
+                check_dist = -1;
+            }
+            if entity.speed < 0 {
+                cos_value = -cos_value;
+                sin_value = -sin_value;
+            }
+
+            sensors[0].collided = false;
+            sensors[1].collided = false;
+            sensors[2].collided = false;
+            sensors[5].collided = false;
+            sensors[6].collided = false;
+            sensors[4].xpos = sensors[4].xpos.wrapping_add(cos_value);
+            sensors[4].ypos = sensors[4].ypos.wrapping_add(sin_value);
+            let mut tile_distance: i32 = -1;
+
+            match entity.collision_mode {
+                CMODE_FLOOR => {
+                    sensors[3].xpos = sensors[3].xpos.wrapping_add(cos_value);
+                    sensors[3].ypos = sensors[3].ypos.wrapping_add(sin_value);
+
+                    if entity.speed > 0 {
+                        self.lwall_collision(plane, &mut sensors[3]);
+                        if sensors[3].collided {
+                            sensors[2].xpos = sensors[3].xpos.wrapping_sub(2).wrapping_shl(16);
+                        }
+                    }
+                    if entity.speed < 0 {
+                        self.rwall_collision(plane, &mut sensors[3]);
+                        if sensors[3].collided {
+                            sensors[0].xpos = sensors[3].xpos.wrapping_add(2).wrapping_shl(16);
+                        }
+                    }
+                    if sensors[3].collided {
+                        cos_value = 0;
+                        check_dist = -1;
+                    }
+
+                    for sensor in &mut sensors[..3] {
+                        sensor.xpos = sensor.xpos.wrapping_add(cos_value);
+                        sensor.ypos = sensor.ypos.wrapping_add(sin_value);
+                        let start_y = sensor.ypos >> 16;
+                        *sensor = self.find_floor_position(plane, *sensor, start_y);
+                    }
+                    for sensor in &mut sensors[5..7] {
+                        sensor.xpos = sensor.xpos.wrapping_add(cos_value);
+                        sensor.ypos = sensor.ypos.wrapping_add(sin_value);
+                        let start_y = sensor.ypos >> 16;
+                        *sensor = self.find_floor_position(plane, *sensor, start_y);
+                    }
+
+                    for index in 0..3 {
+                        if tile_distance > -1 {
+                            if sensors[index].collided {
+                                let current = sensors[tile_distance as usize];
+                                if sensors[index].ypos < current.ypos {
+                                    tile_distance = index as i32;
+                                }
+                                if sensors[index].ypos == current.ypos
+                                    && (sensors[index].angle < 0x08 || sensors[index].angle > 0xF8)
+                                {
+                                    tile_distance = index as i32;
+                                }
+                            }
+                        } else if sensors[index].collided {
+                            tile_distance = index as i32;
+                        }
+                    }
+
+                    if tile_distance <= -1 {
+                        check_dist = -1;
+                    } else {
+                        let chosen = sensors[tile_distance as usize];
+                        sensors[0].ypos = chosen.ypos.wrapping_shl(16);
+                        sensors[0].angle = chosen.angle;
+                        sensors[1].ypos = sensors[0].ypos;
+                        sensors[1].angle = sensors[0].angle;
+                        sensors[2].ypos = sensors[0].ypos;
+                        sensors[2].angle = sensors[0].angle;
+                        sensors[3].ypos = sensors[0].ypos.wrapping_sub(0x40000);
+                        sensors[3].angle = sensors[0].angle;
+                        sensors[4].xpos = sensors[1].xpos;
+                        sensors[4].ypos = sensors[0]
+                            .ypos
+                            .wrapping_sub(collision_bottom.wrapping_shl(16));
+                    }
+
+                    if sensors[0].angle < 0xDE && sensors[0].angle > 0x80 {
+                        entity.collision_mode = CMODE_LWALL;
+                    }
+                    if sensors[0].angle > 0x22 && sensors[0].angle < 0x80 {
+                        entity.collision_mode = CMODE_RWALL;
+                    }
+                }
+                CMODE_LWALL => {
+                    sensors[3].xpos = sensors[3].xpos.wrapping_add(cos_value);
+                    sensors[3].ypos = sensors[3].ypos.wrapping_add(sin_value);
+
+                    if entity.speed > 0 {
+                        self.roof_collision(plane, &mut sensors[3]);
+                    }
+                    if entity.speed < 0 {
+                        self.floor_collision(plane, &mut sensors[3]);
+                    }
+                    if sensors[3].collided {
+                        sin_value = 0;
+                        check_dist = -1;
+                    }
+
+                    for sensor in &mut sensors[..3] {
+                        sensor.xpos = sensor.xpos.wrapping_add(cos_value);
+                        sensor.ypos = sensor.ypos.wrapping_add(sin_value);
+                        let start_x = sensor.xpos >> 16;
+                        *sensor = self.find_lwall_position(plane, *sensor, start_x);
+                    }
+
+                    for index in 0..3 {
+                        if tile_distance > -1 {
+                            if sensors[index].xpos < sensors[tile_distance as usize].xpos
+                                && sensors[index].collided
+                            {
+                                tile_distance = index as i32;
+                            }
+                        } else if sensors[index].collided {
+                            tile_distance = index as i32;
+                        }
+                    }
+
+                    if tile_distance <= -1 {
+                        check_dist = -1;
+                    } else {
+                        let chosen = sensors[tile_distance as usize];
+                        sensors[0].xpos = chosen.xpos.wrapping_shl(16);
+                        sensors[0].angle = chosen.angle;
+                        sensors[1].xpos = sensors[0].xpos;
+                        sensors[1].angle = sensors[0].angle;
+                        sensors[2].xpos = sensors[0].xpos;
+                        sensors[2].angle = sensors[0].angle;
+                        sensors[4].ypos = sensors[1].ypos;
+                        sensors[4].xpos = sensors[1]
+                            .xpos
+                            .wrapping_sub(collision_right.wrapping_shl(16));
+                    }
+
+                    if sensors[0].angle > 0xE2 {
+                        entity.collision_mode = CMODE_FLOOR;
+                    }
+                    if sensors[0].angle < 0x9E {
+                        entity.collision_mode = CMODE_ROOF;
+                    }
+                }
+                CMODE_ROOF => {
+                    sensors[3].xpos = sensors[3].xpos.wrapping_add(cos_value);
+                    sensors[3].ypos = sensors[3].ypos.wrapping_add(sin_value);
+
+                    if entity.speed > 0 {
+                        self.rwall_collision(plane, &mut sensors[3]);
+                    }
+                    if entity.speed < 0 {
+                        self.lwall_collision(plane, &mut sensors[3]);
+                    }
+                    if sensors[3].collided {
+                        cos_value = 0;
+                        check_dist = -1;
+                    }
+
+                    for sensor in &mut sensors[..3] {
+                        sensor.xpos = sensor.xpos.wrapping_add(cos_value);
+                        sensor.ypos = sensor.ypos.wrapping_add(sin_value);
+                        let start_y = sensor.ypos >> 16;
+                        *sensor = self.find_roof_position(plane, *sensor, start_y);
+                    }
+
+                    for index in 0..3 {
+                        if tile_distance > -1 {
+                            if sensors[index].ypos > sensors[tile_distance as usize].ypos
+                                && sensors[index].collided
+                            {
+                                tile_distance = index as i32;
+                            }
+                        } else if sensors[index].collided {
+                            tile_distance = index as i32;
+                        }
+                    }
+
+                    if tile_distance <= -1 {
+                        check_dist = -1;
+                    } else {
+                        let chosen = sensors[tile_distance as usize];
+                        sensors[0].ypos = chosen.ypos.wrapping_shl(16);
+                        sensors[0].angle = chosen.angle;
+                        sensors[1].ypos = sensors[0].ypos;
+                        sensors[1].angle = sensors[0].angle;
+                        sensors[2].ypos = sensors[0].ypos;
+                        sensors[2].angle = sensors[0].angle;
+                        sensors[3].ypos = sensors[0].ypos.wrapping_add(0x40000);
+                        sensors[3].angle = sensors[0].angle;
+                        sensors[4].xpos = sensors[1].xpos;
+                        sensors[4].ypos = sensors[0]
+                            .ypos
+                            .wrapping_sub((collision_top - 1).wrapping_shl(16));
+                    }
+
+                    if sensors[0].angle > 0xA2 {
+                        entity.collision_mode = CMODE_LWALL;
+                    }
+                    if sensors[0].angle < 0x5E {
+                        entity.collision_mode = CMODE_RWALL;
+                    }
+                }
+                CMODE_RWALL => {
+                    sensors[3].xpos = sensors[3].xpos.wrapping_add(cos_value);
+                    sensors[3].ypos = sensors[3].ypos.wrapping_add(sin_value);
+
+                    if entity.speed > 0 {
+                        self.floor_collision(plane, &mut sensors[3]);
+                    }
+                    if entity.speed < 0 {
+                        self.roof_collision(plane, &mut sensors[3]);
+                    }
+                    if sensors[3].collided {
+                        sin_value = 0;
+                        check_dist = -1;
+                    }
+
+                    for sensor in &mut sensors[..3] {
+                        sensor.xpos = sensor.xpos.wrapping_add(cos_value);
+                        sensor.ypos = sensor.ypos.wrapping_add(sin_value);
+                        let start_x = sensor.xpos >> 16;
+                        *sensor = self.find_rwall_position(plane, *sensor, start_x);
+                    }
+
+                    for index in 0..3 {
+                        if tile_distance > -1 {
+                            if sensors[index].xpos > sensors[tile_distance as usize].xpos
+                                && sensors[index].collided
+                            {
+                                tile_distance = index as i32;
+                            }
+                        } else if sensors[index].collided {
+                            tile_distance = index as i32;
+                        }
+                    }
+
+                    if tile_distance <= -1 {
+                        check_dist = -1;
+                    } else {
+                        let chosen = sensors[tile_distance as usize];
+                        sensors[0].xpos = chosen.xpos.wrapping_shl(16);
+                        sensors[0].angle = chosen.angle;
+                        sensors[1].xpos = sensors[0].xpos;
+                        sensors[1].angle = sensors[0].angle;
+                        sensors[2].xpos = sensors[0].xpos;
+                        sensors[2].angle = sensors[0].angle;
+                        sensors[4].ypos = sensors[1].ypos;
+                        sensors[4].xpos = sensors[1]
+                            .xpos
+                            .wrapping_sub((collision_left - 1).wrapping_shl(16));
+                    }
+
+                    if sensors[0].angle < 0x1E {
+                        entity.collision_mode = CMODE_FLOOR;
+                    }
+                    if sensors[0].angle > 0x62 {
+                        entity.collision_mode = CMODE_ROOF;
+                    }
+                }
+                _ => {}
+            }
+
+            if tile_distance != -1 {
+                entity.angle = sensors[0].angle;
+            }
+            if !sensors[3].collided {
+                if let Some(extents) = self.set_path_grip_sensors(&entity, hitbox, &mut sensors) {
+                    collision_left = extents.0;
+                    collision_top = extents.1;
+                    collision_right = extents.2;
+                    collision_bottom = extents.3;
+                }
+            } else {
+                check_dist = -2;
+            }
+        }
+
+        match c_mode {
+            CMODE_FLOOR => {
+                if sensors[0].collided || sensors[1].collided || sensors[2].collided {
+                    entity.angle = sensors[0].angle;
+                    entity.rotation = entity.angle.wrapping_shl(1);
+                    entity.floor_sensors[0] = u8::from(sensors[0].collided);
+                    entity.floor_sensors[1] = u8::from(sensors[1].collided);
+                    entity.floor_sensors[2] = u8::from(sensors[2].collided);
+                    entity.floor_sensors[3] = u8::from(sensors[5].collided);
+                    entity.floor_sensors[4] = u8::from(sensors[6].collided);
+
+                    if !sensors[3].collided {
+                        entity.pushing = 0;
+                        entity.xpos = sensors[4].xpos;
+                    } else {
+                        if entity.speed > 0 {
+                            entity.xpos = sensors[3]
+                                .xpos
+                                .wrapping_sub(collision_right)
+                                .wrapping_shl(16);
+                        }
+                        if entity.speed < 0 {
+                            entity.xpos =
+                                (sensors[3].xpos.wrapping_sub(collision_left) + 1).wrapping_shl(16);
+                        }
+                        entity.speed = 0;
+                        if (entity.left != 0 || entity.right != 0) && entity.pushing < 2 {
+                            entity.pushing = entity.pushing.wrapping_add(1);
+                        }
+                    }
+                    entity.ypos = sensors[4].ypos;
+                } else {
+                    entity.gravity = 1;
+                    entity.collision_mode = CMODE_FLOOR;
+                    entity.xvel = cos256(entity.angle).wrapping_mul(entity.speed) >> 8;
+                    entity.yvel = sin256(entity.angle).wrapping_mul(entity.speed) >> 8;
+                    entity.yvel = entity.yvel.clamp(-0x100000, 0x100000);
+                    entity.speed = entity.xvel;
+                    entity.angle = 0;
+                    if !sensors[3].collided {
+                        entity.pushing = 0;
+                        entity.xpos = entity.xpos.wrapping_add(entity.xvel);
+                    } else {
+                        if entity.speed > 0 {
+                            entity.xpos = sensors[3]
+                                .xpos
+                                .wrapping_sub(collision_right)
+                                .wrapping_shl(16);
+                        }
+                        if entity.speed < 0 {
+                            entity.xpos =
+                                (sensors[3].xpos.wrapping_sub(collision_left) + 1).wrapping_shl(16);
+                        }
+                        entity.speed = 0;
+                        if (entity.left != 0 || entity.right != 0) && entity.pushing < 2 {
+                            entity.pushing = entity.pushing.wrapping_add(1);
+                        }
+                    }
+                    entity.ypos = entity.ypos.wrapping_add(entity.yvel);
+                }
+            }
+            CMODE_LWALL => {
+                if !sensors[0].collided && !sensors[1].collided && !sensors[2].collided {
+                    entity.gravity = 1;
+                    entity.collision_mode = CMODE_FLOOR;
+                    entity.xvel = cos256(entity.angle).wrapping_mul(entity.speed) >> 8;
+                    entity.yvel = sin256(entity.angle).wrapping_mul(entity.speed) >> 8;
+                    entity.yvel = entity.yvel.clamp(-0x100000, 0x100000);
+                    entity.speed = entity.xvel;
+                    entity.angle = 0;
+                } else if entity.speed >= 0x28000
+                    || entity.speed <= -0x28000
+                    || entity.control_lock != 0
+                {
+                    entity.angle = sensors[0].angle;
+                    entity.rotation = entity.angle.wrapping_shl(1);
+                } else {
+                    entity.gravity = 1;
+                    entity.angle = 0;
+                    entity.collision_mode = CMODE_FLOOR;
+                    entity.speed = entity.xvel;
+                    entity.control_lock = 30;
+                }
+                if !sensors[3].collided {
+                    entity.ypos = sensors[4].ypos;
+                } else {
+                    if entity.speed > 0 {
+                        entity.ypos = sensors[3].ypos.wrapping_sub(collision_top).wrapping_shl(16);
+                    }
+                    if entity.speed < 0 {
+                        entity.ypos = sensors[3]
+                            .ypos
+                            .wrapping_sub(collision_bottom)
+                            .wrapping_shl(16);
+                    }
+                    entity.speed = 0;
+                }
+                entity.xpos = sensors[4].xpos;
+            }
+            CMODE_ROOF => {
+                if !sensors[0].collided && !sensors[1].collided && !sensors[2].collided {
+                    entity.gravity = 1;
+                    entity.collision_mode = CMODE_FLOOR;
+                    entity.xvel = cos256(entity.angle).wrapping_mul(entity.speed) >> 8;
+                    entity.yvel = sin256(entity.angle).wrapping_mul(entity.speed) >> 8;
+                    entity.floor_sensors[0] = 0;
+                    entity.floor_sensors[1] = 0;
+                    entity.floor_sensors[2] = 0;
+                    entity.yvel = entity.yvel.clamp(-0x100000, 0x100000);
+                    entity.angle = 0;
+                    entity.speed = entity.xvel;
+                    if !sensors[3].collided {
+                        entity.xpos = entity.xpos.wrapping_add(entity.xvel);
+                    } else {
+                        if entity.speed > 0 {
+                            entity.xpos = sensors[3]
+                                .xpos
+                                .wrapping_sub(collision_right)
+                                .wrapping_shl(16);
+                        }
+                        if entity.speed < 0 {
+                            entity.xpos =
+                                (sensors[3].xpos.wrapping_sub(collision_left) + 1).wrapping_shl(16);
+                        }
+                        entity.speed = 0;
+                    }
+                } else if entity.speed <= -0x28000 || entity.speed >= 0x28000 {
+                    entity.angle = sensors[0].angle;
+                    entity.rotation = entity.angle.wrapping_shl(1);
+                    if !sensors[3].collided {
+                        entity.xpos = sensors[4].xpos;
+                    } else {
+                        if entity.speed < 0 {
+                            entity.xpos = sensors[3]
+                                .xpos
+                                .wrapping_sub(collision_right)
+                                .wrapping_shl(16);
+                        }
+                        if entity.speed > 0 {
+                            entity.xpos =
+                                (sensors[3].xpos.wrapping_sub(collision_left) + 1).wrapping_shl(16);
+                        }
+                        entity.speed = 0;
+                    }
+                } else {
+                    entity.gravity = 1;
+                    entity.angle = 0;
+                    entity.collision_mode = CMODE_FLOOR;
+                    entity.speed = entity.xvel;
+                    entity.floor_sensors[0] = 0;
+                    entity.floor_sensors[1] = 0;
+                    entity.floor_sensors[2] = 0;
+                    if !sensors[3].collided {
+                        entity.xpos = entity.xpos.wrapping_add(entity.xvel);
+                    } else {
+                        if entity.speed > 0 {
+                            entity.xpos = sensors[3]
+                                .xpos
+                                .wrapping_sub(collision_right)
+                                .wrapping_shl(16);
+                        }
+                        if entity.speed < 0 {
+                            entity.xpos =
+                                (sensors[3].xpos.wrapping_sub(collision_left) + 1).wrapping_shl(16);
+                        }
+                        entity.speed = 0;
+                    }
+                }
+                entity.ypos = sensors[4].ypos;
+            }
+            CMODE_RWALL => {
+                if !sensors[0].collided && !sensors[1].collided && !sensors[2].collided {
+                    entity.gravity = 1;
+                    entity.collision_mode = CMODE_FLOOR;
+                    entity.xvel = cos256(entity.angle).wrapping_mul(entity.speed) >> 8;
+                    entity.yvel = sin256(entity.angle).wrapping_mul(entity.speed) >> 8;
+                    entity.yvel = entity.yvel.clamp(-0x100000, 0x100000);
+                    entity.speed = entity.xvel;
+                    entity.angle = 0;
+                } else if entity.speed <= -0x28000
+                    || entity.speed >= 0x28000
+                    || entity.control_lock != 0
+                {
+                    entity.angle = sensors[0].angle;
+                    entity.rotation = entity.angle.wrapping_shl(1);
+                } else {
+                    entity.gravity = 1;
+                    entity.angle = 0;
+                    entity.collision_mode = CMODE_FLOOR;
+                    entity.speed = entity.xvel;
+                    entity.control_lock = 30;
+                }
+                if !sensors[3].collided {
+                    entity.ypos = sensors[4].ypos;
+                } else {
+                    if entity.speed > 0 {
+                        entity.ypos = sensors[3]
+                            .ypos
+                            .wrapping_sub(collision_bottom)
+                            .wrapping_shl(16);
+                    }
+                    if entity.speed < 0 {
+                        entity.ypos =
+                            (sensors[3].ypos.wrapping_sub(collision_top) + 1).wrapping_shl(16);
+                    }
+                    entity.speed = 0;
+                }
+                entity.xpos = sensors[4].xpos;
+            }
+            _ => {}
+        }
+
+        if let Some(target) = store.get_mut(slot) {
+            *target = entity;
+        }
+    }
+
+    /// `FUNC_PROCESSOBJECTMOVEMENT` for entities with tile collisions: `ProcessTileCollisions`
+    /// dispatches to [`Self::process_air_collision`] when `gravity == 1` and to
+    /// [`Self::process_path_grip`] otherwise.
+    ///
+    /// Returns the `checkResult` update (`0`/`1`/`2`), or `None` when `tileCollisions` is off:
+    /// that path only integrates `xpos`/`ypos` and leaves `checkResult` untouched, exactly like
+    /// the script opcode.
+    pub fn process_object_movement(
+        &mut self,
+        store: &mut EntityStore,
+        slot: usize,
+        resolve_hitbox: &dyn Fn(usize, &Entity) -> Hitbox,
+    ) -> Option<i32> {
+        let entity = store.get(slot).copied()?;
+        if entity.tile_collisions == 0 {
+            if let Some(target) = store.get_mut(slot) {
+                target.xpos = target.xpos.wrapping_add(target.xvel);
+                target.ypos = target.ypos.wrapping_add(target.yvel);
+            }
+            return None;
+        }
+
+        if let Some(target) = store.get_mut(slot) {
+            target.floor_sensors = [0; crate::entity::FLOOR_SENSOR_COUNT];
+        }
+        self.collision_tolerance = 15;
+        if entity.speed < 0x60000 {
+            self.collision_tolerance = if entity.angle == 0 { 8 } else { 15 };
+        }
+
+        let hitbox = resolve_hitbox(slot, &entity);
+        let check_result = if entity.gravity == 1 {
+            self.process_air_collision(store, slot, &hitbox)
+        } else {
+            self.process_path_grip(store, slot, &hitbox);
+            0
+        };
+        Some(check_result)
+    }
+}
+
+/// `cos256LookupTable[angle]`. Upstream indexes the raw table with `entity->angle`; masking with
+/// `0xFF` keeps negative or oversized script angles panic-free.
+fn cos256(angle: i32) -> i32 {
+    retro_core::math::COS_256_LOOKUP[(angle & 0xFF) as usize]
+}
+
+/// `sin256LookupTable[angle]`.
+fn sin256(angle: i32) -> i32 {
+    retro_core::math::SIN_256_LOOKUP[(angle & 0xFF) as usize]
 }
 
 /// Sets up the five floor probes of `BoxCollision` and clears their collision flags.
@@ -2207,41 +3498,119 @@ mod tests {
         assert!(!miss);
     }
 
-    #[test]
-    fn movement_falls_onto_floor() {
-        let mut collision = SceneCollision::new(layout(), solid_tiles(), solid_floor_masks());
-        let mut store = EntityStore::new();
-        store.reset_object_entity(0, 1, 0, 64 << 16, 60 << 16);
-        {
-            let entity = store.get_mut(0).unwrap();
-            entity.yvel = 0x40000;
-            entity.tile_collisions = 1;
+    /// Appends one plane record in the on-disk layout.
+    fn push_record(bytes: &mut Vec<u8>, record: (u8, u32, [u8; 8], u8, u8)) {
+        bytes.push(record.0);
+        bytes.extend_from_slice(&record.1.to_le_bytes());
+        bytes.extend_from_slice(&record.2);
+        bytes.push(record.3);
+        bytes.push(record.4);
+    }
+
+    /// Masks whose plane 0 tile 0 is `solid` and whose plane 0 tile 1 (and all of plane 1) is
+    /// empty (`SOLID_NONE`, no samples).
+    fn movement_masks(solid: (u8, u32, [u8; 8], u8, u8)) -> CollisionMasks {
+        let empty = (0x03u8, 0u32, [0x88u8; 8], 0u8, 0u8);
+        let mut bytes = Vec::with_capacity(COLLISION_FILE_BYTES);
+        for _ in 0..COLLISION_TILE_COUNT {
+            push_record(&mut bytes, solid);
+            push_record(&mut bytes, empty);
         }
-        let on_ground = collision.process_object_movement(&mut store, 0);
-        assert!(on_ground);
-        assert_eq!(store.get(0).unwrap().yvel, 0);
-        assert_eq!(store.get(0).unwrap().floor_sensors[1], 1);
+        CollisionMasks::from_bytes(&bytes).unwrap()
+    }
+
+    /// Chunk sheet whose chunk 0 entry (`tile_x`, `tile_y`) uses collision tile 0; every other
+    /// entry uses the empty collision tile 1.
+    fn movement_tiles(tile_x: usize, tile_y: usize) -> TileSheet128 {
+        let empty = Tile128 {
+            direction: 0,
+            visual_plane: 0,
+            tile_index: 1,
+            collision_flag_a: SOLID_NONE,
+            collision_flag_b: SOLID_NONE,
+        };
+        let mut tiles = TileSheet128 {
+            entries: vec![empty; TILE_SHEET_128_ENTRY_COUNT],
+        };
+        tiles.entries[tile_x + (tile_y << 3)] = Tile128 {
+            direction: 0,
+            visual_plane: 0,
+            tile_index: 0,
+            collision_flag_a: 0,
+            collision_flag_b: SOLID_NONE,
+        };
+        tiles
+    }
+
+    /// A Sonic-sized 16x16 hitbox (`left[0] = -8`, `top[0] = -8`, `right[0] = 8`,
+    /// `bottom[0] = 8`) with `±8` floor probes in `left[1]`/`right[1]`.
+    fn test_hitbox() -> Hitbox {
+        let mut hitbox = Hitbox {
+            left: [0; 8],
+            top: [0; 8],
+            right: [0; 8],
+            bottom: [0; 8],
+        };
+        hitbox.left[0] = -8;
+        hitbox.top[0] = -8;
+        hitbox.right[0] = 8;
+        hitbox.bottom[0] = 8;
+        hitbox.left[1] = -8;
+        hitbox.right[1] = 8;
+        hitbox
+    }
+
+    fn hitbox_fn(hitbox: Hitbox) -> impl Fn(usize, &Entity) -> Hitbox {
+        move |_, _| hitbox.clone()
     }
 
     #[test]
-    fn resting_probe_keeps_floor_sensors_and_clears_gravity() {
-        // Regression for the "balance" pose: a player resting exactly on a floor used to be
-        // rejected by the probe's vertical-tolerance check, clearing the L/C/R floor sensors
-        // that `Player_State_Ground` reads to choose the idle animation.
-        let mut collision = SceneCollision::new(layout(), solid_tiles(), solid_floor_masks());
+    fn air_collision_landing_clears_gravity_and_sets_check_result() {
+        // Solid tile at x 64..79, y 32..47; `movement_masks` puts the floor sample at 8, so the
+        // surface is y = 40.
+        let masks = movement_masks((0, 0, [0x88; 8], 0xFF, 0xFF));
+        let mut collision = SceneCollision::new(layout(), movement_tiles(4, 2), masks);
         let mut store = EntityStore::new();
-        // `solid_floor_masks` puts the sample at height 8 in the tile at y = 48, so the surface
-        // is at y = 56 and a 16px-tall entity rests at 40.
-        store.reset_object_entity(0, 1, 0, 64 << 16, 40 << 16);
+        store.reset_object_entity(0, 1, 0, 72 << 16, 28 << 16);
         {
             let entity = store.get_mut(0).unwrap();
+            entity.yvel = 0x40000;
             entity.gravity = 1;
-            entity.tile_collisions = 1;
         }
-        assert!(collision.process_object_movement(&mut store, 0));
+        let hitbox = test_hitbox();
+        let first = collision.process_object_movement(&mut store, 0, &hitbox_fn(hitbox.clone()));
+        assert_eq!(first, Some(0), "still airborne after one frame");
+        let second = collision.process_object_movement(&mut store, 0, &hitbox_fn(hitbox));
+        assert_eq!(second, Some(1), "floor contact reports checkResult 1");
         let entity = store.get(0).unwrap();
-        assert_eq!(entity.ypos >> 16, 40, "resting entity must not sink");
+        assert_eq!(
+            entity.ypos >> 16,
+            32,
+            "bottom (8px) rests on the y=40 surface"
+        );
+        assert_eq!(entity.yvel, 0);
         assert_eq!(entity.gravity, 0, "landing clears gravity");
+        assert_eq!(entity.angle, 0);
+    }
+
+    #[test]
+    fn path_grip_rests_on_flat_ground_with_all_probes() {
+        // Regression for the "balance" pose: a grounded entity must keep the L/C/R floor sensors
+        // that `Player_State_Ground` reads to choose the idle animation, without sinking.
+        let mut collision = SceneCollision::new(layout(), solid_tiles(), solid_floor_masks());
+        let mut store = EntityStore::new();
+        // The tile row at y 32..47 has its floor sample at 8, so the surface is y = 40.
+        store.reset_object_entity(0, 1, 0, 72 << 16, 32 << 16);
+        {
+            let entity = store.get_mut(0).unwrap();
+            entity.gravity = 0;
+            entity.collision_mode = CMODE_FLOOR;
+        }
+        let result = collision.process_object_movement(&mut store, 0, &hitbox_fn(test_hitbox()));
+        assert_eq!(result, Some(0), "path grip never reports checkResult");
+        let entity = store.get(0).unwrap();
+        assert_eq!(entity.ypos >> 16, 32, "resting entity must not sink");
+        assert_eq!(entity.angle, 0);
         assert_eq!(
             entity.floor_sensors[..3],
             [1, 1, 1],
@@ -2250,7 +3619,220 @@ mod tests {
     }
 
     #[test]
-    fn movement_without_tile_collisions_integrates() {
+    fn path_grip_follows_a_45_degree_slope() {
+        // Collision tile 0 is a 45-degree floor (`floor[c] = c`, angle 0x20) placed on the
+        // diagonal `(i, i)` of chunk 0, so the surface descends one tile row per tile column.
+        let samples = [0x01u8, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+        let masks = movement_masks((0, 0x20, samples, 0xFF, 0xFF));
+        let empty = Tile128 {
+            direction: 0,
+            visual_plane: 0,
+            tile_index: 1,
+            collision_flag_a: SOLID_NONE,
+            collision_flag_b: SOLID_NONE,
+        };
+        let mut tiles = TileSheet128 {
+            entries: vec![empty; TILE_SHEET_128_ENTRY_COUNT],
+        };
+        for index in 0..8usize {
+            tiles.entries[index + (index << 3)] = Tile128 {
+                direction: 0,
+                visual_plane: 0,
+                tile_index: 0,
+                collision_flag_a: 0,
+                collision_flag_b: SOLID_NONE,
+            };
+        }
+        let mut collision = SceneCollision::new(layout(), tiles, masks);
+        let mut store = EntityStore::new();
+        store.reset_object_entity(0, 1, 0, 16 << 16, 8 << 16);
+        {
+            let entity = store.get_mut(0).unwrap();
+            entity.gravity = 0;
+            entity.collision_mode = CMODE_FLOOR;
+            entity.angle = 0x20;
+            entity.speed = 0x20000;
+        }
+        let hitbox = test_hitbox();
+        for _ in 0..4 {
+            collision.process_object_movement(&mut store, 0, &hitbox_fn(hitbox.clone()));
+        }
+        let entity = store.get(0).unwrap();
+        assert_eq!(entity.angle, 0x20, "the 45-degree slope angle is kept");
+        assert!(
+            entity.floor_sensors[..3].iter().any(|&sensor| sensor != 0),
+            "slope probes must touch"
+        );
+        let x = entity.xpos >> 16;
+        let y = entity.ypos >> 16;
+        assert!(
+            (y - (x - 8)).abs() <= 16,
+            "entity tracks the 45-degree surface (x={x}, y={y})"
+        );
+    }
+
+    #[test]
+    fn air_collision_stops_at_a_wall() {
+        // A single `SOLID_LRB` tile at x 64..79, y 32..47 with its left wall at the tile edge.
+        let masks = movement_masks((SOLID_LRB, 0, [0x00; 8], 0xFF, 0xFF));
+        let mut tiles = movement_tiles(4, 2);
+        tiles.entries[4 + (2 << 3)].collision_flag_a = SOLID_LRB;
+        let mut collision = SceneCollision::new(layout(), tiles, masks);
+        let mut store = EntityStore::new();
+        store.reset_object_entity(0, 1, 0, 48 << 16, 40 << 16);
+        {
+            let entity = store.get_mut(0).unwrap();
+            entity.xvel = 0x20000;
+            entity.gravity = 1;
+        }
+        let hitbox = test_hitbox();
+        for _ in 0..6 {
+            collision.process_object_movement(&mut store, 0, &hitbox_fn(hitbox.clone()));
+        }
+        let entity = store.get(0).unwrap();
+        assert_eq!(entity.xvel, 0, "wall contact clears x velocity");
+        assert_eq!(entity.speed, 0);
+        assert_eq!(
+            entity.xpos >> 16,
+            56,
+            "right edge (8px) snaps to the wall face at x=64"
+        );
+    }
+
+    #[test]
+    fn path_grip_stops_at_a_wall_and_sets_pushing() {
+        // Floor tiles (collision tile 0) at chunk tiles (2,2)/(3,2) and a `SOLID_LRB` wall
+        // (collision tile 1) at (4,2) whose left face is the tile edge.
+        let floor = (0u8, 0u32, [0x88u8; 8], 0xFFu8, 0xFFu8);
+        let wall = (SOLID_LRB, 0u32, [0x00u8; 8], 0xFFu8, 0xFFu8);
+        let empty = (0x03u8, 0u32, [0x88u8; 8], 0u8, 0u8);
+        let mut bytes = Vec::with_capacity(COLLISION_FILE_BYTES);
+        for tile in 0..COLLISION_TILE_COUNT {
+            push_record(
+                &mut bytes,
+                match tile {
+                    0 => floor,
+                    1 => wall,
+                    _ => empty,
+                },
+            );
+            push_record(&mut bytes, empty);
+        }
+        let masks = CollisionMasks::from_bytes(&bytes).unwrap();
+
+        let empty_entry = Tile128 {
+            direction: 0,
+            visual_plane: 0,
+            tile_index: 2,
+            collision_flag_a: SOLID_NONE,
+            collision_flag_b: SOLID_NONE,
+        };
+        let mut tiles = TileSheet128 {
+            entries: vec![empty_entry; TILE_SHEET_128_ENTRY_COUNT],
+        };
+        for tile_x in 2..=3 {
+            tiles.entries[tile_x + (2 << 3)] = Tile128 {
+                direction: 0,
+                visual_plane: 0,
+                tile_index: 0,
+                collision_flag_a: 0,
+                collision_flag_b: SOLID_NONE,
+            };
+        }
+        tiles.entries[4 + (2 << 3)] = Tile128 {
+            direction: 0,
+            visual_plane: 0,
+            tile_index: 1,
+            collision_flag_a: SOLID_LRB,
+            collision_flag_b: SOLID_NONE,
+        };
+
+        let mut collision = SceneCollision::new(layout(), tiles, masks);
+        let mut store = EntityStore::new();
+        store.reset_object_entity(0, 1, 0, 48 << 16, 32 << 16);
+        {
+            let entity = store.get_mut(0).unwrap();
+            entity.gravity = 0;
+            entity.collision_mode = CMODE_FLOOR;
+            entity.speed = 0x20000;
+            entity.right = 1;
+        }
+        let hitbox = test_hitbox();
+        let mut contact_pushing = None;
+        for _ in 0..8 {
+            collision.process_object_movement(&mut store, 0, &hitbox_fn(hitbox.clone()));
+            let entity = store.get(0).unwrap();
+            if entity.speed == 0 && contact_pushing.is_none() {
+                contact_pushing = Some(entity.pushing);
+            }
+        }
+        assert_eq!(
+            contact_pushing,
+            Some(1),
+            "holding right against the wall pushes on the contact frame"
+        );
+        let entity = store.get(0).unwrap();
+        assert_eq!(entity.speed, 0, "the wall stops ground speed");
+        assert_eq!(
+            entity.xpos >> 16,
+            56,
+            "right edge (8px) snaps to the wall face at x=64"
+        );
+        assert_eq!(entity.ypos >> 16, 32, "the entity stays on the floor");
+    }
+    #[test]
+    fn air_collision_stops_at_a_ceiling() {
+        // Solid tile at x 64..79, y 32..47: its underside is the roof surface at y = 47.
+        let masks = movement_masks((0, 0, [0x88; 8], 0xFF, 0xFF));
+        let mut collision = SceneCollision::new(layout(), movement_tiles(4, 2), masks);
+        let mut store = EntityStore::new();
+        store.reset_object_entity(0, 1, 0, 72 << 16, 64 << 16);
+        {
+            let entity = store.get_mut(0).unwrap();
+            entity.yvel = -0x40000;
+            entity.gravity = 1;
+        }
+        let hitbox = test_hitbox();
+        for _ in 0..2 {
+            let result =
+                collision.process_object_movement(&mut store, 0, &hitbox_fn(hitbox.clone()));
+            assert_eq!(result, Some(0), "still moving up");
+        }
+        let result = collision.process_object_movement(&mut store, 0, &hitbox_fn(hitbox));
+        assert_eq!(result, Some(2), "ceiling contact reports checkResult 2");
+        let entity = store.get(0).unwrap();
+        assert_eq!(entity.yvel, 0);
+        assert_eq!(entity.ypos >> 16, 56, "top (8px) stops below the y=47 face");
+        assert_eq!(entity.gravity, 1, "a plain ceiling stop keeps gravity");
+    }
+
+    #[test]
+    fn path_grip_reports_cliff_edges_via_floor_sensors() {
+        // Solid tile at x 64..79. Path grip's left probe sits at `left[1] - 1` (x=63, the empty
+        // tile to the left), the centre probe at x=72 touches, and the right probe at x=80 hangs
+        // over the void: only the centre floor sensor must be set.
+        let masks = movement_masks((0, 0, [0x88; 8], 0xFF, 0xFF));
+        let mut collision = SceneCollision::new(layout(), movement_tiles(4, 2), masks);
+        let mut store = EntityStore::new();
+        store.reset_object_entity(0, 1, 0, 72 << 16, 32 << 16);
+        {
+            let entity = store.get_mut(0).unwrap();
+            entity.gravity = 0;
+            entity.collision_mode = CMODE_FLOOR;
+        }
+        let result = collision.process_object_movement(&mut store, 0, &hitbox_fn(test_hitbox()));
+        assert_eq!(result, Some(0));
+        let entity = store.get(0).unwrap();
+        assert_eq!(
+            entity.floor_sensors[..3],
+            [0, 1, 0],
+            "only the centre probe is over solid ground"
+        );
+        assert_eq!(entity.ypos >> 16, 32, "entity stays on the surface");
+    }
+
+    #[test]
+    fn movement_without_tile_collisions_integrates_and_keeps_check_result() {
         let mut collision = SceneCollision::new(layout(), blank_tiles(), blank_masks());
         let mut store = EntityStore::new();
         store.reset_object_entity(0, 1, 0, 0, 0);
@@ -2260,10 +3842,61 @@ mod tests {
             entity.yvel = 0x20000;
             entity.tile_collisions = 0;
         }
-        assert!(!collision.process_object_movement(&mut store, 0));
+        assert!(
+            collision
+                .process_object_movement(&mut store, 0, &hitbox_fn(test_hitbox()))
+                .is_none(),
+            "the no-tile path leaves checkResult untouched"
+        );
         assert_eq!(
             (store.get(0).unwrap().xpos, store.get(0).unwrap().ypos),
             (0x10000, 0x20000)
         );
+    }
+
+    #[test]
+    fn movement_wraps_extreme_values_without_panicking() {
+        let samples = [0x01u8, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+        let masks = movement_masks((0, 0x20, samples, 0xFF, 0xFF));
+        let mut collision = SceneCollision::new(layout(), movement_tiles(4, 2), masks);
+        let hitbox = test_hitbox();
+        for (xpos, ypos, xvel, yvel, speed, angle, gravity) in [
+            (
+                i32::MIN,
+                i32::MAX,
+                i32::MIN,
+                i32::MAX,
+                i32::MIN,
+                i32::MIN,
+                1,
+            ),
+            (
+                i32::MAX,
+                i32::MIN,
+                i32::MAX,
+                i32::MIN,
+                i32::MAX,
+                i32::MAX,
+                0,
+            ),
+            (i32::MIN, i32::MIN, 0, 0, i32::MIN, -1, 0),
+            (i32::MAX, i32::MAX, 0, 0, i32::MAX, 0x100, 1),
+            (0, 0, i32::MIN, 0, i32::MIN, 0x1FF, 1),
+            (0, 0, 0, i32::MIN, i32::MIN, 0x80, 0),
+        ] {
+            let mut store = EntityStore::new();
+            store.reset_object_entity(0, 1, 0, xpos, ypos);
+            {
+                let entity = store.get_mut(0).unwrap();
+                entity.xvel = xvel;
+                entity.yvel = yvel;
+                entity.speed = speed;
+                entity.angle = angle;
+                entity.gravity = gravity;
+                entity.collision_mode = CMODE_FLOOR;
+                entity.tile_collisions = 1;
+            }
+            let _ = collision.process_object_movement(&mut store, 0, &hitbox_fn(hitbox.clone()));
+        }
     }
 }

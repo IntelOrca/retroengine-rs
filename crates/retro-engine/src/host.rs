@@ -12,7 +12,6 @@
 //!
 //! Known gaps (documented, deterministic):
 //!
-//! * `ProcessObjectMovement` is the simplified movement in [`retro_scene::SceneCollision`].
 //! * `BoxCollision2` (upstream's "barely used in S2" variant) and the 3D matrix/vertex ops are
 //!   explicit stubs (see [`EngineState::stub_histogram`]); `TouchCollision`, `BoxCollision`,
 //!   `PlatformCollision`, `Get16x16TileInfo`, `Set16x16TileInfo` and `Copy16x16Tile` are fully
@@ -969,10 +968,17 @@ impl ScriptHost for EngineHost<'_> {
             }
             Op::ProcessObjectMovement => {
                 let slot = self.state.object_entity_pos;
-                let on_ground = self.state.collision.as_mut().is_some_and(|collision| {
-                    collision.process_object_movement(&mut self.state.entities, slot)
+                let objects = &self.state.objects;
+                let animations = &self.state.animations;
+                let hitbox = |_slot: usize, entity: &retro_scene::Entity| {
+                    crate::state::hitbox_from(objects, animations, entity)
+                };
+                let result = self.state.collision.as_mut().and_then(|collision| {
+                    collision.process_object_movement(&mut self.state.entities, slot, &hitbox)
                 });
-                state.check_result = i32::from(on_ground);
+                if let Some(result) = result {
+                    state.check_result = result;
+                }
                 self.state.record_op("ProcessObjectMovement");
             }
             Op::ProcessObjectControl => {
@@ -3549,7 +3555,16 @@ mod tests {
 
     #[test]
     fn camera_follow_recomputes_scroll_from_the_target() {
+        // A boundary large enough that the follow is not clamped to a 1x1 scene.
         let mut state = test_state(false);
+        state.stage.cur_x_boundary1 = 0;
+        state.stage.cur_x_boundary2 = 10_000;
+        state.stage.new_x_boundary1 = 0;
+        state.stage.new_x_boundary2 = 10_000;
+        state.stage.cur_y_boundary1 = 0;
+        state.stage.cur_y_boundary2 = 10_000;
+        state.stage.new_y_boundary1 = 0;
+        state.stage.new_y_boundary2 = 10_000;
         state.screen.x_scroll = 44;
         state.screen.y_scroll = 7;
         state.camera.enabled = 1;
@@ -3558,7 +3573,10 @@ mod tests {
             .entities
             .reset_object_entity(0, 1, 0, 212 << 16, 120 << 16);
         crate::runtime::follow_camera(&mut state);
-        assert_eq!((state.camera.xpos, state.camera.ypos), (212, 120));
+        // `SetPlayerScreenPosition` centres the camera on the target horizontally; vertically
+        // it clamps the camera to `curYBoundary1 + SCREEN_SCROLL_UP` (104), which makes the
+        // derived `yScrollOffset` equal `curYBoundary1`.
+        assert_eq!((state.camera.xpos, state.camera.ypos), (212, 104));
         assert_eq!((state.screen.x_scroll, state.screen.y_scroll), (0, 0));
 
         // A disabled camera leaves the script scroll untouched even with a live target.
