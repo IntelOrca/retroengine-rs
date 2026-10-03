@@ -57,6 +57,14 @@ pub enum EngineError {
         /// Comma-separated acts found in the folder, or `<none>`.
         available: String,
     },
+    /// A script requested a stage list entry that does not exist.
+    #[error("stage list {list} has no entry at position {pos}")]
+    InvalidStageList {
+        /// Engine stage list index (`stage.activeList`).
+        list: i32,
+        /// Stage list position (`stage.listPos`).
+        pos: i32,
+    },
     /// The scripted input file could not be parsed.
     #[error("input error: {0}")]
     Input(String),

@@ -15,8 +15,10 @@
 //!
 //! Each frame carries four players, each with four whitespace-separated fields:
 //!
-//! 1. buttons: `-` for none, a `|`-separated list of `A,B,C,X,Y,Z,L,R,START,SELECT,UP,DOWN,
-//!    LEFT,RIGHT`, or a decimal/`0x` mask of [`ButtonState`] bits,
+//! 1. buttons: `-` for none, a `|`-separated list of `A,B,C,X,Y,Z,START,SELECT,UP,DOWN,
+//!    LEFT,RIGHT`, or a decimal/`0x` mask of [`ButtonState`] bits. `L`/`R` are rejected with
+//!    [`InputError::UnsupportedButton`]: rev03 controllers have no L/R fields, so the reference
+//!    harness cannot replay them,
 //! 2. `axis_x`: decimal integer clamped to `i16`,
 //! 3. `axis_y`: decimal integer clamped to `i16`,
 //! 4. touches: `-` or `0` for none, otherwise `;`-separated `x:y` pairs (at most
@@ -37,11 +39,18 @@ pub const HEADER: &str = "retro-input";
 pub const VERSION: u32 = 1;
 
 /// Input source replaying per-frame states parsed from a text file.
+///
+/// `pressed` edges are re-derived on every poll from the previously *returned* state (upstream
+/// `ProcessInput` keeps the previous `down` flags in `controller[]`), so ticks the engine skips
+/// (load ticks, which never call `ProcessInput`) do not shift later edges. The edges stored at
+/// parse time describe a strictly sequential replay and back [`ScriptedInput::frame`].
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ScriptedInput {
     frames: Vec<[InputState; PLAYER_COUNT]>,
     cursor: usize,
     seed: Option<u32>,
+    /// Held buttons returned by the most recent `poll`/`poll_at`, used for press edges.
+    previous: [ButtonState; PLAYER_COUNT],
 }
 
 impl ScriptedInput {
@@ -117,6 +126,7 @@ impl ScriptedInput {
             frames,
             cursor: 0,
             seed,
+            previous: [ButtonState::NONE; PLAYER_COUNT],
         })
     }
 
@@ -152,6 +162,23 @@ impl ScriptedInput {
     /// Rewinds the replay to the first frame.
     pub fn rewind(&mut self) {
         self.cursor = 0;
+        self.previous = [ButtonState::NONE; PLAYER_COUNT];
+    }
+
+    /// Copies `frames[index]` (clamped to the last line) and derives `pressed` edges against the
+    /// previously returned held buttons, updating that tracking state.
+    ///
+    /// Upstream `ProcessInput` keeps `down` in `controller[]` and clears only `press` each tick,
+    /// so a skipped tick leaves `down` untouched and the next held button is still a press edge.
+    fn states_at(&mut self, index: usize) -> [InputState; PLAYER_COUNT] {
+        let last = self.frames.len().saturating_sub(1);
+        let index = index.min(last);
+        let mut states = self.frames[index];
+        for (slot, state) in states.iter_mut().enumerate() {
+            state.pressed = state.held.difference(self.previous[slot]);
+            self.previous[slot] = state.held;
+        }
+        states
     }
 }
 
@@ -171,7 +198,17 @@ impl InputSource for ScriptedInput {
         let last = self.frames.len() - 1;
         let index = self.cursor.min(last);
         self.cursor = self.cursor.saturating_add(1).min(last);
-        self.frames.get(index).copied().unwrap_or_else(idle_states)
+        self.states_at(index)
+    }
+
+    fn poll_at(&mut self, tick: u64) -> [InputState; PLAYER_COUNT] {
+        if self.frames.is_empty() {
+            return idle_states();
+        }
+        let last = self.frames.len() - 1;
+        let index = usize::try_from(tick).unwrap_or(usize::MAX).min(last);
+        self.cursor = index.saturating_add(1).min(last);
+        self.states_at(index)
     }
 }
 
@@ -243,16 +280,28 @@ fn parse_buttons(token: &str, line: usize) -> Result<ButtonState, InputError> {
         line,
         value: token.to_owned(),
     };
+    let unsupported = |token: &str| InputError::UnsupportedButton {
+        line,
+        name: token.to_owned(),
+    };
     if let Some(hex) = token
         .strip_prefix("0x")
         .or_else(|| token.strip_prefix("0X"))
     {
         let bits = u16::from_str_radix(hex, 16).map_err(|_| invalid())?;
-        return Ok(ButtonState::from_bits_truncate(bits));
+        let state = ButtonState::from_bits_truncate(bits);
+        if state.intersects(ButtonState::L | ButtonState::R) {
+            return Err(unsupported(token));
+        }
+        return Ok(state);
     }
     if token.bytes().all(|byte| byte.is_ascii_digit()) {
         let bits = token.parse::<u16>().map_err(|_| invalid())?;
-        return Ok(ButtonState::from_bits_truncate(bits));
+        let state = ButtonState::from_bits_truncate(bits);
+        if state.intersects(ButtonState::L | ButtonState::R) {
+            return Err(unsupported(token));
+        }
+        return Ok(state);
     }
     let mut state = ButtonState::NONE;
     for name in token.split('|') {
@@ -260,6 +309,14 @@ fn parse_buttons(token: &str, line: usize) -> Result<ButtonState, InputError> {
             line,
             name: name.trim().to_owned(),
         })?;
+        // rev03 `ControllerState` has no L/R fields, so a replay containing them cannot be
+        // reproduced by the reference harness; reject instead of silently dropping the press.
+        if matches!(button, Button::L | Button::R) {
+            return Err(InputError::UnsupportedButton {
+                line,
+                name: name.trim().to_owned(),
+            });
+        }
         state.insert(button.flag());
     }
     Ok(state)
@@ -422,6 +479,72 @@ seed 7
         input.rewind();
         assert_eq!(input.position(), 0);
         assert!(input.poll()[0].held.contains(ButtonState::A));
+    }
+
+    #[test]
+    fn poll_at_indexes_lines_by_absolute_tick() {
+        // Distinct buttons per line so the returned line is unambiguous.
+        let script = format!(
+            "retro-input 1\n{}\n{}\n{}\n{}\n",
+            solo(0, "A 0 0 -"),
+            solo(1, "B 0 0 -"),
+            solo(2, "C 0 0 -"),
+            solo(3, "- 0 0 -"),
+        );
+        let mut input = ScriptedInput::from_str(&script).unwrap();
+
+        // The load tick (0) is never processed by the engine, but the source is absolute: tick 0
+        // returns line 0, tick N returns line N.
+        assert!(input.poll_at(0)[0].held.contains(ButtonState::A));
+        assert!(input.poll_at(1)[0].held.contains(ButtonState::B));
+        assert!(input.poll_at(3)[0].held.is_empty());
+        // Past the end the last line repeats.
+        assert_eq!(input.poll_at(99)[0].held, ButtonState::NONE);
+    }
+
+    #[test]
+    fn poll_at_derives_edges_across_skipped_ticks() {
+        // A becomes held on line 2, which the engine skips because it is a load tick. Upstream
+        // keeps `down` across the skipped tick, so line 3's held A is a fresh press edge even
+        // though the file marks it as a hold.
+        let script = format!(
+            "retro-input 1\n{}\n{}\n{}\n{}\n",
+            solo(0, "- 0 0 -"),
+            solo(1, "- 0 0 -"),
+            solo(2, "A 0 0 -"),
+            solo(3, "A 0 0 -"),
+        );
+        let mut input = ScriptedInput::from_str(&script).unwrap();
+        assert!(input.poll_at(1)[0].pressed.is_empty());
+        assert!(input.poll_at(3)[0].pressed.contains(ButtonState::A));
+        // Processing the next tick consumes the hold: no second edge.
+        assert!(input.poll_at(4)[0].pressed.is_empty());
+    }
+
+    #[test]
+    fn lr_buttons_are_rejected() {
+        for token in ["L", "R", "A|L", "0x400", "1024"] {
+            let script = format!("retro-input 1\n{}\n", solo(0, &format!("{token} 0 0 -")));
+            let error = ScriptedInput::from_str(&script).unwrap_err();
+            assert!(
+                matches!(error, InputError::UnsupportedButton { .. }),
+                "{token}: unexpected {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewind_resets_press_edges() {
+        let script = format!(
+            "retro-input 1\n{}\n{}\n",
+            solo(0, "A 0 0 -"),
+            solo(1, "A 0 0 -"),
+        );
+        let mut input = ScriptedInput::from_str(&script).unwrap();
+        assert!(input.poll()[0].pressed.contains(ButtonState::A));
+        assert!(input.poll()[0].pressed.is_empty());
+        input.rewind();
+        assert!(input.poll()[0].pressed.contains(ButtonState::A));
     }
 
     #[test]

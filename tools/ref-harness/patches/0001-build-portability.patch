@@ -1,0 +1,170 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 74ffa26..b01dded 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -8,6 +8,9 @@ set(RETRO_REVISION 3 CACHE STRING "What revision to compile for. Defaults to v5U
+ option(RETRO_DISABLE_PLUS "Disable plus. Should be set on for any public releases." OFF)
+ 
+ option(RETRO_MOD_LOADER "Enables or disables the mod loader." ON)
++
++option(RETRO_HARNESS "Build the deterministic reference interface (tools/ref-harness)." OFF)
++set(BLAKE3_DIR "" CACHE PATH "Directory containing the BLAKE3 C implementation (blake3.c, ...).")
+ set(RETRO_MOD_LOADER_VER 2 CACHE STRING "Sets the mod loader version. Defaults to latest")
+ 
+ option(RETRO_DISABLE_LOG "Disables the log. Defaults to OFF." OFF)
+@@ -133,6 +136,17 @@ if(COMPILE_THEORA)
+     target_link_libraries(RetroEngine libtheora)
+ endif()
+ 
++if(RETRO_HARNESS)
++    if(NOT BLAKE3_DIR)
++        message(FATAL_ERROR "RETRO_HARNESS requires -DBLAKE3_DIR=<dir containing blake3.c>")
++    endif()
++    target_sources(RetroEngine PRIVATE RSDKv5/refharness.cpp ${BLAKE3_DIR}/blake3.c ${BLAKE3_DIR}/blake3_dispatch.c
++                                      ${BLAKE3_DIR}/blake3_portable.c)
++    target_include_directories(RetroEngine PRIVATE ${BLAKE3_DIR})
++    target_compile_definitions(RetroEngine PRIVATE RETRO_HARNESS=1 BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
++                                                   BLAKE3_NO_NEON)
++endif()
++
+ target_include_directories(RetroEngine PRIVATE
+     RSDKv5/
+     dependencies/all/
+diff --git a/platforms/Linux.cmake b/platforms/Linux.cmake
+index 66b940d..de6305b 100644
+--- a/platforms/Linux.cmake
++++ b/platforms/Linux.cmake
+@@ -1,7 +1,11 @@
+ # PKG-CONFIG IS USED AS THE MAIN DRIVER
+ # bc cmake is inconsistent as fuuuckkk
++#
++# Reference-harness portability patch: pkg-config is optional. When it is missing (no sudo on
++# the harness machine) SDL2 is located through its CMake package config instead of pkg-config,
++# and the OGG/THEORA libraries are skipped (the harness build stubs out video playback).
+ 
+-find_package(PkgConfig REQUIRED)
++find_package(PkgConfig)
+ 
+ add_executable(RetroEngine ${RETRO_FILES})
+ 
+@@ -12,53 +16,61 @@ option(USE_SDL_AUDIO "Whether or not to use SDL for audio instead of the default
+ find_package(Threads REQUIRED)
+ target_link_libraries(RetroEngine Threads::Threads)
+ 
+-pkg_check_modules(OGG ogg)
++if(PkgConfig_FOUND)
++    pkg_check_modules(OGG ogg)
+ 
+-if(NOT OGG_FOUND)
+-    set(COMPILE_OGG TRUE)
+-    message(NOTICE "libogg not found, attempting to build from source")
+-else()
+-    message("found libogg")
+-    target_link_libraries(RetroEngine ${OGG_STATIC_LIBRARIES})
+-    target_link_options(RetroEngine PRIVATE ${OGG_STATIC_LDLIBS_OTHER})
+-    target_compile_options(RetroEngine PRIVATE ${OGG_STATIC_CFLAGS})
+-endif()
++    if(NOT OGG_FOUND)
++        set(COMPILE_OGG TRUE)
++        message(NOTICE "libogg not found, attempting to build from source")
++    else()
++        message("found libogg")
++        target_link_libraries(RetroEngine ${OGG_STATIC_LIBRARIES})
++        target_link_options(RetroEngine PRIVATE ${OGG_STATIC_LDLIBS_OTHER})
++        target_compile_options(RetroEngine PRIVATE ${OGG_STATIC_CFLAGS})
++    endif()
+ 
+-pkg_check_modules(THEORA theora theoradec)
++    pkg_check_modules(THEORA theora theoradec)
+ 
+-if(NOT THEORA_FOUND)
+-    message("could not find libtheora, attempting to build manually")
+-    set(COMPILE_THEORA TRUE)
++    if(NOT THEORA_FOUND)
++        message("could not find libtheora, attempting to build manually")
++        set(COMPILE_THEORA TRUE)
++    else()
++        message("found libtheora")
++        target_link_libraries(RetroEngine ${THEORA_STATIC_LIBRARIES})
++        target_link_options(RetroEngine PRIVATE ${THEORA_STATIC_LDLIBS_OTHER})
++        target_compile_options(RetroEngine PRIVATE ${THEORA_STATIC_CFLAGS})
++    endif()
+ else()
+-    message("found libtheora")
+-    target_link_libraries(RetroEngine ${THEORA_STATIC_LIBRARIES})
+-    target_link_options(RetroEngine PRIVATE ${THEORA_STATIC_LDLIBS_OTHER})
+-    target_compile_options(RetroEngine PRIVATE ${THEORA_STATIC_CFLAGS})
++    message(NOTICE "pkg-config not found: skipping system OGG/Theora lookup")
+ endif()
+ 
+ if(RETRO_SUBSYSTEM STREQUAL "OGL")
+-    pkg_check_modules(GLFW glfw3)
+-
+-    if(NOT GLFW_FOUND)
+-        message("could not find glfw, attempting to build from source")
+-        add_subdirectory(dependencies/ogl/glfw)
++    if(PkgConfig_FOUND)
++        pkg_check_modules(GLFW glfw3)
++
++        if(NOT GLFW_FOUND)
++            message("could not find glfw, attempting to build from source")
++            add_subdirectory(dependencies/ogl/glfw)
++        else()
++            message("found GLFW")
++            target_link_libraries(RetroEngine ${GLFW_STATIC_LIBRARIES})
++            target_link_options(RetroEngine PRIVATE ${GLFW_STATIC_LDLIBS_OTHER})
++            target_compile_options(RetroEngine PRIVATE ${GLFW_STATIC_CFLAGS})
++        endif()
++
++        pkg_check_modules(GLEW glew)
++
++        if(NOT GLEW_FOUND)
++            message(NOTICE "could not find glew, attempting to build from source")
++
++        else()
++            message("found GLEW")
++            target_link_libraries(RetroEngine ${GLEW_STATIC_LIBRARIES})
++            target_link_options(RetroEngine PRIVATE ${GLEW_STATIC_LDLIBS_OTHER})
++            target_compile_options(RetroEngine PRIVATE ${GLEW_STATIC_CFLAGS})
++        endif()
+     else()
+-        message("found GLFW")
+-        target_link_libraries(RetroEngine ${GLFW_STATIC_LIBRARIES})
+-        target_link_options(RetroEngine PRIVATE ${GLFW_STATIC_LDLIBS_OTHER})
+-        target_compile_options(RetroEngine PRIVATE ${GLFW_STATIC_CFLAGS})
+-    endif()
+-
+-    pkg_check_modules(GLEW glew)
+-
+-    if(NOT GLEW_FOUND)
+-        message(NOTICE "could not find glew, attempting to build from source")
+-
+-    else()
+-        message("found GLEW")
+-        target_link_libraries(RetroEngine ${GLEW_STATIC_LIBRARIES})
+-        target_link_options(RetroEngine PRIVATE ${GLEW_STATIC_LDLIBS_OTHER})
+-        target_compile_options(RetroEngine PRIVATE ${GLEW_STATIC_CFLAGS})
++        message(FATAL_ERROR "The OGL subsystem requires pkg-config; configure with -DRETRO_SUBSYSTEM=SDL2 for the harness.")
+     endif()
+ elseif(RETRO_SUBSYSTEM STREQUAL "VK")
+     find_package(glfw3 CONFIG)
+@@ -78,10 +90,15 @@ elseif(RETRO_SUBSYSTEM STREQUAL "VK")
+         Vulkan::Vulkan
+     )
+ elseif(RETRO_SUBSYSTEM STREQUAL "SDL2")
+-    pkg_check_modules(SDL2 sdl2 REQUIRED)
+-    target_link_libraries(RetroEngine ${SDL2_STATIC_LIBRARIES})
+-    target_link_options(RetroEngine PRIVATE ${SDL2_STATIC_LDLIBS_OTHER})
+-    target_compile_options(RetroEngine PRIVATE ${SDL2_STATIC_CFLAGS})
++    if(PkgConfig_FOUND)
++        pkg_check_modules(SDL2 sdl2 REQUIRED)
++        target_link_libraries(RetroEngine ${SDL2_STATIC_LIBRARIES})
++        target_link_options(RetroEngine PRIVATE ${SDL2_STATIC_LDLIBS_OTHER})
++        target_compile_options(RetroEngine PRIVATE ${SDL2_STATIC_CFLAGS})
++    else()
++        find_package(SDL2 CONFIG REQUIRED)
++        target_link_libraries(RetroEngine SDL2::SDL2)
++    endif()
+ endif()
+ 
+ if(NOT RETRO_SUBSYSTEM STREQUAL SDL2)

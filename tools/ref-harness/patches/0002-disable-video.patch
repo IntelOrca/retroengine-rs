@@ -1,0 +1,70 @@
+diff --git a/RSDKv5/RSDK/Core/RetroEngine.hpp b/RSDKv5/RSDK/Core/RetroEngine.hpp
+index 6d6c352..ea59855 100644
+--- a/RSDKv5/RSDK/Core/RetroEngine.hpp
++++ b/RSDKv5/RSDK/Core/RetroEngine.hpp
+@@ -539,7 +539,13 @@ extern "C" {
+ #endif
+ #endif
+ 
++#if !RETRO_HARNESS
+ #include <theora/theoradec.h>
++#endif
++
++#if RETRO_HARNESS
++#include "refharness.hpp"
++#endif
+ 
+ // ============================
+ // ENGINE INCLUDES
+diff --git a/RSDKv5/RSDK/Graphics/Video.cpp b/RSDKv5/RSDK/Graphics/Video.cpp
+index cc0b2fc..da5ba6b 100644
+--- a/RSDKv5/RSDK/Graphics/Video.cpp
++++ b/RSDKv5/RSDK/Graphics/Video.cpp
+@@ -2,6 +2,8 @@
+ 
+ using namespace RSDK;
+ 
++#if !RETRO_HARNESS
++
+ FileInfo VideoManager::file;
+ 
+ ogg_sync_state VideoManager::oy;
+@@ -284,3 +286,18 @@ void RSDK::ProcessVideo()
+ #endif
+     }
+ }
++
++#else // RETRO_HARNESS
++
++bool32 RSDK::LoadVideo(const char *filename, double startDelay, bool32 (*skipCallback)())
++{
++    // Reference harness: video playback is disabled so the build has no libogg/libtheora dependency.
++    (void)filename;
++    (void)startDelay;
++    (void)skipCallback;
++    return false;
++}
++
++void RSDK::ProcessVideo() { }
++
++#endif // !RETRO_HARNESS
+diff --git a/RSDKv5/RSDK/Graphics/Video.hpp b/RSDKv5/RSDK/Graphics/Video.hpp
+index cb1913f..f1f103b 100644
+--- a/RSDKv5/RSDK/Graphics/Video.hpp
++++ b/RSDKv5/RSDK/Graphics/Video.hpp
+@@ -4,6 +4,7 @@
+ namespace RSDK
+ {
+ 
++#if !RETRO_HARNESS
+ struct VideoManager {
+     static FileInfo file;
+ 
+@@ -21,6 +22,7 @@ struct VideoManager {
+     static ogg_int64_t granulePos;
+     static bool32 initializing;
+ };
++#endif
+ 
+ bool32 LoadVideo(const char *filename, double startDelay, bool32 (*skipCallback)());
+ void ProcessVideo();

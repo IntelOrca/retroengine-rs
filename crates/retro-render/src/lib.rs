@@ -445,6 +445,111 @@ mod tests {
         assert_eq!(render.framebuffer.get(143, 0), 0x07E0);
     }
 
+    /// Builds a `2 x 2` chunk layout whose four chunks paint their first 16x16 tile in a distinct
+    /// palette colour; every other sub-tile is transparent.
+    fn known_chunk_layout() -> (RenderState, LayerState, ParallaxState) {
+        let mut render = RenderState::new(160, 160);
+        for (index, (r, g, b)) in [
+            (1u8, (255u8, 0u8, 0u8)),
+            (2, (0, 255, 0)),
+            (3, (0, 0, 255)),
+            (4, (255, 255, 0)),
+        ] {
+            render.palette.set_entry(0, usize::from(index), r, g, b);
+        }
+        let mut pixels = vec![0u8; TILE_SET_16_SIZE];
+        for (tile, index) in [(0usize, 1u8), (1, 2), (2, 3), (3, 4)] {
+            pixels[tile * 256..tile * 256 + 16].fill(index);
+        }
+        render.tiles.pixels = pixels;
+
+        // Chunk id `n` has its sub-tile 0 at tile index `n`; everything else uses the empty
+        // tile 4, which is fully transparent.
+        render.tiles.chunks = vec![
+            ChunkEntry {
+                gfx_data_pos: 4 << 8,
+                direction: 0,
+                visual_plane: 0,
+            };
+            4 * 64
+        ];
+        for chunk in 0..4usize {
+            render.tiles.chunks[chunk * 64] = ChunkEntry {
+                gfx_data_pos: (chunk as i32) << 8,
+                direction: 0,
+                visual_plane: 0,
+            };
+        }
+
+        let mut layer = LayerState {
+            xsize: 2,
+            ysize: 2,
+            layer_type: LAYER_HSCROLL,
+            ..LayerState::default()
+        };
+        layer.set_entry(0, 0, 0); // top-left chunk 0
+        layer.set_entry(1, 0, 1); // top-right chunk 1
+        layer.set_entry(0, 1, 2); // bottom-left chunk 2
+        layer.set_entry(1, 1, 3); // bottom-right chunk 3
+        (render, layer, ParallaxState::default())
+    }
+
+    #[test]
+    fn horizontal_layer_maps_a_known_chunk_layout() {
+        let (mut render, mut layer, mut parallax) = known_chunk_layout();
+        layers::draw_h_line_scroll_layer(
+            &mut render,
+            &mut layer,
+            &mut parallax,
+            LayerView {
+                is_background: false,
+                above_mid_point: false,
+                x_scroll_offset: 0,
+                y_scroll_offset: 0,
+            },
+        );
+        // The four chunks' first tiles land at the four 128x128 quadrant origins.
+        assert_eq!(render.framebuffer.get(0, 0), 0xF800, "chunk 0 tile 0");
+        assert_eq!(render.framebuffer.get(128, 0), 0x07E0, "chunk 1 tile 0");
+        assert_eq!(render.framebuffer.get(0, 128), 0x001F, "chunk 2 tile 0");
+        assert_eq!(render.framebuffer.get(128, 128), 0xFFE0, "chunk 3 tile 0");
+        // Sub-tile 1 of every chunk is transparent, so the second 16x16 column is blank.
+        assert_eq!(render.framebuffer.get(16, 0), 0, "chunk 0 tile 1");
+        assert_eq!(render.framebuffer.get(144, 128), 0, "chunk 3 tile 1");
+        // `8 * tileY` sub-indexing: screen y=64 is tile row 4 of the first chunk row.
+        assert_eq!(render.framebuffer.get(0, 64), 0, "chunk 0 tile row 4");
+    }
+
+    #[test]
+    fn horizontal_layer_honours_chunk_direction_bits() {
+        let (mut render, mut layer, mut parallax) = known_chunk_layout();
+        // Give chunk 3 a two-colour row and mirror it; chunk 3's tile index is 3.
+        render.tiles.pixels[3 * 256] = 1;
+        render.tiles.pixels[3 * 256 + 15] = 2;
+        render.tiles.chunks[3 * 64].direction = FLIP_X;
+        layers::draw_h_line_scroll_layer(
+            &mut render,
+            &mut layer,
+            &mut parallax,
+            LayerView {
+                is_background: false,
+                above_mid_point: false,
+                x_scroll_offset: 0,
+                y_scroll_offset: 0,
+            },
+        );
+        assert_eq!(
+            render.framebuffer.get(128, 128),
+            0x07E0,
+            "mirrored first pixel"
+        );
+        assert_eq!(
+            render.framebuffer.get(143, 128),
+            0xF800,
+            "mirrored last pixel"
+        );
+    }
+
     #[test]
     fn vertical_layer_blits_a_column() {
         let palette = two_color_palette();

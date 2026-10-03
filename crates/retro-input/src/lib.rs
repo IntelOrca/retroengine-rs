@@ -42,6 +42,15 @@ pub const KEY_COUNT: usize = 512;
 pub trait InputSource {
     /// Returns one state per player for the current frame.
     fn poll(&mut self) -> [InputState; PLAYER_COUNT];
+
+    /// Returns the state for absolute engine tick `tick`.
+    ///
+    /// Sequential sources ignore the tick and behave like [`InputSource::poll`]. A scripted
+    /// replay overrides this to index its file lines by tick, matching the C++ reference
+    /// harness: line `N` belongs to record `N` (`InjectInput` indexes `inputMasks[frame]`).
+    fn poll_at(&mut self, _tick: u64) -> [InputState; PLAYER_COUNT] {
+        self.poll()
+    }
 }
 
 /// Four neutral states in slot order.

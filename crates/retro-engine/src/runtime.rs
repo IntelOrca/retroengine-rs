@@ -7,7 +7,10 @@
 //! * startup events run once per object type in object-list order against the temp slot,
 //! * update events run per entity slot in ascending order,
 //! * type groups are rebuilt after the update pass from the pre-update process flags,
-//! * the camera follows `camera.target` once per frame (simplified, see below).
+//! * the camera follows `camera.target` once per frame (simplified, see below),
+//! * a `LoadStage` request queued by a script op is consumed at the start of the next frame
+//!   (`STAGEMODE_LOAD`): the scene is torn down and rebuilt, startup events run and that frame
+//!   skips updates/draw while still presenting.
 //!
 //! The state hash is a canonical little-endian serialisation of all entity slots, the object
 //! list, camera/screen/stage metadata, global VM state and the RNG state, fed through BLAKE3.
@@ -37,7 +40,8 @@ use retro_platform::Storage;
 use retro_render::ChunkEntry;
 use retro_render::layers::{LAYER_3DFLOOR, LAYER_3DSKY, LAYER_HSCROLL, LAYER_VSCROLL, LayerView};
 use retro_scene::{
-    DRAWLAYER_COUNT, ENTITY_COUNT, EntityStore, OBJECT_COUNT, SCENE_ENTITY_START, TEMPENTITY_START,
+    Camera, DRAWLAYER_COUNT, ENTITY_COUNT, EntityStore, OBJECT_COUNT, PRIORITY_ALWAYS,
+    SCENE_ENTITY_START, StageLayout, StageState, TEMPENTITY_START,
 };
 use retro_script::{ScriptEvent, ScriptFile, Vm, VmState};
 
@@ -45,11 +49,11 @@ use crate::EngineError;
 use crate::audio::AudioState;
 use crate::host::EngineHost;
 use crate::input::{EngineInput, PRESS_BUTTONS, apply_players};
-use crate::loader;
+use crate::loader::{self, SceneAssets};
 use crate::profile::EngineSettings;
 use crate::rng::DEFAULT_SEED;
 use crate::save::{SaveState, seed_memory_storage};
-use crate::state::EngineState;
+use crate::state::{EngineState, STAGEMODE_FROZEN, STAGEMODE_NORMAL, STAGEMODE_PAUSED};
 
 /// The compiled script file and its VM execution state.
 pub struct ScriptRuntime {
@@ -163,6 +167,18 @@ impl Engine {
         state.save = save;
         let act_id = state.act.clone();
         state.stage.set_act_id(&act_id);
+        // `ProcessStage` enters `STAGEMODE_NORMAL` before `LoadStageFiles`, so startup events see
+        // a running stage (`stage.state`); scripts later set `STAGE_FROZEN`/`STAGE_RUNNING`.
+        state.stage.state = STAGEMODE_NORMAL;
+        // When the requested scene is a GameConfig entry, point `stage.activeList`/`stage.listPos`
+        // at it and record the list size so `ActFinish`'s `stage.listPos++` advances correctly.
+        if let Some((list, pos, size)) =
+            loader::engine_list_position(&state.game_config, &state.stage_folder, &state.act)
+        {
+            state.stage.active_list = list;
+            state.stage.list_pos = pos;
+            state.stage.list_size = size;
+        }
         // `[Window] DimLimit` is stored in seconds and converted to frames when settings load.
         state.render.dim_limit = state.settings.dim_limit_frames;
         state.apply_game_palette();
@@ -227,6 +243,27 @@ impl Engine {
 
     /// Runs startup events for every registered object type, in object-list order.
     pub fn run_startup(&mut self) -> Result<(), EngineError> {
+        // `ProcessStartupObjects` rewinds the script frame lists and animation data and resets
+        // every object's sheet/animation before the setup pass.
+        for frames in &mut self.state.object_frames {
+            frames.clear();
+        }
+        self.state.animations.clear();
+        self.state.animation_ids.clear();
+        self.state.animation_sheet_ids.clear();
+        for index in 0..self.state.objects.len() {
+            if let Some(entry) = self.state.objects.get_mut(index) {
+                entry.sprite_sheet_id = 0;
+                entry.animation_file = None;
+            }
+        }
+        // `ProcessStartupObjects` derives the object borders from `SCREEN_XSIZE`.
+        self.state.object_borders = [
+            0x80,
+            self.state.screen.xsize + 0x80,
+            0x20,
+            self.state.screen.xsize + 0x20,
+        ];
         self.state.object_entity_pos = TEMPENTITY_START;
         self.scripts.vm_state.array_position[8] = TEMPENTITY_START as i32;
         self.scripts.vm_state.foreach_stack.clear();
@@ -260,15 +297,251 @@ impl Engine {
         Ok(())
     }
 
+    /// Applies a pending `LoadStage` request: the upstream `STAGEMODE_LOAD` handoff.
+    ///
+    /// `FUNC_LOADSTAGE` only sets `stageMode = STAGEMODE_LOAD`; the next `ProcessStage` call
+    /// resets the frame state, runs `LoadStageFiles` and skips that frame's updates/draw. This is
+    /// the port of that handoff. `stage.activeList`/`stage.listPos` select the GameConfig entry.
+    fn apply_deferred_load(&mut self) -> Result<(), EngineError> {
+        self.state.load_stage_requested = false;
+        let (folder, act, list_size) = {
+            let (entry, size) = loader::stage_list_entry(
+                &self.state.game_config,
+                self.state.stage.active_list,
+                self.state.stage.list_pos,
+            )?;
+            (entry.folder.clone(), entry.id.clone(), size)
+        };
+        let assets = loader::load_scene_assets(
+            &self.state.source,
+            &self.state.game_config,
+            &self.state.settings,
+            &folder,
+            &act,
+        )?;
+        // `CheckCurrentStageFolder`: the same folder reuses the linked scripts, tiles, collision
+        // and background metadata and only reloads the act layout and entities.
+        if self.state.stage_folder == folder {
+            self.prepare_act_reload();
+            self.apply_act_reload(act, list_size, assets)?;
+        } else {
+            self.apply_full_scene_load(folder, act, list_size, assets)?;
+        }
+        self.run_startup()?;
+        Ok(())
+    }
+
+    /// The `STAGEMODE_LOAD` reset that runs before `LoadStageFiles`.
+    ///
+    /// `ResetBackgroundSettings` zeroes the per-layer deformation/auto-scroll state. Resetting the
+    /// camera matters for script-driven scroll: the title's `screen.xoffset` writes are
+    /// authoritative while `cameraTarget == -1`, and zones re-point `camera.target` from their
+    /// setup scripts.
+    fn prepare_act_reload(&mut self) {
+        self.state.render.fade_mode = 0;
+        self.state.camera = Camera::scene_load();
+        self.state.screen.x_scroll = 0;
+        self.state.screen.y_scroll = 0;
+        self.state.music_track = 0;
+        self.state.audio.reset_stage_tracks();
+        self.reset_background_settings();
+    }
+
+    /// `ResetBackgroundSettings`: zeroes deformation offsets, layer auto-scroll positions, the
+    /// parallax auto-scroll positions and all four deformation tables.
+    fn reset_background_settings(&mut self) {
+        for layer in &mut self.state.layers {
+            layer.deformation_offset = 0;
+            layer.deformation_offset_w = 0;
+            layer.scroll_pos = 0;
+        }
+        for table in [&mut self.state.h_parallax, &mut self.state.v_parallax] {
+            table.scroll_pos.fill(0);
+        }
+        for data in &mut self.state.render.deform_data {
+            data.fill(0);
+        }
+    }
+
+    /// Full `LoadStageFiles` path for a different stage folder: relinks the scripts, rebuilds the
+    /// tile layers/palettes and re-seeds the act, entities and stage globals.
+    fn apply_full_scene_load(
+        &mut self,
+        folder: String,
+        act: String,
+        list_size: i32,
+        assets: SceneAssets,
+    ) -> Result<(), EngineError> {
+        let SceneAssets {
+            scene,
+            stage_config,
+            collision,
+            backgrounds,
+            tiles16,
+            tiles128,
+            scripts,
+        } = assets;
+        // The output device survives the reload; `reload_for_scene` rebuilds the sfx/track tables
+        // from the new configs and silences the mixer (`StopAllSfx` + `SetMusicTrack("", ...)`).
+        let mut audio = std::mem::take(&mut self.state.audio);
+        audio.reload_for_scene(
+            Arc::clone(&self.state.source),
+            &self.state.game_config,
+            &stage_config,
+            &self.raw_settings.audio,
+        );
+        let source = Arc::clone(&self.state.source);
+        let settings = self.state.settings.clone();
+        let game_config = self.state.game_config.clone();
+        let rng = self.state.rng.clone();
+        let mut state = EngineState::new(
+            source,
+            settings,
+            game_config,
+            folder,
+            act.clone(),
+            scene,
+            stage_config,
+            collision,
+            backgrounds,
+            scripts.objects,
+            rng,
+        );
+        state.audio = audio;
+        // State that lives on across `LoadStageFiles`: save RAM, input, RNG (already carried),
+        // menus, diagnostics and the frame counter. Global VM variables are restored below.
+        state.save = std::mem::replace(&mut self.state.save, SaveState::in_memory());
+        state.input = self.state.input;
+        state.input_press = self.state.input_press;
+        state.touch_down = std::mem::take(&mut self.state.touch_down);
+        state.touch_x = std::mem::take(&mut self.state.touch_x);
+        state.touch_y = std::mem::take(&mut self.state.touch_y);
+        state.frame = self.state.frame;
+        state.menu1_selection = self.state.menu1_selection;
+        state.menu2_selection = self.state.menu2_selection;
+        state.op_histogram = std::mem::take(&mut self.state.op_histogram);
+        state.stub_histogram = std::mem::take(&mut self.state.stub_histogram);
+        // `activeStageList`/`stageListPosition` are script globals upstream and survive the load.
+        state.stage.active_list = self.state.stage.active_list;
+        state.stage.list_pos = self.state.stage.list_pos;
+        state.stage.list_size = list_size;
+        state.stage.player_list_pos = self.state.stage.player_list_pos;
+        state.stage.debug_mode = self.state.stage.debug_mode;
+        state.stage.state = STAGEMODE_NORMAL;
+        state.stage.set_act_id(&act);
+        state.render.dim_limit = state.settings.dim_limit_frames;
+        state.apply_game_palette();
+        state.apply_stage_palette();
+        if let Some(tiles16) = &tiles16 {
+            state.apply_tile_sheet(tiles16);
+        }
+        if let Some(tiles128) = &tiles128 {
+            state
+                .render
+                .tiles
+                .chunks
+                .extend(tiles128.entries.iter().map(|entry| ChunkEntry {
+                    gfx_data_pos: entry.gfx_data_pos(),
+                    direction: entry.direction,
+                    visual_plane: entry.visual_plane,
+                }));
+        }
+        state.entities.reset_scene();
+        place_scene_entities(&mut state.entities, &state.scene.entities);
+        self.state = state;
+        // `ClearScriptData` empties the script code and VM execution state; global variables
+        // persist because `LoadStageFiles` never re-reads `GameConfig.bin` into them.
+        self.scripts.vm = Vm::new(scripts.file);
+        let globals = std::mem::take(&mut self.scripts.vm_state.global_variables);
+        let mut array_position = [0i32; 9];
+        array_position[8] = TEMPENTITY_START as i32;
+        self.scripts.vm_state = VmState {
+            global_variables: globals,
+            array_position,
+            ..VmState::default()
+        };
+        Ok(())
+    }
+
+    /// `CheckCurrentStageFolder` reload path: the same folder with a different act.
+    ///
+    /// Upstream skips the config/script/graphics/collision/background reload and only runs
+    /// `LoadStageChunks`, `LoadActLayout`, `Init3DFloorBuffer` and `ProcessStartupObjects`.
+    fn apply_act_reload(
+        &mut self,
+        act: String,
+        list_size: i32,
+        assets: SceneAssets,
+    ) -> Result<(), EngineError> {
+        self.state.act = act.clone();
+        self.state.scene = assets.scene;
+        let (width, height, layout) = {
+            let scene = &self.state.scene;
+            (scene.width, scene.height, scene.layout.clone())
+        };
+        // `LoadActLayout` clears and refills tile layer 0 and leaves the background layers alone.
+        if let Some(main) = self.state.layers.first_mut() {
+            main.xsize = i32::from(width);
+            main.ysize = i32::from(height);
+            main.layer_type = LAYER_HSCROLL;
+            main.tiles.fill(0);
+            main.line_scroll.fill(0);
+            for y in 0..i32::from(height) {
+                for x in 0..i32::from(width) {
+                    let chunk = layout
+                        .get(usize::try_from(y * i32::from(width) + x).unwrap_or(usize::MAX))
+                        .copied()
+                        .unwrap_or(0);
+                    main.set_entry(x, y, chunk);
+                }
+            }
+        }
+        let mut stage = StageState::from_scene(&self.state.scene);
+        stage.active_list = self.state.stage.active_list;
+        stage.list_pos = self.state.stage.list_pos;
+        stage.list_size = list_size;
+        stage.player_list_pos = self.state.stage.player_list_pos;
+        stage.debug_mode = self.state.stage.debug_mode;
+        stage.state = STAGEMODE_NORMAL;
+        self.state.stage = stage;
+        self.state.stage.set_act_id(&act);
+        // Collision code reads `stageLayouts[0]` directly upstream, so the context must follow the
+        // new act's layout.
+        if let Some(collision) = self.state.collision.as_mut() {
+            collision.layout = StageLayout::from_scene(&self.state.scene);
+        }
+        self.state.entities.reset_scene();
+        place_scene_entities(&mut self.state.entities, &self.state.scene.entities);
+        Ok(())
+    }
+
     /// Runs one 60 Hz frame.
     ///
     /// Ordering matches `ProcessStage`'s `STAGEMODE_NORMAL`: fade decay, clock, object updates,
     /// camera follow, parallax auto-scroll, then `DrawStageGFX` (which runs `ObjectDraw` events
     /// through the draw lists, interleaved with the tile layers) and the fade rectangle.
+    ///
+    /// A `LoadStage` request queued by an update or draw event is consumed at the start of the
+    /// next frame, exactly like upstream's `STAGEMODE_LOAD` (which resets the frame state, runs
+    /// `LoadStageFiles` and skips that frame's updates and draw).
     pub fn run_frame(&mut self) -> Result<(), EngineError> {
-        self.poll_input();
-        // `ProcessInput` runs before the frame: any press/hold resets the idle-dimming timer,
-        // otherwise it advances towards `dim_limit` (`Input.cpp:377-382`). Presentation-only.
+        if self.state.load_stage_requested {
+            self.apply_deferred_load()?;
+            // `STAGEMODE_LOAD` never calls `ProcessInput`: the load tick neither consumes an
+            // input line nor advances the idle-dimming timer (`SceneLegacyv4.cpp`). The load
+            // frame still presents (`FlipScreen`): dimming runs, the frame counter advances and
+            // audio mixes, but no updates or drawing happen.
+            self.state.render.process_dimming();
+            self.state.frame += 1;
+            self.state.audio.tick();
+            return Ok(());
+        }
+        // `ProcessInput` runs at the start of every non-load tick. The tick being produced is
+        // `state.frame + 1` (`Engine::load` performs record 0, the `STAGEMODE_LOAD` tick), and
+        // the reference harness input script's line `N` belongs to record `N`.
+        self.poll_input(self.state.frame + 1);
+        // Any press/hold resets the idle-dimming timer, otherwise it advances towards
+        // `dim_limit` (`Input.cpp:377-382`). Presentation-only.
         let input_active = self.state.input.any_button()
             || self.state.input_press.any_button()
             || self
@@ -282,11 +555,31 @@ impl Engine {
         if self.state.render.fade_mode > 0 {
             self.state.render.fade_mode -= 1;
         }
-        self.update_clock();
-        self.process_objects()?;
-        self.update_camera();
-        self.process_parallax_auto_scroll();
-        self.draw_stage_gfx()?;
+        // `ProcessStage` resets the shared layer-size caches at the top of every mode.
+        self.state.render.last_x_size = -1;
+        self.state.render.last_y_size = -1;
+        match self.state.stage.state {
+            STAGEMODE_NORMAL => {
+                self.update_clock();
+                self.process_objects()?;
+                self.update_camera();
+                self.process_parallax_auto_scroll();
+                self.draw_stage_gfx()?;
+            }
+            STAGEMODE_PAUSED => {
+                self.process_paused_objects()?;
+                self.draw_paused_gfx()?;
+            }
+            // `STAGEMODE_FROZEN` (death/game-over): only `PRIORITY_ALWAYS` entities update, but
+            // type groups are rebuilt and the stage still draws, so the death animation plays.
+            STAGEMODE_FROZEN => {
+                self.process_frozen_objects()?;
+                self.update_camera();
+                self.draw_stage_gfx()?;
+            }
+            // `STAGEMODE_2P` and the `+ STAGEMODE_STEPOVER` variants are not modelled.
+            _ => {}
+        }
         // `FlipScreen` updates the display-only dim state after the frame is composed.
         self.state.render.process_dimming();
         self.state.frame += 1;
@@ -295,9 +588,58 @@ impl Engine {
         Ok(())
     }
 
-    /// Polls the input source and copies the player states into the engine state.
-    fn poll_input(&mut self) {
-        let players = self.input.poll();
+    /// `ProcessPausedObjects`: only `PRIORITY_ALWAYS` entities update and enter draw lists.
+    ///
+    /// Type groups are not rebuilt and `processObjectFlag` is not touched, matching upstream's
+    /// paused pass (`ObjectLegacyv4.cpp`).
+    fn process_paused_objects(&mut self) -> Result<(), EngineError> {
+        for list in &mut self.state.draw_lists {
+            list.clear();
+        }
+        for slot in 0..ENTITY_COUNT {
+            let Some(entity) = self.state.entities.get(slot).copied() else {
+                continue;
+            };
+            if entity.priority != PRIORITY_ALWAYS || entity.type_id == 0 {
+                continue;
+            }
+            let Some(entry) = self.state.objects.get(usize::from(entity.type_id)) else {
+                continue;
+            };
+            let update = entry.script.update;
+            if self.script_exists(update.code_pos) {
+                self.state.object_entity_pos = slot;
+                self.scripts.vm_state.current_event = ScriptEvent::Main;
+                self.run_host_event(update.code_pos, update.jump_pos)?;
+            }
+            let draw_order = usize::from(
+                self.state
+                    .entities
+                    .get(slot)
+                    .map(|entity| entity.draw_order)
+                    .unwrap_or(0),
+            );
+            if draw_order < DRAWLAYER_COUNT
+                && let Some(list) = self.state.draw_lists.get_mut(draw_order)
+            {
+                list.push(slot as i32);
+            }
+        }
+        Ok(())
+    }
+
+    /// The paused-mode draw pass: every object list, no tile layers and no fade rectangle.
+    fn draw_paused_gfx(&mut self) -> Result<(), EngineError> {
+        for layer in [0, 1, 2, 3, 4, 5, 7, 6] {
+            self.draw_object_list(layer)?;
+        }
+        Ok(())
+    }
+
+    /// Polls the input source for absolute tick `tick` and copies the player states into the
+    /// engine state.
+    fn poll_input(&mut self, tick: u64) {
+        let players = self.input.poll_at(tick);
         apply_players(&mut self.state, &players);
         if let Some(index) = self.press_button_global {
             let pressed = players
@@ -402,20 +744,20 @@ impl Engine {
     }
 
     /// `DrawObjectList`: runs `ObjectDraw` for every entity in `layer`'s draw list.
+    ///
+    /// The list is walked by live index, exactly like upstream's `for (i < listSize)` loop, so a
+    /// draw event that appends to (or clears) the same list affects the current pass.
     fn draw_object_list(&mut self, layer: usize) -> Result<(), EngineError> {
-        let Some(slot) = self.state.draw_lists.get_mut(layer) else {
-            return Ok(());
-        };
-        let list = std::mem::take(slot);
-        let result = self.run_draw_list(&list);
-        if let Some(target) = self.state.draw_lists.get_mut(layer) {
-            *target = list;
-        }
-        result
-    }
-
-    fn run_draw_list(&mut self, list: &[i32]) -> Result<(), EngineError> {
-        for &slot in list {
+        let mut index = 0usize;
+        while let Some(slot) = self
+            .state
+            .draw_lists
+            .get(layer)
+            .and_then(|list| list.get(index))
+            .copied()
+        {
+            index += 1;
+            self.state.object_entity_pos = usize::try_from(slot).unwrap_or(0);
             let Some(entity) = self
                 .state
                 .entities
@@ -427,7 +769,6 @@ impl Engine {
             if entity.type_id == 0 {
                 continue;
             }
-            self.state.object_entity_pos = usize::try_from(slot).unwrap_or(0);
             let Some(entry) = self.state.objects.get(usize::from(entity.type_id)) else {
                 continue;
             };
@@ -541,6 +882,17 @@ impl Engine {
 
     /// Ports the active-entity check from `ProcessObjects`.
     fn process_objects(&mut self) -> Result<(), EngineError> {
+        self.process_objects_impl(false)
+    }
+
+    /// `ProcessFrozenObjects`: like [`Self::process_objects`], but only `PRIORITY_ALWAYS`
+    /// entities run their update script. Type groups are still rebuilt so frozen ALWAYS
+    /// objects see the same interaction lists as upstream.
+    fn process_frozen_objects(&mut self) -> Result<(), EngineError> {
+        self.process_objects_impl(true)
+    }
+
+    fn process_objects_impl(&mut self, frozen: bool) -> Result<(), EngineError> {
         for list in &mut self.state.draw_lists {
             list.clear();
         }
@@ -587,7 +939,9 @@ impl Engine {
                 continue;
             };
             let update = entry.script.update;
-            if self.script_exists(update.code_pos) {
+            if self.script_exists(update.code_pos)
+                && (!frozen || entity.priority == PRIORITY_ALWAYS)
+            {
                 self.state.object_entity_pos = slot;
                 self.scripts.vm_state.current_event = ScriptEvent::Main;
                 self.run_host_event(update.code_pos, update.jump_pos)?;
@@ -621,6 +975,11 @@ impl Engine {
     /// guard). Scenes that keep the camera disabled (the title screens) drive the scroll
     /// themselves through `screen.xoffset`/`screen.yoffset`, so an unconditional follow here
     /// would clobber the script-set values every frame.
+    ///
+    /// Only `CAMERASTYLE_FOLLOW` (0) is dispatched; upstream's other styles
+    /// (`EXTENDED`/`EXTENDED_OFFSET_L`/`EXTENDED_OFFSET_R`/`HLOCKED`/`FIXED`/`STATIC`, 1-6)
+    /// and the `cameraEnabled != 1` branch that calls `SetPlayerLockedScreenPosition` are
+    /// dormant. The verified S1/S2 runs use style 0 only.
     fn update_camera(&mut self) {
         follow_camera(&mut self.state);
     }
@@ -669,6 +1028,7 @@ impl Engine {
             camera.adjust_y,
             camera.shake_x,
             camera.shake_y,
+            camera.locked_y,
         ] {
             put_i32(&mut hasher, value);
         }
@@ -832,13 +1192,19 @@ impl Engine {
     }
 }
 
-/// Deterministic simplified camera follow, split out for unit testing.
+/// `SetPlayerScreenPosition` (`CAMERASTYLE_FOLLOW`), ported from `SceneLegacyv4.cpp`.
 ///
-/// Upstream only recomputes `xScrollOffset`/`yScrollOffset` inside `SetPlayerScreenPosition`,
-/// which `ProcessStage` calls under `cameraEnabled == 1 && cameraTarget > -1`
-/// (`Scene.cpp:250-262`). Scenes that keep the camera disabled or targetless (the title
-/// screens) drive the scroll themselves through `screen.xoffset`/`screen.yoffset`, so an
-/// unconditional follow here would clobber the script-set values every frame.
+/// `ProcessStage` only calls this through `HandleCameras` while `cameraEnabled == 1`; scenes
+/// that keep the camera disabled or targetless (the title screens) drive the scroll themselves
+/// through `screen.xoffset`/`screen.yoffset`, so an unconditional follow would clobber the
+/// script-set values. The boundary easing, the `xPosDif`/`yPosDif` dead zones, the
+/// `cameraLockedY` latch and the `SCREEN_SCROLL_UP`/`DOWN` clamps all mirror upstream exactly.
+///
+/// This is the only camera style implemented: upstream's `HandleCameras` also dispatches
+/// `EXTENDED`/`EXTENDED_OFFSET_L`/`EXTENDED_OFFSET_R` (`SetPlayerScreenPositionCDStyle`),
+/// `HLOCKED` (`SetPlayerHLockedScreenPosition`), `FIXED`, `STATIC`, and falls back to
+/// `SetPlayerLockedScreenPosition` when `cameraEnabled != 1`. Those paths stay dormant until a
+/// scene needs them.
 pub(crate) fn follow_camera(state: &mut EngineState) {
     if state.camera.enabled != 1 {
         return;
@@ -849,26 +1215,243 @@ pub(crate) fn follow_camera(state: &mut EngineState) {
     let Some(entity) = state.entities.get(target).copied() else {
         return;
     };
+
+    let screen_w = state.screen.xsize;
+    let screen_h = state.screen.ysize;
     let half_x = state.screen.center_x();
-    let half_y = state.screen.center_y();
+    let scroll_up = screen_h / 2 - 16;
+    let scroll_down = screen_h / 2 + 16;
     let target_x = entity.xpos >> 16;
-    let target_y = (entity.ypos >> 16) + state.camera.adjust_y;
-    let min_x = state.stage.cur_x_boundary1.wrapping_add(half_x);
-    let max_x = state.stage.cur_x_boundary2.wrapping_sub(half_x);
-    let min_y = state.stage.cur_y_boundary1.wrapping_add(half_y);
-    let max_y = state.stage.cur_y_boundary2.wrapping_sub(half_y);
-    state.camera.xpos = if min_x <= max_x {
-        target_x.clamp(min_x, max_x)
+    let target_y = state.camera.adjust_y.wrapping_add(entity.ypos >> 16);
+    let x_vel = entity.xvel;
+    let y_vel = entity.yvel;
+
+    // Boundary easing towards the script-written `new*Boundary` values.
+    if state.stage.new_y_boundary1 > state.stage.cur_y_boundary1 {
+        state.stage.cur_y_boundary1 = if state.stage.new_y_boundary1 >= state.screen.y_scroll {
+            state.screen.y_scroll
+        } else {
+            state.stage.new_y_boundary1
+        };
+    }
+    if state.stage.new_y_boundary1 < state.stage.cur_y_boundary1 {
+        if state.stage.cur_y_boundary1 >= state.screen.y_scroll {
+            state.stage.cur_y_boundary1 = state.stage.cur_y_boundary1.wrapping_sub(1);
+        } else {
+            state.stage.cur_y_boundary1 = state.stage.new_y_boundary1;
+        }
+    }
+    if state.stage.new_y_boundary2 < state.stage.cur_y_boundary2 {
+        if state.stage.cur_y_boundary2 <= state.screen.y_scroll.wrapping_add(screen_h)
+            || state.stage.new_y_boundary2 >= state.screen.y_scroll.wrapping_add(screen_h)
+        {
+            state.stage.cur_y_boundary2 = state.stage.cur_y_boundary2.wrapping_sub(1);
+        } else {
+            state.stage.cur_y_boundary2 = state.screen.y_scroll.wrapping_add(screen_h);
+        }
+    }
+    if state.stage.new_y_boundary2 > state.stage.cur_y_boundary2 {
+        if state.screen.y_scroll.wrapping_add(screen_h) >= state.stage.cur_y_boundary2 {
+            state.stage.cur_y_boundary2 = state.stage.cur_y_boundary2.wrapping_add(1);
+            if y_vel > 0 {
+                let buffer = state.stage.cur_y_boundary2.wrapping_add(y_vel >> 16);
+                state.stage.cur_y_boundary2 = if state.stage.new_y_boundary2 < buffer {
+                    state.stage.new_y_boundary2
+                } else {
+                    buffer
+                };
+            }
+        } else {
+            state.stage.cur_y_boundary2 = state.stage.new_y_boundary2;
+        }
+    }
+    if state.stage.new_x_boundary1 > state.stage.cur_x_boundary1 {
+        state.stage.cur_x_boundary1 = if state.screen.x_scroll <= state.stage.new_x_boundary1 {
+            state.screen.x_scroll
+        } else {
+            state.stage.new_x_boundary1
+        };
+    }
+    if state.stage.new_x_boundary1 < state.stage.cur_x_boundary1 {
+        if state.screen.x_scroll <= state.stage.cur_x_boundary1 {
+            state.stage.cur_x_boundary1 = state.stage.cur_x_boundary1.wrapping_sub(1);
+            if x_vel < 0 {
+                state.stage.cur_x_boundary1 = state.stage.cur_x_boundary1.wrapping_add(x_vel >> 16);
+                if state.stage.cur_x_boundary1 < state.stage.new_x_boundary1 {
+                    state.stage.cur_x_boundary1 = state.stage.new_x_boundary1;
+                }
+            }
+        } else {
+            state.stage.cur_x_boundary1 = state.stage.new_x_boundary1;
+        }
+    }
+    if state.stage.new_x_boundary2 < state.stage.cur_x_boundary2 {
+        state.stage.cur_x_boundary2 =
+            if state.stage.new_x_boundary2 > screen_w.wrapping_add(state.screen.x_scroll) {
+                state.stage.new_x_boundary2
+            } else {
+                screen_w.wrapping_add(state.screen.x_scroll)
+            };
+    }
+    if state.stage.new_x_boundary2 > state.stage.cur_x_boundary2 {
+        if screen_w.wrapping_add(state.screen.x_scroll) >= state.stage.cur_x_boundary2 {
+            state.stage.cur_x_boundary2 = state.stage.cur_x_boundary2.wrapping_add(1);
+            if x_vel > 0 {
+                state.stage.cur_x_boundary2 = state.stage.cur_x_boundary2.wrapping_add(x_vel >> 16);
+                if state.stage.cur_x_boundary2 > state.stage.new_x_boundary2 {
+                    state.stage.cur_x_boundary2 = state.stage.new_x_boundary2;
+                }
+            }
+        } else {
+            state.stage.cur_x_boundary2 = state.stage.new_x_boundary2;
+        }
+    }
+
+    // Horizontal follow: an 8px dead zone, at most 16px per frame, clamped to the boundaries.
+    let mut x_pos_dif = target_x.wrapping_sub(state.camera.xpos);
+    if target_x > state.camera.xpos {
+        x_pos_dif = x_pos_dif.wrapping_sub(8);
+        if x_pos_dif >= 0 {
+            if x_pos_dif >= 17 {
+                x_pos_dif = 16;
+            }
+        } else {
+            x_pos_dif = 0;
+        }
     } else {
-        target_x
-    };
-    state.camera.ypos = if min_y <= max_y {
-        target_y.clamp(min_y, max_y)
+        x_pos_dif = x_pos_dif.wrapping_add(8);
+        if x_pos_dif > 0 {
+            x_pos_dif = 0;
+        } else if x_pos_dif <= -17 {
+            x_pos_dif = -16;
+        }
+    }
+    let mut centered_x_bound1 = state.camera.xpos.wrapping_add(x_pos_dif);
+    state.camera.xpos = centered_x_bound1;
+    if centered_x_bound1 < half_x.wrapping_add(state.stage.cur_x_boundary1) {
+        state.camera.xpos = half_x.wrapping_add(state.stage.cur_x_boundary1);
+        centered_x_bound1 = state.camera.xpos;
+    }
+    let centered_x_bound2 = state.stage.cur_x_boundary2.wrapping_sub(half_x);
+    if centered_x_bound2 < centered_x_bound1 {
+        state.camera.xpos = centered_x_bound2;
+        centered_x_bound1 = centered_x_bound2;
+    }
+
+    // Vertical follow: `scrollTracking` uses a 32px window; otherwise the camera latches once
+    // it settles within 6px of the target.
+    let mut y_pos_dif;
+    if entity.scroll_tracking != 0 {
+        if target_y <= state.camera.ypos {
+            y_pos_dif = target_y.wrapping_sub(state.camera.ypos).wrapping_add(32);
+            if y_pos_dif <= 0 {
+                if y_pos_dif <= -17 {
+                    y_pos_dif = -16;
+                }
+            } else {
+                y_pos_dif = 0;
+            }
+        } else {
+            y_pos_dif = target_y.wrapping_sub(state.camera.ypos).wrapping_sub(32);
+            if y_pos_dif >= 0 {
+                if y_pos_dif >= 17 {
+                    y_pos_dif = 16;
+                }
+            } else {
+                y_pos_dif = 0;
+            }
+        }
+        state.camera.locked_y = 0;
+    } else if state.camera.locked_y != 0 {
+        y_pos_dif = 0;
+        state.camera.ypos = target_y;
+    } else if target_y <= state.camera.ypos {
+        y_pos_dif = target_y.wrapping_sub(state.camera.ypos);
+        if target_y.wrapping_sub(state.camera.ypos) <= 0 {
+            if y_pos_dif >= -32 && y_vel.unsigned_abs() <= 0x60000 {
+                if y_pos_dif < -6 {
+                    y_pos_dif = -6;
+                }
+            } else if y_pos_dif < -16 {
+                y_pos_dif = -16;
+            }
+        } else {
+            y_pos_dif = 0;
+            state.camera.locked_y = 1;
+        }
     } else {
-        target_y
+        y_pos_dif = target_y.wrapping_sub(state.camera.ypos);
+        if target_y.wrapping_sub(state.camera.ypos) < 0 {
+            y_pos_dif = 0;
+            state.camera.locked_y = 1;
+        } else if y_pos_dif > 32 || y_vel.unsigned_abs() > 0x60000 {
+            if y_pos_dif > 16 {
+                y_pos_dif = 16;
+            } else {
+                state.camera.locked_y = 1;
+            }
+        } else if y_pos_dif <= 6 {
+            state.camera.locked_y = 1;
+        } else {
+            y_pos_dif = 6;
+        }
+    }
+
+    let mut new_cam_y = state.camera.ypos.wrapping_add(y_pos_dif);
+    if new_cam_y
+        <= state
+            .stage
+            .cur_y_boundary1
+            .wrapping_add(scroll_up.wrapping_sub(1))
+    {
+        new_cam_y = state.stage.cur_y_boundary1.wrapping_add(scroll_up);
+    }
+    state.camera.ypos = new_cam_y;
+    if state
+        .stage
+        .cur_y_boundary2
+        .wrapping_sub(scroll_down.wrapping_sub(1))
+        <= new_cam_y
+    {
+        state.camera.ypos = state.stage.cur_y_boundary2.wrapping_sub(scroll_down);
+    }
+
+    state.screen.x_scroll = state.camera.shake_x.wrapping_add(centered_x_bound1) - half_x;
+    let pos = state
+        .camera
+        .ypos
+        .wrapping_add(entity.look_pos_y)
+        .wrapping_sub(scroll_up);
+    state.screen.y_scroll = if pos < state.stage.cur_y_boundary1 {
+        state.stage.cur_y_boundary1
+    } else {
+        pos
     };
-    state.screen.x_scroll = state.camera.shake_x + state.camera.xpos - half_x;
-    state.screen.y_scroll = state.camera.shake_y + state.camera.ypos - half_y;
+    let mut y = state.stage.cur_y_boundary2.wrapping_sub(screen_h);
+    if state
+        .stage
+        .cur_y_boundary2
+        .wrapping_sub(screen_h.wrapping_sub(1))
+        > state.screen.y_scroll
+    {
+        y = state.screen.y_scroll;
+    }
+    state.screen.y_scroll = state.camera.shake_y.wrapping_add(y);
+
+    if state.camera.shake_x != 0 {
+        state.camera.shake_x = if state.camera.shake_x <= 0 {
+            !state.camera.shake_x
+        } else {
+            -state.camera.shake_x
+        };
+    }
+    if state.camera.shake_y != 0 {
+        state.camera.shake_y = if state.camera.shake_y <= 0 {
+            !state.camera.shake_y
+        } else {
+            -state.camera.shake_y
+        };
+    }
 }
 
 fn place_scene_entities(store: &mut EntityStore, entities: &[SceneEntity]) {

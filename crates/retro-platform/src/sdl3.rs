@@ -190,31 +190,38 @@ impl Platform for Sdl3Platform {
         }
         let audio = sdl.audio().map_err(PlatformError::sdl)?;
         let driver = audio.current_audio_driver();
+        // Query the system default playback device (via the documented default sentinel, which
+        // does not open it) for its preferred format and hardware buffer size, then open the
+        // simplified device stream. `spec` is the app side of the stream, forced to the mixer's
+        // 44.1 kHz stereo f32; when the hardware runs at a different format SDL converts into the
+        // device's format automatically.
+        let default_device = audio.default_playback_device();
+        let device_name = default_device
+            .name()
+            .unwrap_or_else(|_| "default playback device".to_owned());
+        let (preferred_spec, device_buffer_frames) = match default_device.format() {
+            Ok((spec, buffer_frames)) => (Some(spec), buffer_frames),
+            Err(_) => (None, None),
+        };
         let spec = AudioSpec {
             freq: Some(desc.sample_rate as i32),
             channels: Some(desc.channels as i32),
             format: Some(AudioFormat::f32_sys()),
         };
-        let device = audio
-            .open_playback_device(&spec)
-            .map_err(PlatformError::sdl)?;
-        let device_name = device
-            .name()
-            .unwrap_or_else(|_| "default playback device".to_owned());
-        let stream = device
+        let stream = default_device
             .open_device_stream(Some(&spec))
             .map_err(PlatformError::sdl)?;
-        // SDL starts a device stream paused; resume it defensively and keep going when the
-        // backend refuses so a device quirk can never abort the game.
-        if let Err(error) = stream.resume() {
-            eprintln!("warning: audio stream resume failed: {error}");
-        }
+        // The device stream starts paused. Leave it paused: `AudioEngine::with_prebuffer` fills
+        // the queue to its target and then calls `start`, so playback never begins empty.
+        let (_, obtained_spec) = stream.get_format().unwrap_or((None, None));
         Ok(Box::new(Sdl3Audio {
             stream,
             sample_rate: desc.sample_rate,
             channels: desc.channels,
             device_name,
             driver_name: driver,
+            device_spec: obtained_spec.or(preferred_spec),
+            device_buffer_frames,
         }))
     }
 
@@ -323,31 +330,23 @@ impl Window for Sdl3Window {
     }
 }
 
-/// Maximum queued audio in engine ticks (about 50 ms at 60 Hz).
-///
-/// [`Sdl3Audio::submit`] never lets the stream queue exceed this. `SDL_PutAudioStreamData` is
-/// non-blocking and appends to the queue, so without a cap a device that stops draining would
-/// grow memory and audio latency without bound. At the cap new frames are dropped until the
-/// device drains, which parks latency at ~50 ms without any clear/resync step.
-pub const MAX_QUEUED_TICKS: usize = 3;
-
-/// Number of frames a single [`Sdl3Audio::submit`] call may enqueue.
-///
-/// Returns 0 when the queue is already at or over `cap`; otherwise the count is limited so the
-/// queue can never be pushed past `cap` by one call. This is a pure function so the cap logic is
-/// unit-testable without an SDL device.
-#[must_use]
-fn frames_within_capacity(queued: usize, total: usize, cap: usize) -> usize {
-    cap.saturating_sub(queued).min(total)
-}
-
 /// SDL3 audio stream accepting interleaved f32 samples.
+///
+/// The device is opened paused (`SDL_OpenAudioDeviceStream` semantics) and the queue cap and
+/// prebuffer are enforced one layer up by `retro_audio::AudioEngine::with_prebuffer`, which uses
+/// [`AudioDevice::queued_frames`] and calls [`AudioDevice::start`] when the target is queued.
+/// `SDL_PutAudioStreamData` is non-blocking and appends, so this device simply reports the
+/// stream's queued input frames and accepts every frame it is offered.
 pub struct Sdl3Audio {
     stream: AudioStreamOwner,
     sample_rate: u32,
     channels: u8,
     device_name: String,
     driver_name: &'static str,
+    /// Device-side stream format SDL obtained (the app side is always 44.1 kHz f32 stereo).
+    device_spec: Option<AudioSpec>,
+    /// Hardware buffer size in frames reported before opening, when available.
+    device_buffer_frames: Option<i32>,
 }
 
 impl AudioDevice for Sdl3Audio {
@@ -367,23 +366,29 @@ impl AudioDevice for Sdl3Audio {
             ));
         }
         let total = frames.len() / channels;
-        let tick_frames = (self.sample_rate as usize / 60).max(1);
-        let cap = tick_frames * MAX_QUEUED_TICKS;
-        let accepted = frames_within_capacity(self.queued_frames(), total, cap);
-        if accepted == 0 {
-            // The queue is at the cap: drop this tick's output until the device drains. There is
-            // no clear/resync branch because the cap itself keeps latency parked at ~50 ms.
+        if total == 0 {
             return Ok(0);
         }
         self.stream
-            .put_data_f32(&frames[..accepted * channels])
+            .put_data_f32(frames)
             .map_err(PlatformError::sdl)?;
-        Ok(accepted)
+        Ok(total)
     }
 
     fn queued_frames(&self) -> usize {
+        // `SDL_GetAudioStreamQueued` counts input bytes put into the stream (before SDL's
+        // conversion to the hardware format), so this is in 44.1 kHz stereo frames.
         let bytes = self.stream.queued_bytes().unwrap_or(0).max(0) as usize;
         bytes / (std::mem::size_of::<f32>() * self.channels.max(1) as usize)
+    }
+
+    fn start(&mut self) -> Result<(), PlatformError> {
+        // Keep going when the backend refuses a resume so a device quirk can never abort the
+        // game; the queue cap still bounds latency if playback never starts.
+        if let Err(error) = self.stream.resume() {
+            eprintln!("warning: audio stream resume failed: {error}");
+        }
+        Ok(())
     }
 
     fn close(&mut self) -> Result<(), PlatformError> {
@@ -391,8 +396,45 @@ impl AudioDevice for Sdl3Audio {
     }
 
     fn description(&self) -> String {
-        format!("{} ({})", self.device_name, self.driver_name)
+        format_sdl_audio_description(
+            &self.device_name,
+            self.driver_name,
+            self.device_spec.as_ref(),
+            self.device_buffer_frames,
+        )
     }
+}
+
+/// Formats the startup `audio:` diagnostics line body for the SDL3 backend.
+///
+/// Reports the opened device's actual format and hardware buffer rather than the requested one,
+/// so a device running at e.g. 48 kHz is visible (SDL resamples the 44.1 kHz app stream), plus
+/// the hardware buffer in frames and milliseconds.
+#[must_use]
+fn format_sdl_audio_description(
+    device_name: &str,
+    driver_name: &str,
+    device_spec: Option<&AudioSpec>,
+    device_buffer_frames: Option<i32>,
+) -> String {
+    let mut description = format!("{device_name}, {driver_name}");
+    if let Some(spec) = device_spec {
+        description.push_str(&format!(
+            ", device {} Hz {} {:?}",
+            spec.freq.unwrap_or(0),
+            spec.channels.unwrap_or(0),
+            spec.format.unwrap_or(AudioFormat::UNKNOWN)
+        ));
+    }
+    if let Some(frames) = device_buffer_frames.filter(|frames| *frames > 0) {
+        let rate = device_spec
+            .and_then(|spec| spec.freq)
+            .filter(|rate| *rate > 0)
+            .unwrap_or(44_100);
+        let ms = f64::from(frames) * 1000.0 / f64::from(rate);
+        description.push_str(&format!(", {frames}-frame/{ms:.1} ms device buffer"));
+    }
+    description
 }
 
 /// Digital trigger threshold in raw SDL axis units, equivalent to the upstream 0.3 deadzone.
@@ -984,35 +1026,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn audio_queue_parks_at_the_cap_without_a_resync_branch() {
-        let tick = 735usize;
-        let cap = tick * MAX_QUEUED_TICKS;
-        assert_eq!(frames_within_capacity(0, tick, cap), tick);
-        assert_eq!(frames_within_capacity(cap - 1, tick, cap), 1);
-        assert_eq!(frames_within_capacity(cap, tick, cap), 0);
-        assert_eq!(frames_within_capacity(cap * 100, tick, cap), 0);
-        assert_eq!(frames_within_capacity(0, cap + 500, cap), cap);
-        assert_eq!(frames_within_capacity(0, 0, cap), 0);
-        assert_eq!(frames_within_capacity(0, tick, 0), 0);
+    fn audio_description_reports_device_format_and_buffer() {
+        let spec = AudioSpec {
+            freq: Some(48_000),
+            channels: Some(2),
+            format: Some(AudioFormat::f32_sys()),
+        };
+        let description =
+            format_sdl_audio_description("Speakers", "pipewire", Some(&spec), Some(1_024));
+        assert!(
+            description.starts_with("Speakers, pipewire"),
+            "{description}"
+        );
+        assert!(description.contains("device 48000 Hz 2"), "{description}");
+        assert!(description.contains("1024-frame/21.3 ms"), "{description}");
 
-        // Worst case: the device never drains and every tick offers a full tick of frames. The
-        // cap must park the queue (accepted drops to 0) instead of growing it, which is why no
-        // clear/resync branch is needed.
-        let mut queued = 0usize;
-        for _ in 0..100 {
-            let accepted = frames_within_capacity(queued, tick, cap);
-            assert!(
-                queued + accepted <= cap,
-                "queue grew past the {MAX_QUEUED_TICKS}-tick cap"
-            );
-            queued += accepted;
-        }
-        assert_eq!(queued, cap);
-        assert_eq!(frames_within_capacity(queued, tick, cap), 0);
-
-        // When the device later drains one tick, exactly one tick of room reopens.
-        queued -= tick;
-        assert_eq!(frames_within_capacity(queued, tick, cap), tick);
+        // Missing format/buffer information must not produce empty or malformed fields.
+        let fallback = format_sdl_audio_description("Default", "dummy", None, None);
+        assert_eq!(fallback, "Default, dummy");
+        let no_buffer = format_sdl_audio_description("Default", "dummy", Some(&spec), Some(0));
+        assert!(!no_buffer.contains("device buffer"), "{no_buffer}");
     }
 
     #[test]

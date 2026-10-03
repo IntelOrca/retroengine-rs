@@ -9,8 +9,8 @@ use retro_engine::Engine;
 use retro_engine::rng::DEFAULT_SEED;
 use retro_format_v4::gameconfig::PALETTE_COUNT;
 use retro_format_v4::scene::{
-    ACTIVE_LAYER_COUNT, ENTITY_ATTRIB_DIRECTION, ENTITY_ATTRIB_DRAW_ORDER, ENTITY_ATTRIB_STATE,
-    ENTITY_ATTRIB_VALUES,
+    ACTIVE_LAYER_COUNT, ENTITY_ATTRIB_DIRECTION, ENTITY_ATTRIB_DRAW_ORDER, ENTITY_ATTRIB_PRIORITY,
+    ENTITY_ATTRIB_STATE, ENTITY_ATTRIB_VALUES,
 };
 use retro_format_v4::stageconfig::STAGE_PALETTE_COUNT;
 use retro_io::MemorySource;
@@ -233,6 +233,148 @@ fn draw_source(draw_body: &str) -> Arc<dyn retro_io::DataSource> {
     Arc::new(source)
 }
 
+/// Builds a synthetic asset set with a green and a blue 1x1 `DrawRect` object (types 1 and 2)
+/// whose draw lists are set per entity, plus a one-chunk act layout used by layer slot 0.
+fn overlap_source(orders: [u8; 2]) -> Arc<dyn retro_io::DataSource> {
+    let mut bytes = Vec::new();
+    push_string(&mut bytes, "Synthetic");
+    push_string(&mut bytes, "draw overlap");
+    for _ in 0..PALETTE_COUNT {
+        bytes.extend_from_slice(&[0, 0, 0]);
+    }
+    bytes.push(2); // object count: all names first, then the paired script paths
+    push_string(&mut bytes, "Green Object");
+    push_string(&mut bytes, "Blue Object");
+    push_string(&mut bytes, "Test/GreenObject.txt");
+    push_string(&mut bytes, "Test/BlueObject.txt");
+    bytes.push(0); // global variables
+    bytes.push(0); // sound effects
+    bytes.push(0); // players
+    for category in 0..4 {
+        let scenes = u8::from(category == 0);
+        bytes.push(scenes);
+        if category == 0 {
+            push_string(&mut bytes, "Zone01");
+            push_string(&mut bytes, "1");
+            push_string(&mut bytes, "TEST ZONE");
+            bytes.push(1);
+        }
+    }
+
+    let mut scene = Vec::new();
+    push_string(&mut scene, "TEST");
+    scene.extend_from_slice(&[0, 9, 9, 9]); // layer slot 0 draws act layout 0
+    scene.push(3); // midpoint: list 0 is under layer 0, list 3 is over it
+    scene.push(1);
+    scene.push(0);
+    scene.push(1);
+    scene.push(0);
+    scene.extend_from_slice(&0u16.to_le_bytes()); // one chunk
+    scene.extend_from_slice(&2u16.to_le_bytes()); // two entities
+    for (slot, order) in orders.into_iter().enumerate() {
+        let attributes = ENTITY_ATTRIB_DRAW_ORDER | ENTITY_ATTRIB_PRIORITY;
+        scene.extend_from_slice(&attributes.to_le_bytes());
+        scene.push(1 + slot as u8); // type: green then blue
+        scene.push(0); // property value
+        scene.extend_from_slice(&(100i32 << 16).to_le_bytes());
+        scene.extend_from_slice(&(100i32 << 16).to_le_bytes());
+        scene.push(order);
+        scene.push(2); // PRIORITY_ALWAYS keeps the entity active regardless of scroll
+    }
+
+    let mut source = MemorySource::new();
+    source.insert(
+        "Settings.ini",
+        "[Game]
+gameType=1
+txtScripts=n
+",
+    );
+    source.insert("Data/Game/GameConfig.bin", bytes);
+    source.insert("Data/Stages/Zone01/StageConfig.bin", stage_config_bytes());
+    source.insert("Data/Stages/Zone01/Act1.bin", scene);
+    source.insert(
+        "Data/Scripts/Test/GreenObject.txt",
+        "event ObjectDraw\n    DrawRect(0, 0, 1, 1, 0, 255, 0, 255)\nend event\n",
+    );
+    source.insert(
+        "Data/Scripts/Test/BlueObject.txt",
+        "event ObjectDraw\n    DrawRect(0, 0, 1, 1, 0, 0, 255, 255)\nend event\n",
+    );
+    Arc::new(source)
+}
+
+/// Replaces the synthetic (empty) tile assets with a one-chunk, fully opaque red layer so the
+/// framebuffer proves which draw pass wrote the overlapping pixel last.
+fn install_overlap_layer(engine: &mut Engine) {
+    engine.state.stage.active_layers = [0, 9, 9, 9];
+    {
+        let layer = &mut engine.state.layers[0];
+        layer.xsize = 1;
+        layer.ysize = 1;
+        layer.layer_type = retro_render::LAYER_HSCROLL;
+        layer.set_entry(0, 0, 0);
+    }
+    let mut pixels = vec![0u8; retro_render::TILE_SET_16_SIZE];
+    pixels[..256].fill(1);
+    engine.state.render.tiles.pixels = pixels;
+    engine.state.render.tiles.chunks = vec![
+        retro_render::ChunkEntry {
+            gfx_data_pos: 0,
+            direction: 0,
+            visual_plane: 0,
+        };
+        64
+    ];
+    engine.state.render.palette.set_entry(0, 1, 255, 0, 0);
+}
+
+#[test]
+fn draw_order_interleaves_objects_and_tile_layers() {
+    // `midpoint == 3`: list 0 runs before tile layer 0, list 3 runs after it. The opaque red
+    // layer therefore covers the green object but not the blue one.
+    let mut engine = Engine::load(overlap_source([0, 3]), None, None, DEFAULT_SEED).unwrap();
+    install_overlap_layer(&mut engine);
+    engine.run_frame().unwrap();
+    assert_eq!(
+        engine.state.draw_lists[3],
+        vec![33],
+        "only the blue entity is in list 3"
+    );
+    assert_eq!(
+        engine.framebuffer().get(0, 0),
+        0x001F,
+        "blue object draws after the tile layer"
+    );
+
+    // Removing the blue entity leaves only the green list-0 object, which the layer covers.
+    let mut engine = Engine::load(overlap_source([0, 3]), None, None, DEFAULT_SEED).unwrap();
+    install_overlap_layer(&mut engine);
+    engine
+        .state
+        .entities
+        .get_mut(33)
+        .expect("blue entity")
+        .type_id = 0;
+    engine.run_frame().unwrap();
+    assert_eq!(
+        engine.framebuffer().get(0, 0),
+        0xF800,
+        "tile layer draws over the list-0 object"
+    );
+
+    // Two objects in the same list are processed in ascending slot order, so blue wins.
+    let mut engine = Engine::load(overlap_source([3, 3]), None, None, DEFAULT_SEED).unwrap();
+    install_overlap_layer(&mut engine);
+    engine.run_frame().unwrap();
+    assert_eq!(engine.state.draw_lists[3], vec![32, 33]);
+    assert_eq!(
+        engine.framebuffer().get(0, 0),
+        0x001F,
+        "later slot in the same draw list wins"
+    );
+}
+
 #[test]
 fn draw_events_run_after_updates_in_slot_order() {
     let mut engine = Engine::load(
@@ -285,20 +427,21 @@ fn dimming_is_presentation_only_and_never_enters_the_hash() {
     );
     assert_eq!(control.state_hash(), dimmed.state_hash());
 
-    // Idle frames advance the timer towards the limit.
+    // Idle frames advance the timer towards the limit. Script line `N` belongs to record `N`
+    // (the load tick's line 0 is never processed), so four frames consume lines 1..=4.
     let mut idle = Engine::load(draw_source(body), None, None, DEFAULT_SEED).unwrap();
     idle.state.render.dim_limit = 10;
     let mut script = String::from("retro-input 1\n");
-    for frame in 0..4 {
+    for frame in 0..5 {
         script.push_str(&format!("{frame} - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n"));
     }
-    script.push_str("4 RIGHT 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n");
+    script.push_str("5 RIGHT 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n");
     idle.set_scripted_input(retro_input::ScriptedInput::from_str(&script).unwrap());
     for _ in 0..4 {
         idle.run_frame().unwrap();
     }
     assert_eq!(idle.state.render.dim_timer, 4);
-    // A held button resets the timer.
+    // The fifth frame consumes line 5: a held button resets the timer.
     idle.run_frame().unwrap();
     assert!(idle.state.input.right);
     assert_eq!(idle.state.render.dim_timer, 0);

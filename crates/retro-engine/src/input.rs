@@ -89,11 +89,29 @@ impl EngineInput {
         self.raw = raw;
     }
 
-    /// Produces the states for the current frame.
+    /// Produces the states for the current frame (sequential polling).
     pub fn poll(&mut self) -> [retro_input::InputState; PLAYER_COUNT] {
-        self.states = match &mut self.mode {
+        self.states = self.poll_mode(None);
+        self.states
+    }
+
+    /// Produces the states for absolute engine tick `tick`.
+    ///
+    /// The engine passes the record number (`state.frame + 1`) so a scripted replay consumes
+    /// line `N` on record `N`, matching the reference harness. Sequential sources (null,
+    /// platform) ignore the tick.
+    pub fn poll_at(&mut self, tick: u64) -> [retro_input::InputState; PLAYER_COUNT] {
+        self.states = self.poll_mode(Some(tick));
+        self.states
+    }
+
+    fn poll_mode(&mut self, tick: Option<u64>) -> [retro_input::InputState; PLAYER_COUNT] {
+        match &mut self.mode {
             InputMode::Null(_) => idle_states(),
-            InputMode::Scripted(scripted) => scripted.poll(),
+            InputMode::Scripted(scripted) => match tick {
+                Some(tick) => scripted.poll_at(tick),
+                None => scripted.poll(),
+            },
             InputMode::Platform => {
                 let mut states = std::array::from_fn(|index| {
                     self.mappings
@@ -115,8 +133,7 @@ impl EngineInput {
                 }
                 states
             }
-        };
-        self.states
+        }
     }
 
     /// The states produced by the most recent [`EngineInput::poll`].
@@ -316,6 +333,21 @@ select=0x9\n";
         input.set_raw(raw_with(79));
         let states = input.poll();
         assert!(states[0].held.contains(ButtonState::A | ButtonState::RIGHT));
+    }
+
+    #[test]
+    fn scripted_poll_at_consumes_line_n_on_tick_n() {
+        let script = "retro-input 1\n\
+                      0 A 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n\
+                      1 B 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n\
+                      2 C 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n";
+        let mut input = EngineInput::new(&settings());
+        input.set_scripted(ScriptedInput::from_str(script).unwrap());
+        assert!(input.poll_at(1)[0].held.contains(ButtonState::B));
+        assert!(input.poll_at(2)[0].held.contains(ButtonState::C));
+        // Null input ignores the tick.
+        input.set_null();
+        assert_eq!(input.poll_at(2), idle_states());
     }
 
     fn test_state() -> EngineState {

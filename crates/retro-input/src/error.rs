@@ -59,6 +59,14 @@ pub enum InputError {
         /// The offending name.
         name: String,
     },
+    /// An `L`/`R` button was requested. The rev03 legacy `ControllerState` has no L/R fields,
+    /// so neither the reference harness nor the v4 host can inject them.
+    UnsupportedButton {
+        /// One-based line number.
+        line: usize,
+        /// The offending name or mask.
+        name: String,
+    },
     /// The button field is neither a name list, `-`, nor a numeric mask.
     InvalidButtons {
         /// One-based line number.
@@ -125,6 +133,12 @@ impl fmt::Display for InputError {
             ),
             Self::UnknownButton { line, name } => {
                 write!(f, "line {line}: unknown button `{name}`")
+            }
+            Self::UnsupportedButton { line, name } => {
+                write!(
+                    f,
+                    "line {line}: button `{name}` cannot be replayed (rev03 controllers have no L/R fields)"
+                )
             }
             Self::InvalidButtons { line, value } => {
                 write!(f, "line {line}: invalid button field `{value}`")

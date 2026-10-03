@@ -32,6 +32,16 @@ pub const TILE_LAYER_HEIGHT: usize = 0x100;
 pub const PARALLAX_COUNT: usize = 0x100;
 /// `ENGINE_MAINGAME`, the only engine mode modelled by M3.
 pub const ENGINE_MAINGAME: i32 = 1;
+/// `STAGEMODE_LOAD`: the scene-load tick (`LoadStageFiles`), handled by the deferred load path.
+pub const STAGEMODE_LOAD: i32 = 0;
+/// `STAGEMODE_NORMAL`: the stage mode `ProcessStage` enters after finishing `STAGEMODE_LOAD`.
+pub const STAGEMODE_NORMAL: i32 = 1;
+/// `STAGEMODE_PAUSED`: only `PRIORITY_ALWAYS` entities update and draw (`ProcessPausedObjects`).
+pub const STAGEMODE_PAUSED: i32 = 2;
+/// `STAGEMODE_FROZEN`: frozen for debug frame stepping; `ProcessStage` has no plain-mode case.
+pub const STAGEMODE_FROZEN: i32 = 3;
+/// `STAGEMODE_2P`: split-screen mode; `ProcessStage` has no plain-mode case for it.
+pub const STAGEMODE_2P: i32 = 4;
 /// Number of text menus upstream keeps (`TEXTMENU_COUNT`).
 pub const TEXT_MENU_COUNT: usize = 0x2;
 /// Maximum characters stored per text menu (`TEXTDATA_COUNT`).
@@ -196,6 +206,35 @@ impl InputState {
         self.down(var - 14)
     }
 
+    /// Writes the key-down variable for a rev03 input id (170..=183); returns whether the id was
+    /// recognised. Scripts may write `keyDown[...]` (upstream `VAR_KEYDOWN*` cases).
+    pub fn set_down(&mut self, var: i32, value: bool) -> bool {
+        match var {
+            170 => self.up = value,
+            171 => self.down = value,
+            172 => self.left = value,
+            173 => self.right = value,
+            174 => self.button_a = value,
+            175 => self.button_b = value,
+            176 => self.button_c = value,
+            177 => self.button_x = value,
+            178 => self.button_y = value,
+            179 => self.button_z = value,
+            180 => self.button_l = value,
+            181 => self.button_r = value,
+            182 => self.start = value,
+            183 => self.select = value,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Writes the key-press variable for a rev03 input id (184..=197); returns whether the id
+    /// was recognised.
+    pub fn set_press(&mut self, var: i32, value: bool) -> bool {
+        self.set_down(var - 14, value)
+    }
+
     /// Whether any button is pressed or held (`inputDevice[INPUT_ANY].press || hold`).
     #[must_use]
     pub fn any_button(&self) -> bool {
@@ -310,7 +349,8 @@ pub struct EngineState {
     pub op_histogram: BTreeMap<String, u64>,
     /// Ops implemented as deterministic stubs, by name.
     pub stub_histogram: BTreeMap<String, u64>,
-    /// Set by `LoadStage`; a real scene switch is deferred to the next milestone.
+    /// Set by `LoadStage`; the runtime applies the scene switch at the start of the next frame,
+    /// mirroring upstream's `stageMode = STAGEMODE_LOAD` handoff.
     pub load_stage_requested: bool,
 }
 

@@ -1,0 +1,36 @@
+--- a/RSDKv5/refharness.cpp
++++ b/RSDKv5/refharness.cpp
+@@ -89,6 +89,10 @@
+         value     = strtoul(token.c_str() + 2, &end, 16);
+         if (!end || *end)
+             return false;
++        // rev03 `ControllerState` has no L/R fields and `InjectInput` never sets the triggers,
++        // so an L/R bit would be silently ignored.
++        if (value & (BTN_L | BTN_R))
++            return false;
+         *out = (unsigned short)value;
+         return true;
+     }
+@@ -98,7 +102,10 @@
+             allDigits = false;
+     }
+     if (allDigits) {
+-        *out = (unsigned short)strtoul(token.c_str(), NULL, 10);
++        value = strtoul(token.c_str(), NULL, 10);
++        if (value & (BTN_L | BTN_R))
++            return false;
++        *out = (unsigned short)value;
+         return true;
+     }
+ 
+@@ -128,10 +135,6 @@
+             bit = BTN_Y;
+         else if (equalsIgnoreCase(name, "Z"))
+             bit = BTN_Z;
+-        else if (equalsIgnoreCase(name, "L"))
+-            bit = BTN_L;
+-        else if (equalsIgnoreCase(name, "R"))
+-            bit = BTN_R;
+         else if (equalsIgnoreCase(name, "START"))
+             bit = BTN_START;
+         else if (equalsIgnoreCase(name, "SELECT"))

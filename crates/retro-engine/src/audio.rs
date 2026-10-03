@@ -109,6 +109,40 @@ impl AudioState {
         state
     }
 
+    /// Rebuilds the SFX/track tables for a new scene while keeping the output device.
+    ///
+    /// `LoadStageFiles` calls `StopAllSfx`/`ReleaseStageSfx` and clears every music track; the
+    /// windowed device, mute flag and volume settings survive the reload.
+    pub fn reload_for_scene(
+        &mut self,
+        source: Arc<dyn DataSource>,
+        game_config: &GameConfig,
+        stage_config: &StageConfig,
+        settings: &AudioSettings,
+    ) {
+        let device = self.device.take();
+        let muted = self.muted;
+        let capture = self.capture;
+        *self = Self::for_scene(source, game_config, stage_config, settings);
+        self.device = device;
+        self.muted = muted;
+        self.capture = capture;
+    }
+
+    /// `StopAllSfx` plus clearing every music track (`SetMusicTrack("", i, false, 0)`).
+    ///
+    /// `LoadStageFiles` runs both for a same-folder act reload; a full scene load rebuilds the
+    /// whole table through [`AudioState::reload_for_scene`] instead.
+    pub fn reset_stage_tracks(&mut self) {
+        self.mixer.stop_all_sfx();
+        self.mixer.stop_stream();
+        for track in &mut self.tracks {
+            *track = TrackInfo::default();
+        }
+        self.stream_cache.fill(None);
+        self.stream_failed.fill(false);
+    }
+
     /// Attaches a windowed output device; mixing continues through it from now on.
     pub fn set_device(&mut self, device: AudioEngine) {
         self.device = Some(device);
@@ -438,6 +472,7 @@ fn hash_hex(hash: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use retro_audio::MAX_QUEUED_TICKS;
     use retro_format_v4::SoundEffect;
     use retro_io::MemorySource;
 
@@ -508,6 +543,31 @@ mod tests {
             &AudioSettings::default(),
         );
         (state, source)
+    }
+
+    #[test]
+    fn reset_stage_tracks_clears_music_and_sfx() {
+        let (mut state, _) = state_with_sfx();
+        state.set_track(3, "Song.ogg", true, 0);
+        state.play_sfx(0, false);
+        assert!(state.track_file(3).is_some());
+        assert!(
+            (0..retro_audio::SFX_CHANNEL_COUNT).any(|channel| state
+                .mixer
+                .channel_sfx(retro_audio::SfxChannel(channel))
+                .is_some()),
+            "the sfx must be playing before the reset"
+        );
+        state.reset_stage_tracks();
+        assert!(state.track_file(3).is_none(), "tracks are cleared");
+        assert!(
+            (0..retro_audio::SFX_CHANNEL_COUNT).all(|channel| state
+                .mixer
+                .channel_sfx(retro_audio::SfxChannel(channel))
+                .is_none()),
+            "all sfx are stopped"
+        );
+        assert_eq!(state.music_position(), 0, "the stream is stopped");
     }
 
     #[test]
@@ -803,6 +863,116 @@ mod tests {
         assert!(
             attached.device.is_some(),
             "a zero acceptance is not an error; the device stays attached"
+        );
+    }
+
+    /// A prebuffered device whose queue drains slowly, for the hash-stability integration test.
+    struct DrainingProbeDevice {
+        queued: std::rc::Rc<std::cell::Cell<usize>>,
+        started: std::rc::Rc<std::cell::Cell<bool>>,
+        submits: std::rc::Rc<std::cell::Cell<usize>>,
+        underruns: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl DrainingProbeDevice {
+        fn new() -> (
+            Self,
+            std::rc::Rc<std::cell::Cell<bool>>,
+            std::rc::Rc<std::cell::Cell<usize>>,
+        ) {
+            let queued = std::rc::Rc::new(std::cell::Cell::new(0));
+            let started = std::rc::Rc::new(std::cell::Cell::new(false));
+            let submits = std::rc::Rc::new(std::cell::Cell::new(0));
+            let device = Self {
+                queued: std::rc::Rc::clone(&queued),
+                started: std::rc::Rc::clone(&started),
+                submits,
+                underruns: std::rc::Rc::new(std::cell::Cell::new(0)),
+            };
+            (device, started, queued)
+        }
+    }
+
+    impl retro_platform::AudioDevice for DrainingProbeDevice {
+        fn sample_rate(&self) -> u32 {
+            SAMPLE_RATE
+        }
+
+        fn channels(&self) -> u8 {
+            CHANNELS as u8
+        }
+
+        fn submit(&mut self, frames: &[f32]) -> Result<usize, retro_platform::PlatformError> {
+            if self.started.get() {
+                let drain = if self.submits.get().is_multiple_of(3) {
+                    FRAMES_PER_TICK
+                } else {
+                    0
+                };
+                if drain > self.queued.get() {
+                    self.underruns.set(self.underruns.get() + 1);
+                }
+                self.queued.set(self.queued.get().saturating_sub(drain));
+            }
+            let total = frames.len() / CHANNELS;
+            self.queued.set(self.queued.get() + total);
+            self.submits.set(self.submits.get() + 1);
+            Ok(total)
+        }
+
+        fn queued_frames(&self) -> usize {
+            self.queued.get()
+        }
+
+        fn start(&mut self) -> Result<(), retro_platform::PlatformError> {
+            self.started.set(true);
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), retro_platform::PlatformError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn prebuffered_draining_device_keeps_the_pcm_hash_and_queue_bounded() {
+        let (device, started, queued) = DrainingProbeDevice::new();
+        let (mut local, _) = state_with_sfx();
+        let (mut attached, _) = state_with_sfx();
+        attached.set_device(
+            AudioEngine::with_prebuffer(Box::new(device)).expect("prebuffered audio engine"),
+        );
+        for state in [&mut local, &mut attached] {
+            state.play_sfx(0, false);
+            state.set_capture(true);
+        }
+
+        let mut hashes = Vec::new();
+        for frame in 0..30 {
+            assert_eq!(
+                local.tick(),
+                attached.tick(),
+                "frame {frame}: device queueing must not change the mix hash"
+            );
+            hashes.push(local.last_hash_hex());
+            assert!(
+                queued.get() <= MAX_QUEUED_TICKS * FRAMES_PER_TICK,
+                "frame {frame}: queue above the cap"
+            );
+        }
+        assert_ne!(
+            hashes[0],
+            "0".repeat(64),
+            "the scripted run must be audible"
+        );
+        assert!(
+            started.get(),
+            "the prebuffered engine must start the device"
+        );
+        assert_eq!(
+            local.captured_pcm(),
+            attached.captured_pcm(),
+            "the device receives the hashed samples unchanged"
         );
     }
 

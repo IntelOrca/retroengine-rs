@@ -39,6 +39,8 @@ pub const OBJECT_COUNT: usize = 0x100;
 pub const TYPEGROUP_COUNT: usize = 0x103;
 /// Number of draw layers in Origins revisions (`DRAWLAYER_COUNT`).
 pub const DRAWLAYER_COUNT: usize = 8;
+/// `PRIORITY_ALWAYS`: the entity updates (and draws) even while the stage is paused/frozen.
+pub const PRIORITY_ALWAYS: u8 = 2;
 /// Number of floor/roof sensors carried by an entity in revisions >= rev01.
 pub const FLOOR_SENSOR_COUNT: usize = 5;
 

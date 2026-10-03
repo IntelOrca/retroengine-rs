@@ -250,6 +250,39 @@ mod tests {
     }
 
     #[test]
+    fn decodes_every_direction_and_visual_plane_bit() {
+        // byte0 packs `visual_plane` in bits 4-5, `direction` in bits 2-3 and the high two bits
+        // of the tile index in bits 0-1; bits 6-7 are discarded.
+        for visual_plane in 0..=3u8 {
+            for direction in 0..=3u8 {
+                for index_high in 0..=3u8 {
+                    let byte0 = (visual_plane << 4) | (direction << 2) | index_high;
+                    let tile = Tile128::from_entry([byte0, 0x5A, 0xC3]);
+                    assert_eq!(tile.visual_plane, visual_plane, "byte0={byte0:#04x}");
+                    assert_eq!(tile.direction, direction, "byte0={byte0:#04x}");
+                    assert_eq!(
+                        tile.tile_index,
+                        u16::from(index_high) << 8 | 0x5A,
+                        "byte0={byte0:#04x}"
+                    );
+                    assert_eq!(tile.collision_flag_a, 0xC);
+                    assert_eq!(tile.collision_flag_b, 0x3);
+                    assert_eq!(tile.gfx_data_pos(), i32::from(tile.tile_index) << 8);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn discards_the_top_two_bits_of_byte_zero() {
+        // `entry[0] -= (entry[0] >> 6) << 6` before any field is unpacked.
+        let plain = Tile128::from_entry([0x12, 0x34, 0x56]);
+        for top in [0x00, 0x40, 0x80, 0xC0] {
+            assert_eq!(Tile128::from_entry([0x12 | top, 0x34, 0x56]), plain);
+        }
+    }
+
+    #[test]
     fn decodes_extreme_tile128_entries() {
         let tile = Tile128::from_entry([0xFF, 0xFF, 0xFF]);
         assert_eq!(tile.visual_plane, 3);

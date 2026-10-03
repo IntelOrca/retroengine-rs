@@ -73,6 +73,87 @@ pub struct LoadedWorld {
     pub scripts: LoadedScripts,
 }
 
+/// Stage assets for one act, independent of settings/`GameConfig` detection.
+///
+/// This is the `LoadStageFiles` body after `stageList[activeStageList][stageListPosition]` has
+/// been resolved: deferred `LoadStage` requests reuse it with a folder/act pair taken directly
+/// from the stage list entry.
+pub struct SceneAssets {
+    /// Parsed act file.
+    pub scene: Scene,
+    /// Parsed stage config.
+    pub stage_config: StageConfig,
+    /// Collision context (`None` when the stage has no collision files).
+    pub collision: Option<SceneCollision>,
+    /// Background layers/parallax (`None` when absent).
+    pub backgrounds: Option<Backgrounds>,
+    /// Decoded `16x16Tiles.gif` (`None` when absent or malformed).
+    pub tiles16: Option<TileSheet16>,
+    /// Decoded `128x128Tiles.bin` (`None` when absent or malformed).
+    pub tiles128: Option<TileSheet128>,
+    /// Linked scripts.
+    pub scripts: LoadedScripts,
+}
+
+/// Loads the stage config, act, tiles, collision, backgrounds and scripts for `folder`/`act`.
+///
+/// The folder and act are used verbatim (the GameConfig entry's own values), matching upstream's
+/// `stageList[activeStageList][stageListPosition].folder`/`.id`.
+pub fn load_scene_assets(
+    source: &Arc<dyn DataSource>,
+    game_config: &GameConfig,
+    settings: &EngineSettings,
+    folder: &str,
+    act: &str,
+) -> Result<SceneAssets, EngineError> {
+    let stage_dir = format!("Data/Stages/{folder}");
+    if !source.exists(&Scene::path(&stage_dir, act)) {
+        let available = available_acts(source.as_ref(), &stage_dir);
+        return Err(EngineError::MissingAct {
+            folder: folder.to_owned(),
+            act: act.to_owned(),
+            available: if available.is_empty() {
+                "<none>".to_owned()
+            } else {
+                available.join(", ")
+            },
+        });
+    }
+    let stage_config = StageConfig::load(&stage_dir, source.as_ref())?;
+    let scene = Scene::load(&stage_dir, act, source.as_ref())?;
+
+    let tiles128 = TileSheet128::load(&stage_dir, source.as_ref()).ok();
+    let collision = match (
+        tiles128.clone(),
+        CollisionMasks::load(&stage_dir, source.as_ref()),
+    ) {
+        (Some(tiles), Ok(masks)) => {
+            let layout = StageLayout::from_scene(&scene);
+            Some(SceneCollision::new(layout, tiles, masks))
+        }
+        _ => None,
+    };
+    let tiles16 = TileSheet16::load(&stage_dir, source.as_ref()).ok();
+    let backgrounds = if source.exists(&format!("{stage_dir}/Backgrounds.bin")) {
+        Backgrounds::load(&stage_dir, source.as_ref()).ok()
+    } else {
+        None
+    };
+    // Achievements are referenced by some scripts; load them when present.
+    let _achievements = Achievements::load(source.as_ref()).ok();
+
+    let scripts = load_scripts(source.as_ref(), game_config, &stage_config, settings)?;
+    Ok(SceneAssets {
+        scene,
+        stage_config,
+        collision,
+        backgrounds,
+        tiles16,
+        tiles128,
+        scripts,
+    })
+}
+
 /// A GameConfig scene paired with its category (file order) and global 1-based `--list` index.
 #[derive(Clone, Copy, Debug)]
 struct IndexedScene<'a> {
@@ -637,6 +718,56 @@ pub struct LoadOptions {
     pub origins: bool,
 }
 
+/// Locates a stage folder/act pair in the engine stage lists, returning
+/// `(engine_list, list_pos, list_size)`.
+///
+/// `engine_list` is the `stage.activeList` value (`STAGELIST_*` order, not the GameConfig
+/// file order); `list_size` is the number of entries in that list. `None` when no entry matches.
+#[must_use]
+pub fn engine_list_position(
+    game_config: &GameConfig,
+    folder: &str,
+    act: &str,
+) -> Option<(i32, i32, i32)> {
+    for engine_index in 0..4usize {
+        let Some(category) = game_config.category_for_engine_index(engine_index) else {
+            continue;
+        };
+        for (position, entry) in category.scenes.iter().enumerate() {
+            if entry.folder == folder && entry.id == act {
+                return Some((
+                    engine_index as i32,
+                    position as i32,
+                    category.scenes.len() as i32,
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Resolves a stage list request the way `LoadStage` consumes it: `stage.activeList` selects the
+/// engine stage list and `stage.listPos` the entry inside it.
+///
+/// Returns the entry's folder and id or [`EngineError::InvalidStageList`].
+pub fn stage_list_entry(
+    game_config: &GameConfig,
+    active_list: i32,
+    list_pos: i32,
+) -> Result<(&retro_format_v4::SceneEntry, i32), EngineError> {
+    let invalid = || EngineError::InvalidStageList {
+        list: active_list,
+        pos: list_pos,
+    };
+    let category = usize::try_from(active_list)
+        .ok()
+        .and_then(|index| game_config.category_for_engine_index(index))
+        .ok_or_else(invalid)?;
+    let position = usize::try_from(list_pos).map_err(|_| invalid())?;
+    let entry = category.scenes.get(position).ok_or_else(invalid)?;
+    Ok((entry, category.scenes.len() as i32))
+}
+
 /// Loads settings, configs, scene data and scripts for the requested scene.
 pub fn load_world(
     source: &Arc<dyn DataSource>,
@@ -666,56 +797,20 @@ pub fn load_world_with(
     let game_config = detected.game_config;
 
     let (folder, act) = resolve_scene(&game_config, requested_scene, act)?;
-    let stage_dir = format!("Data/Stages/{folder}");
-    if !source.exists(&Scene::path(&stage_dir, &act)) {
-        let available = available_acts(source.as_ref(), &stage_dir);
-        return Err(EngineError::MissingAct {
-            folder,
-            act,
-            available: if available.is_empty() {
-                "<none>".to_owned()
-            } else {
-                available.join(", ")
-            },
-        });
-    }
-    let stage_config = StageConfig::load(&stage_dir, source.as_ref())?;
-    let scene = Scene::load(&stage_dir, &act, source.as_ref())?;
-
-    let tiles128 = TileSheet128::load(&stage_dir, source.as_ref()).ok();
-    let collision = match (
-        tiles128.clone(),
-        CollisionMasks::load(&stage_dir, source.as_ref()),
-    ) {
-        (Some(tiles), Ok(masks)) => {
-            let layout = StageLayout::from_scene(&scene);
-            Some(SceneCollision::new(layout, tiles, masks))
-        }
-        _ => None,
-    };
-    let tiles16 = TileSheet16::load(&stage_dir, source.as_ref()).ok();
-    let backgrounds = if source.exists(&format!("{stage_dir}/Backgrounds.bin")) {
-        Backgrounds::load(&stage_dir, source.as_ref()).ok()
-    } else {
-        None
-    };
-    // Achievements are referenced by some scripts; load them when present.
-    let _achievements = Achievements::load(source.as_ref()).ok();
-
-    let scripts = load_scripts(source.as_ref(), &game_config, &stage_config, &settings)?;
+    let assets = load_scene_assets(source, &game_config, &settings, &folder, &act)?;
     Ok(LoadedWorld {
         settings,
         raw_settings: detected.settings,
         game_config,
         stage_folder: folder,
         act,
-        scene,
-        stage_config,
-        collision,
-        backgrounds,
-        tiles16,
-        tiles128,
-        scripts,
+        scene: assets.scene,
+        stage_config: assets.stage_config,
+        collision: assets.collision,
+        backgrounds: assets.backgrounds,
+        tiles16: assets.tiles16,
+        tiles128: assets.tiles128,
+        scripts: assets.scripts,
     })
 }
 
