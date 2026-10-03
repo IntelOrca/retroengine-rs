@@ -20,12 +20,15 @@ system SDL2, no `pkg-config`):
 
 | Run | Result |
 |---|---|
-| `build.sh` from a clean build dir | builds SDL2 2.32.10, BLAKE3 1.5.5, patched RSDKv5U + `hash565` |
+| `build.sh` from a clean build dir | builds SDL2 2.32.10 and BLAKE3 1.5.5 (pinned by commit SHA), patched RSDKv5U + `hash565` |
 | S1 `Title` act 1, 600 frames | 600 records, 236 unique framebuffers, exit 0 |
 | S1 `Zone01` act 1, 600 frames (idle / hold RIGHT) | 600 records each, 495 / 380 unique framebuffers |
 | Two identical runs (`cmp records.jsonl`) | byte-identical (deterministic) |
 | S2 `Title` and `Zone01` act 1, 120 frames | boot and render (S2 covered by the same loader) |
-| C reference vs Rust `--dump-frames` PNGs, S1 Zone01 hold-RIGHT | first divergent framebuffer at **frame 155** |
+| C reference vs Rust `--dump-frames` PNGs, S1/S2 `Zone01` idle | **600/600 identical** |
+| C reference vs Rust, S1/S2 `Zone01` hold-RIGHT (`zone01_right.input`) | **600/600 identical** |
+| C reference vs Rust, S1/S2 `Zone01` RIGHT held from frame 400 (`zone01_right400.input`) | **600/600 identical** |
+| C reference vs Rust, S1/S2 `Title` -> `Zone01` START (A held from frame 800, `title_start.input`) | **1200/1200 identical** |
 
 ## Requirements
 
@@ -87,16 +90,35 @@ seed 1592594996
 * Frame numbers must be sequential from 0; the header and `seed` line are optional only in that
   `seed` may be omitted.
 * Polling past the end of the file repeats the last frame, so a 61-line file holds RIGHT forever.
-* Button names: `UP DOWN LEFT RIGHT A B C X Y Z L R START SELECT`, joined with `|`, or `-`,
-  a decimal mask, or a `0x` mask.
+* Button names: `UP DOWN LEFT RIGHT A B C X Y Z START SELECT`, joined with `|`, or `-`, a
+  decimal mask, or a `0x` mask. `L`/`R` are rejected (`bad buttons`): rev03 `ControllerState`
+  has no L/R fields and the harness never injects them, so accepting the tokens would silently
+  do nothing.
 * `seed` (or `--seed`/`REF_HARNESS_SEED`, which take precedence) seeds both libc `rand()` and
   `Engine.randSeed`, so script `Rand()` calls are reproducible.
+
+### Tick alignment
+
+Input lines are indexed by **absolute engine tick**: line `N` is applied on record `N`. The
+reference's `InjectInput` reads `inputMasks[frame]`, and record 0 is the `STAGEMODE_LOAD` tick,
+which never calls `ProcessInput`; line 0 is therefore unused. The Rust port performs that load
+tick in `Engine::load` and its first `run_frame` (record 1) consumes line 1. Scene switches
+trigger further `STAGEMODE_LOAD` ticks, which likewise do not call `ProcessInput` and do not
+consume their line.
+
+Press edges are derived against the previously *processed* line (upstream keeps `down` in
+`controller[]` and clears only `press`), so a button that becomes held on a skipped load-tick
+line still reports a press on the next processed line. This is what made A-at-800 START and
+RIGHT-at-400 replays line up exactly; an off-by-one here is invisible to inputs that hold a
+button continuously (idle/hold-RIGHT) but shifts every press edge by one tick.
 
 `testdata/` contains text-only inputs used by the verified runs:
 
 * `title_idle.input` – header-only, idle (repeat)
+* `title_start.input` – Title screen, A held from line 800 (START -> Zone01)
 * `zone01_idle.input` – header-only, idle (repeat)
 * `zone01_right.input` – idle through frame 59, then RIGHT held
+* `zone01_right400.input` – idle through frame 399, then RIGHT held
 
 ## Record stream format (`records.jsonl`)
 
@@ -117,7 +139,14 @@ One JSON object per line, one line per `ProcessEngine` tick (frame 0 is the scen
 
 When a scene is selected directly (`run.sh` passes `stage=<folder> scene=<act>`), the engine appends
 a synthetic `_RSDK_SCENE` entry to the scene list, which is why `list` is one past the shipped
-scenes and `scenename` is `_RSDK_SCENE`.
+scenes and `scenename` is `_RSDK_SCENE`. The reference seeds `stage.listPos` with that synthetic
+entry (`listPos = totalSceneCount`), while the Rust port points `stage.activeList`/`listPos` at
+the real `GameConfig` entry for the requested scene. Scripts that read those variables
+(`ActFinish`, `SignPost`, `TitleCard`, `DeathEvent`, `Start`, `CheckCurrentStageFolder` and the
+`LoadStage` reload path) would observe a different list position if they compared it against a
+shipped index. The verified windows do not exercise that comparison: idle and RIGHT-from-400
+never leave the scene, the S1 hold-RIGHT death/game-over reloads the same entry, and the Title
+START path overwrites `stage.activeList`/`listPos` in `Start.txt` before calling `LoadStage`.
 
 * `fb.blake3` – BLAKE3 of the **visible** `w × h` RGB565 framebuffer, rows contiguous,
   little-endian u16. The C reference hashes `screens[0].frameBuffer` after `ProcessEngine()`.
@@ -174,6 +203,7 @@ same BLAKE3 as `fb.blake3`. It reports the first divergent frame, and
 | `0001-build-portability.patch` | Makes `pkg-config` optional (SDL2 via `SDL2Config.cmake`) and adds the `RETRO_HARNESS` CMake option wiring `refharness.cpp` + pinned BLAKE3 sources. |
 | `0002-disable-video.patch` | Compiles out libogg/libtheora video playback under `RETRO_HARNESS` (S1/S2 ship no `Data/Video`; avoids a dependency that has no user-local build here). |
 | `0003-reference-harness.patch` | Adds `RSDKv5/refharness.{hpp,cpp}` and hooks: deterministic RNG seed (`Math.cpp`), scripted input injection (`Input.cpp`), no frame-skip/no wall clock + software-renderer fallback + presentation skip (`SDL2RenderDevice.cpp`), frame recording and frame-limit exit (`RetroEngine.cpp`). |
+| `0004-reject-lr-buttons.patch` | Rejects `L`/`R` button names and mask bits in the input script parser; rev03 `ControllerState` has no L/R fields, so they could only be silently ignored. |
 
 The harness only activates when a `REF_HARNESS_*` variable is set; without it the binary behaves
 like the upstream decompilation.
@@ -189,28 +219,32 @@ like the upstream decompilation.
 * Verified: two full 600-frame runs with identical input produced byte-identical
   `records.jsonl`.
 
-## First verified divergence (S1 Zone01, hold RIGHT)
+## Verified parity (`m7-fidelity` @ `c8c3da1` + input alignment)
 
 Commands: the `run.sh` invocation above, plus the Rust command from "Reference vs Rust port"
-(`Rust`: build `m7-fidelity`, seed 1592594996). Observed:
+(`Rust`: build `m7-fidelity`, seed 1592594996). All framebuffer comparisons use
+`compare_frames.py --offset 0`:
 
-* Frames 0–154 match pixel-for-pixel. Frame 0 is the scene load; frames ~0–200 are the title-card
-  pause, so this divergence happens during the title-card fade before gameplay starts.
-* **First divergent frame: 155** (`A=0ad5666c…`, `B=bcc1a1a6…`); at frame 155 the difference is
-  42,838 pixels, all near-black values (`0x0000/0x0001/0x0040/0x0800`), i.e. a background/fade
-  difference rather than the player.
-* By frame 240 the images differ massively (66k pixels) as the runs move through the level
-  differently; frame 599 differs in only 1,235 pixels (y 80–130), consistent with a UI/title-text
-  difference after the Rust run's death/respawn timing diverged.
-* Reference keyframes for inspection: `/tmp/opencode/refrun/final-zone01-right/ppm/frame_0155.ppm`
-  and `frame_0240.ppm` (regenerate with `--ppm 155,240`). These are asset-derived and stay out of
-  the repository.
+| Input | Window | First divergence |
+|---|---|---|
+| `zone01_idle.input` (S1/S2) | 600 frames | none (600/600) |
+| `zone01_right.input` (S1/S2) | 600 frames | none (600/600) |
+| `zone01_right400.input` (S1/S2) | 600 frames | before the tick-alignment fix: record 400; now none |
+| `title_start.input` (S1/S2, Title -> Zone01) | 1200 frames | before: record 801; after the alignment fix: record 1028 (S1) / 1010 (S2), caused by scripts writing `keyDown`/`keyPress`; with those writes ported: none (1200/1200) |
+
+Earlier revisions of the port diverged in the title-card fade (frame 155) and at the first
+death (`STAGEMODE_FROZEN` handling, record 377); both are fixed and covered by pinned tests in
+`crates/retro-engine/tests/{collision_parity,assets}.rs`.
 
 ## Limitations
 
 * Only the RSDKv5U rev-3 **legacy v4** path is exercised; the v3/v5 scene paths are untested.
 * Video playback, mod loader and shader paths are disabled in the harness build. S1/S2 have no
   video assets, so the stub matches the shipped data.
+* Camera styles other than `CAMERASTYLE_FOLLOW` (0) are dormant in the Rust port: upstream's
+  `HandleCameras` also dispatches `EXTENDED`/`EXTENDED_OFFSET_L`/`EXTENDED_OFFSET_R`/`HLOCKED`/
+  `FIXED`/`STATIC` and falls back to `SetPlayerLockedScreenPosition` when `cameraEnabled != 1`.
+  The verified scenes use style 0 only; a scene that switches styles will diverge.
 * Audio is the dummy SDL driver; the harness deliberately compares graphics + simulation state,
   not audio.
 * `run.sh` always regenerates `Settings.ini` with `devMenu=n`, `gameType=0`, `pixWidth=424`; use
@@ -220,5 +254,5 @@ Commands: the `run.sh` invocation above, plus the Rust command from "Reference v
 * The Rust side currently emits a composite `state_hash`, so only framebuffer-image comparison
   (`compare_frames.py`) and reference-to-reference `diff_records.py` are field-level today. If
   `crates/retro-parity` gains a JSONL emitter matching this format, `diff_records.py` will work
-  C↔Rust unchanged (mind the Rust `state.frame` starts at 1 for the first executed frame; use
-  `--offset`).
+  C↔Rust unchanged: scripted input is now indexed by absolute tick, so record `N` consumes line
+  `N` and `--offset 0` aligns the streams.

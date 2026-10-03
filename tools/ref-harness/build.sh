@@ -15,11 +15,13 @@ BUILD="${REF_HARNESS_BUILD:-$HOME/.cache/ref-harness}"
 PREFIX="$BUILD/prefix"
 
 SDL2_REPO="https://github.com/libsdl-org/SDL.git"
-SDL2_REF="release-2.32.10"
+# `release-2.32.10`
+SDL2_REF="5d249570393f7a37e037abf22cd6012a4cc56a71"
 RSDK5_REPO="https://github.com/RSDKModding/RSDKv5-Decompilation.git"
 RSDK5_REF="43d426f8427c5553dab72afc02354e275f9ace48"
 BLAKE3_REPO="https://github.com/BLAKE3-team/BLAKE3.git"
-BLAKE3_REF="1.5.5"
+# `1.5.5`
+BLAKE3_REF="81f772a4cd70dc0325047a6a737d2f6f4b92180e"
 
 # cmake/ninja may live in ~/.local/bin on the harness machine.
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
