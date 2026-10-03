@@ -181,6 +181,199 @@ fn scene_ghz_act1_headless_runs_for_both_games() {
     }
 }
 
+/// Runs the engine with the SDL dummy drivers and fails the test if it does not exit in time.
+#[cfg(unix)]
+fn run_bounded(args: &[&str], timeout: std::time::Duration) -> Output {
+    run_bounded_with_env(args, timeout, &[])
+}
+
+/// Like [`run_bounded`] but lets the caller override individual SDL environment variables.
+#[cfg(unix)]
+fn run_bounded_with_env(
+    args: &[&str],
+    timeout: std::time::Duration,
+    env: &[(&str, &str)],
+) -> Output {
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let mut child = Command::new(bin())
+        .args(args)
+        .env("SDL_VIDEO_DRIVER", "dummy")
+        .env("SDL_VIDEODRIVER", "dummy")
+        .env("SDL_AUDIODRIVER", "dummy")
+        .envs(env.iter().copied())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn retroengine");
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("try_wait").is_some() {
+            return child.wait_with_output().expect("wait_with_output");
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("windowed run did not exit within {timeout:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// A windowed run must create its window, present exactly `--frames` frames and exit 0,
+/// reporting the selected platform, video driver and audio device.
+#[cfg(unix)]
+#[test]
+fn windowed_frames_run_exits_promptly() {
+    use std::time::Duration;
+
+    let root = temp_assets("windowed-frames");
+    write_assets(&root);
+    let user_dir = root.join("user");
+    let output = run_bounded(
+        &[
+            root.to_str().unwrap(),
+            "--frames",
+            "5",
+            "--user-dir",
+            user_dir.to_str().unwrap(),
+        ],
+        Duration::from_secs(30),
+    );
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(text.contains("platform: standalone"), "{text}");
+    assert!(text.contains("presented-frames: 5"), "{text}");
+    assert!(text.contains("hash: "), "{text}");
+    assert!(text.contains("audio: 44100 Hz stereo f32"), "{text}");
+    assert!(text.contains("video: dummy"), "{text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A windowed scripted replay with a frame cap must exit on its own (no quit signal needed),
+/// proving the SDL event pump and the audio path do not block the frame loop.
+#[cfg(unix)]
+#[test]
+fn windowed_scripted_input_with_frames_exits_promptly() {
+    use std::time::Duration;
+
+    let root = temp_assets("windowed-input-frames");
+    write_assets(&root);
+    let script = root.join("input.txt");
+    std::fs::write(
+        &script,
+        "retro-input 1\n\
+         0 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n\
+         1 A 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n",
+    )
+    .unwrap();
+    let output = run_bounded(
+        &[
+            root.to_str().unwrap(),
+            "--input",
+            script.to_str().unwrap(),
+            "--frames",
+            "5",
+            "--user-dir",
+            root.join("user").to_str().unwrap(),
+        ],
+        Duration::from_secs(30),
+    );
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(text.contains("presented-frames: 5"), "{text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A failed load must exit with an error before any window is created, so a bad asset tree can
+/// never leave a frozen window behind.
+#[cfg(unix)]
+#[test]
+fn windowed_load_failure_exits_without_a_frozen_window() {
+    use std::time::Duration;
+
+    let root = temp_assets("windowed-bad-scene");
+    write_assets(&root);
+    let output = run_bounded(
+        &[
+            root.to_str().unwrap(),
+            "--scene",
+            "NOPE",
+            "--user-dir",
+            root.join("user").to_str().unwrap(),
+        ],
+        Duration::from_secs(30),
+    );
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(text.contains("unknown scene 'NOPE'"), "{text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A missing audio device is reported and the windowed game keeps running (silent run).
+#[cfg(unix)]
+#[test]
+fn windowed_audio_failure_is_reported_but_does_not_abort() {
+    use std::time::Duration;
+
+    let root = temp_assets("windowed-no-audio");
+    write_assets(&root);
+    let output = run_bounded_with_env(
+        &[
+            root.to_str().unwrap(),
+            "--frames",
+            "2",
+            "--user-dir",
+            root.join("user").to_str().unwrap(),
+        ],
+        Duration::from_secs(30),
+        &[("SDL_AUDIODRIVER", "no-such-audio-driver")],
+    );
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(text.contains("audio: unavailable:"), "{text}");
+    assert!(text.contains("presented-frames: 2"), "{text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Origins data (`gameType=1` in `Settings.ini`) compiles as standalone by default; `--origins`
+/// opts back into the Origins platform blocks.
+#[test]
+fn origins_flag_selects_the_script_platform() {
+    let root = temp_assets("origins-flag");
+    write_assets(&root);
+    let default = run(&[
+        root.to_str().unwrap(),
+        "--headless",
+        "--frames",
+        "2",
+        "--mute",
+    ]);
+    assert!(default.status.success(), "{}", stderr(&default));
+    assert!(
+        stdout(&default).contains("platform: standalone"),
+        "{}",
+        stdout(&default)
+    );
+
+    let origins = run(&[
+        root.to_str().unwrap(),
+        "--headless",
+        "--frames",
+        "2",
+        "--mute",
+        "--origins",
+    ]);
+    assert!(origins.status.success(), "{}", stderr(&origins));
+    assert!(
+        stdout(&origins).contains("platform: origins"),
+        "{}",
+        stdout(&origins)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A windowed run with scripted input must still pump SDL events so a quit signal can close
 /// it. SDL turns SIGTERM into a quit event, exactly like the window close button.
 #[cfg(unix)]
