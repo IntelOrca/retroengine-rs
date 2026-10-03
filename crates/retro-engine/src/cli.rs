@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
-use retro_audio::{AudioEngine, SAMPLE_RATE};
+use retro_audio::{AudioEngine, MAX_QUEUED_TICKS, PREBUFFER_TICKS, SAMPLE_RATE};
 use retro_format_v4::GameConfig;
 use retro_input::ScriptedInput;
 use retro_io::{DataSource, DirSource};
@@ -397,7 +397,9 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
 
     // Windowed runs push mixed audio to the SDL device. A missing device is not fatal: mixing
     // (and therefore `--audio-hash`) continues headlessly. Audio is opened before the window is
-    // created so a failing audio backend happens before any window is shown.
+    // created so a failing audio backend happens before any window is shown. The engine queues a
+    // few ticks before starting the device (SDL opens it paused), so playback starts with
+    // headroom instead of underrunning on the first frames.
     if !args.headless {
         if args.mute {
             println!("audio: muted (--mute)");
@@ -405,9 +407,12 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
             match platform.open_audio(AudioDesc::stereo(SAMPLE_RATE)) {
                 Ok(device) => {
                     let description = device.description();
-                    match AudioEngine::new(device) {
+                    match AudioEngine::with_prebuffer(device) {
                         Ok(audio) => {
-                            println!("audio: {SAMPLE_RATE} Hz stereo f32 ({description})");
+                            println!(
+                                "audio: {SAMPLE_RATE} Hz stereo f32 ({description}, \
+                                 {PREBUFFER_TICKS}-tick prebuffer, {MAX_QUEUED_TICKS}-tick cap)"
+                            );
                             engine.set_audio_device(audio);
                         }
                         Err(error) => println!("audio: unavailable: {error}"),
