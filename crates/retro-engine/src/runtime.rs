@@ -525,9 +525,23 @@ impl Engine {
     /// next frame, exactly like upstream's `STAGEMODE_LOAD` (which resets the frame state, runs
     /// `LoadStageFiles` and skips that frame's updates and draw).
     pub fn run_frame(&mut self) -> Result<(), EngineError> {
-        self.poll_input();
-        // `ProcessInput` runs before the frame: any press/hold resets the idle-dimming timer,
-        // otherwise it advances towards `dim_limit` (`Input.cpp:377-382`). Presentation-only.
+        if self.state.load_stage_requested {
+            self.apply_deferred_load()?;
+            // `STAGEMODE_LOAD` never calls `ProcessInput`: the load tick neither consumes an
+            // input line nor advances the idle-dimming timer (`SceneLegacyv4.cpp`). The load
+            // frame still presents (`FlipScreen`): dimming runs, the frame counter advances and
+            // audio mixes, but no updates or drawing happen.
+            self.state.render.process_dimming();
+            self.state.frame += 1;
+            self.state.audio.tick();
+            return Ok(());
+        }
+        // `ProcessInput` runs at the start of every non-load tick. The tick being produced is
+        // `state.frame + 1` (`Engine::load` performs record 0, the `STAGEMODE_LOAD` tick), and
+        // the reference harness input script's line `N` belongs to record `N`.
+        self.poll_input(self.state.frame + 1);
+        // Any press/hold resets the idle-dimming timer, otherwise it advances towards
+        // `dim_limit` (`Input.cpp:377-382`). Presentation-only.
         let input_active = self.state.input.any_button()
             || self.state.input_press.any_button()
             || self
@@ -538,15 +552,6 @@ impl Engine {
                 .count()
                 > 1;
         self.state.render.update_dim_timer(input_active, false);
-        if self.state.load_stage_requested {
-            self.apply_deferred_load()?;
-            // The load frame still presents (`FlipScreen`): dimming runs, the frame counter
-            // advances and audio mixes, but no updates or drawing happen.
-            self.state.render.process_dimming();
-            self.state.frame += 1;
-            self.state.audio.tick();
-            return Ok(());
-        }
         if self.state.render.fade_mode > 0 {
             self.state.render.fade_mode -= 1;
         }
@@ -631,9 +636,10 @@ impl Engine {
         Ok(())
     }
 
-    /// Polls the input source and copies the player states into the engine state.
-    fn poll_input(&mut self) {
-        let players = self.input.poll();
+    /// Polls the input source for absolute tick `tick` and copies the player states into the
+    /// engine state.
+    fn poll_input(&mut self, tick: u64) {
+        let players = self.input.poll_at(tick);
         apply_players(&mut self.state, &players);
         if let Some(index) = self.press_button_global {
             let pressed = players
@@ -969,6 +975,11 @@ impl Engine {
     /// guard). Scenes that keep the camera disabled (the title screens) drive the scroll
     /// themselves through `screen.xoffset`/`screen.yoffset`, so an unconditional follow here
     /// would clobber the script-set values every frame.
+    ///
+    /// Only `CAMERASTYLE_FOLLOW` (0) is dispatched; upstream's other styles
+    /// (`EXTENDED`/`EXTENDED_OFFSET_L`/`EXTENDED_OFFSET_R`/`HLOCKED`/`FIXED`/`STATIC`, 1-6)
+    /// and the `cameraEnabled != 1` branch that calls `SetPlayerLockedScreenPosition` are
+    /// dormant. The verified S1/S2 runs use style 0 only.
     fn update_camera(&mut self) {
         follow_camera(&mut self.state);
     }
@@ -1188,6 +1199,12 @@ impl Engine {
 /// through `screen.xoffset`/`screen.yoffset`, so an unconditional follow would clobber the
 /// script-set values. The boundary easing, the `xPosDif`/`yPosDif` dead zones, the
 /// `cameraLockedY` latch and the `SCREEN_SCROLL_UP`/`DOWN` clamps all mirror upstream exactly.
+///
+/// This is the only camera style implemented: upstream's `HandleCameras` also dispatches
+/// `EXTENDED`/`EXTENDED_OFFSET_L`/`EXTENDED_OFFSET_R` (`SetPlayerScreenPositionCDStyle`),
+/// `HLOCKED` (`SetPlayerHLockedScreenPosition`), `FIXED`, `STATIC`, and falls back to
+/// `SetPlayerLockedScreenPosition` when `cameraEnabled != 1`. Those paths stay dormant until a
+/// scene needs them.
 pub(crate) fn follow_camera(state: &mut EngineState) {
     if state.camera.enabled != 1 {
         return;

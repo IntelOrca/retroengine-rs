@@ -427,20 +427,21 @@ fn dimming_is_presentation_only_and_never_enters_the_hash() {
     );
     assert_eq!(control.state_hash(), dimmed.state_hash());
 
-    // Idle frames advance the timer towards the limit.
+    // Idle frames advance the timer towards the limit. Script line `N` belongs to record `N`
+    // (the load tick's line 0 is never processed), so four frames consume lines 1..=4.
     let mut idle = Engine::load(draw_source(body), None, None, DEFAULT_SEED).unwrap();
     idle.state.render.dim_limit = 10;
     let mut script = String::from("retro-input 1\n");
-    for frame in 0..4 {
+    for frame in 0..5 {
         script.push_str(&format!("{frame} - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n"));
     }
-    script.push_str("4 RIGHT 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n");
+    script.push_str("5 RIGHT 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n");
     idle.set_scripted_input(retro_input::ScriptedInput::from_str(&script).unwrap());
     for _ in 0..4 {
         idle.run_frame().unwrap();
     }
     assert_eq!(idle.state.render.dim_timer, 4);
-    // A held button resets the timer.
+    // The fifth frame consumes line 5: a held button resets the timer.
     idle.run_frame().unwrap();
     assert!(idle.state.input.right);
     assert_eq!(idle.state.render.dim_timer, 0);
