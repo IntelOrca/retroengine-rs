@@ -391,6 +391,12 @@ version = "0.1.0"
 [[package]]
 name = "retro-dev"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "retro-engine",
+ "retro-format-v4",
+ "retro-io",
+]
 
 [[package]]
 name = "retro-engine"

@@ -95,6 +95,10 @@ Scripts compile with the standalone platform (`#platform: USE_STANDALONE`) by de
 instead. Windowed startup prints one `platform:`, `video:` and `audio:` line, so a missing audio
 device or an unusual driver is visible in the log without aborting the run.
 
+If the window appears unresponsive, rerun with `--frames N`: the frame loop exits after `N` frames
+even when the window is never focused or receives no close event, so the session cannot hang.
+Include the `platform:`/`audio:`/`video:` startup lines when reporting the problem.
+
 Full verification:
 
 ```sh
