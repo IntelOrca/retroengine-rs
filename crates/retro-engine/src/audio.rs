@@ -333,7 +333,9 @@ impl AudioState {
     ///
     /// With a device attached the mixed samples are submitted through [`AudioEngine`] unless
     /// muted; the submitted buffer is exactly the hashed buffer, so device playback, `--mute`
-    /// and headless runs all agree.
+    /// and headless runs all agree. Submission is best-effort: a short or zero acceptance (a
+    /// full device queue) drops only device output and never changes the hash. The device is
+    /// detached only when submission returns a real error.
     pub fn tick(&mut self) -> [u8; 32] {
         self.scratch.resize(FRAMES_PER_TICK * CHANNELS, 0.0);
         // Always mix on the single engine mixer; the device (when attached and unmuted) receives
@@ -346,7 +348,8 @@ impl AudioState {
             && let Some(device) = self.device.as_mut()
             && device.submit(&self.scratch).is_err()
         {
-            // The device was lost mid-run: keep mixing locally for the rest of the frame loop.
+            // A real device error means it is gone: keep mixing locally for the rest of the run.
+            // `Ok(0)` (a full queue) is not an error and leaves the device attached.
             self.device = None;
         }
         self.last_hash = hash;
@@ -714,5 +717,110 @@ mod tests {
             platform.captured_pcm().is_empty(),
             "muted output must not be submitted"
         );
+    }
+
+    /// A device whose queue never drains: it reports a huge backlog and accepts nothing.
+    struct StalledDevice {
+        calls: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl retro_platform::AudioDevice for StalledDevice {
+        fn sample_rate(&self) -> u32 {
+            SAMPLE_RATE
+        }
+
+        fn channels(&self) -> u8 {
+            CHANNELS as u8
+        }
+
+        fn submit(&mut self, _frames: &[f32]) -> Result<usize, retro_platform::PlatformError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(0)
+        }
+
+        fn queued_frames(&self) -> usize {
+            usize::MAX / 2
+        }
+
+        fn close(&mut self) -> Result<(), retro_platform::PlatformError> {
+            Ok(())
+        }
+    }
+
+    /// A device that reports a real error on every submission.
+    struct FailingDevice;
+
+    impl retro_platform::AudioDevice for FailingDevice {
+        fn sample_rate(&self) -> u32 {
+            SAMPLE_RATE
+        }
+
+        fn channels(&self) -> u8 {
+            CHANNELS as u8
+        }
+
+        fn submit(&mut self, _frames: &[f32]) -> Result<usize, retro_platform::PlatformError> {
+            Err(retro_platform::PlatformError::Other(
+                "device lost".to_owned(),
+            ))
+        }
+
+        fn queued_frames(&self) -> usize {
+            0
+        }
+
+        fn close(&mut self) -> Result<(), retro_platform::PlatformError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn tick_with_a_stalled_device_returns_promptly_and_keeps_the_device() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let stalled = StalledDevice {
+            calls: std::rc::Rc::clone(&calls),
+        };
+        let (mut local, _) = state_with_sfx();
+        let (mut attached, _) = state_with_sfx();
+        attached.set_device(AudioEngine::new(Box::new(stalled)).unwrap());
+        for state in [&mut local, &mut attached] {
+            state.play_sfx(0, false);
+        }
+
+        let started = std::time::Instant::now();
+        for _ in 0..8 {
+            assert_eq!(
+                local.tick(),
+                attached.tick(),
+                "a stalled device must not change the mix hash"
+            );
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "tick must not block against a stalled device"
+        );
+        assert_eq!(calls.get(), 8, "each tick submits exactly once");
+        assert!(
+            attached.device.is_some(),
+            "a zero acceptance is not an error; the device stays attached"
+        );
+    }
+
+    #[test]
+    fn tick_detaches_the_device_only_on_a_real_error() {
+        let (mut state, _) = state_with_sfx();
+        state.set_device(AudioEngine::new(Box::new(FailingDevice)).unwrap());
+        state.play_sfx(0, false);
+        let hashes: Vec<[u8; 32]> = (0..4).map(|_| state.tick()).collect();
+        assert!(
+            state.device.is_none(),
+            "a device error must detach the device"
+        );
+
+        // Mixing continues and stays deterministic after the device is gone.
+        let (mut reference, _) = state_with_sfx();
+        reference.play_sfx(0, false);
+        let expected: Vec<[u8; 32]> = (0..4).map(|_| reference.tick()).collect();
+        assert_eq!(hashes, expected);
     }
 }
