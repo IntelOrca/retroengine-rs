@@ -20,9 +20,9 @@
 //! [`AudioEngine`] owns a [`retro_platform::AudioDevice`] and submits already-mixed interleaved
 //! stereo `f32` buffers; the engine always mixes on its single [`Mixer`] and forwards one engine
 //! tick (735 stereo frames, exactly 60 Hz at 44.1 kHz) per logic frame, so device playback and
-//! headless hashing see the same samples. Submission is best-effort: when the device queue is
-//! full the frame is dropped instead of retried, so a stalled audio device can never block the
-//! main thread.
+//! headless hashing see the same samples. Submission is best-effort: the buffer is offered to
+//! the device once and whatever is not accepted is dropped, so the frame loop never waits on the
+//! audio device.
 
 #![forbid(unsafe_code)]
 
@@ -101,9 +101,11 @@ impl AudioEngine {
     /// device accepted.
     ///
     /// The device is allowed to accept fewer frames than `frames` contains (or none at all) when
-    /// its queue is full, and frames it did not accept are dropped by the caller. This call
-    /// never retries, so a stalled device can not block the engine's frame loop; the local mix
-    /// (and therefore the deterministic hash) is unaffected by dropped output.
+    /// its queue is full or it is unresponsive, and frames it did not accept are dropped by the
+    /// caller. This call never retries — the old implementation looped until every frame was
+    /// accepted and detached the device on a partial result — so a device that accepts nothing
+    /// can not stall the engine's frame loop. The local mix (and therefore the deterministic
+    /// hash) is unaffected by dropped output.
     pub fn submit(&mut self, frames: &[f32]) -> Result<usize, AudioError> {
         if !frames.len().is_multiple_of(CHANNELS) {
             return Err(AudioError::Invalid(

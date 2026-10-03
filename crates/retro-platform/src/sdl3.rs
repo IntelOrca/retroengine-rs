@@ -124,12 +124,22 @@ impl Platform for Sdl3Platform {
         self.input
             .set_window((desc.width, desc.height), desc.integer_scale);
         let video = sdl.video().map_err(PlatformError::sdl)?;
-        let window = video
-            .window(&desc.title, desc.width, desc.height)
-            .position_centered()
-            .resizable()
-            .build()
-            .map_err(PlatformError::other)?;
+        let mut builder = video.window(&desc.title, desc.width, desc.height);
+        builder.position_centered();
+        if desc.windowed {
+            if !desc.border {
+                builder.borderless();
+            }
+            builder.resizable();
+        } else {
+            // SDL3's fullscreen flag presents the desktop fullscreen; `exclusive_fullscreen` is
+            // recorded but no display-mode switch is requested.
+            builder.fullscreen();
+            if !desc.border {
+                builder.borderless();
+            }
+        }
+        let window = builder.build().map_err(PlatformError::other)?;
         let canvas = window.into_canvas();
         let renderer = canvas.raw();
         let texture = unsafe {
@@ -315,14 +325,11 @@ impl Window for Sdl3Window {
 
 /// Maximum queued audio in engine ticks (about 50 ms at 60 Hz).
 ///
-/// Once the device queue holds this much, [`Sdl3Audio::submit`] drops new frames instead of
-/// calling the potentially blocking `SDL_PutAudioStreamData`, so a stalled output device can not
-/// stall the engine's frame loop.
+/// [`Sdl3Audio::submit`] never lets the stream queue exceed this. `SDL_PutAudioStreamData` is
+/// non-blocking and appends to the queue, so without a cap a device that stops draining would
+/// grow memory and audio latency without bound. At the cap new frames are dropped until the
+/// device drains, which parks latency at ~50 ms without any clear/resync step.
 pub const MAX_QUEUED_TICKS: usize = 3;
-
-/// Backlog above which the stream is cleared so playback resyncs instead of playing minutes
-/// behind, in engine ticks.
-pub const RESYNC_QUEUED_TICKS: usize = 10;
 
 /// Number of frames a single [`Sdl3Audio::submit`] call may enqueue.
 ///
@@ -362,17 +369,10 @@ impl AudioDevice for Sdl3Audio {
         let total = frames.len() / channels;
         let tick_frames = (self.sample_rate as usize / 60).max(1);
         let cap = tick_frames * MAX_QUEUED_TICKS;
-        let queued = self.queued_frames();
-        if queued >= cap {
-            // Grossly behind (e.g. the device stopped draining): drop the backlog so playback
-            // resyncs with the current frame instead of lagging further and further.
-            if queued > tick_frames * RESYNC_QUEUED_TICKS {
-                let _ = self.stream.clear();
-            }
-            return Ok(0);
-        }
-        let accepted = frames_within_capacity(queued, total, cap);
+        let accepted = frames_within_capacity(self.queued_frames(), total, cap);
         if accepted == 0 {
+            // The queue is at the cap: drop this tick's output until the device drains. There is
+            // no clear/resync branch because the cap itself keeps latency parked at ~50 ms.
             return Ok(0);
         }
         self.stream
@@ -984,10 +984,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn audio_queue_cap_never_exceeds_the_budget() {
+    fn audio_queue_parks_at_the_cap_without_a_resync_branch() {
         let tick = 735usize;
         let cap = tick * MAX_QUEUED_TICKS;
-        const { assert!(MAX_QUEUED_TICKS < RESYNC_QUEUED_TICKS) };
         assert_eq!(frames_within_capacity(0, tick, cap), tick);
         assert_eq!(frames_within_capacity(cap - 1, tick, cap), 1);
         assert_eq!(frames_within_capacity(cap, tick, cap), 0);
@@ -995,6 +994,25 @@ mod tests {
         assert_eq!(frames_within_capacity(0, cap + 500, cap), cap);
         assert_eq!(frames_within_capacity(0, 0, cap), 0);
         assert_eq!(frames_within_capacity(0, tick, 0), 0);
+
+        // Worst case: the device never drains and every tick offers a full tick of frames. The
+        // cap must park the queue (accepted drops to 0) instead of growing it, which is why no
+        // clear/resync branch is needed.
+        let mut queued = 0usize;
+        for _ in 0..100 {
+            let accepted = frames_within_capacity(queued, tick, cap);
+            assert!(
+                queued + accepted <= cap,
+                "queue grew past the {MAX_QUEUED_TICKS}-tick cap"
+            );
+            queued += accepted;
+        }
+        assert_eq!(queued, cap);
+        assert_eq!(frames_within_capacity(queued, tick, cap), 0);
+
+        // When the device later drains one tick, exactly one tick of room reopens.
+        queued -= tick;
+        assert_eq!(frames_within_capacity(queued, tick, cap), tick);
     }
 
     #[test]

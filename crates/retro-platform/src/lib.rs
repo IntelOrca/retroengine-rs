@@ -30,10 +30,20 @@ pub struct WindowDesc {
     pub integer_scale: bool,
     /// Enable vsync when presenting.
     pub vsync: bool,
+    /// Start windowed rather than fullscreen (`Settings.ini` `windowed`).
+    pub windowed: bool,
+    /// Draw window decorations (`Settings.ini` `border`).
+    pub border: bool,
+    /// Request exclusive fullscreen (`Settings.ini` `exclusiveFS`).
+    ///
+    /// SDL3's fullscreen flag already presents the desktop fullscreen; this flag records the
+    /// request and is applied as a borderless fullscreen window rather than a mode switch.
+    pub exclusive_fullscreen: bool,
 }
 
 impl WindowDesc {
-    /// Creates a window description with nearest-neighbour integer scaling and vsync enabled.
+    /// Creates a window description with nearest-neighbour integer scaling, vsync enabled,
+    /// windowed and bordered.
     #[must_use]
     pub fn new(title: impl Into<String>, width: u32, height: u32) -> Self {
         Self {
@@ -42,6 +52,9 @@ impl WindowDesc {
             height,
             integer_scale: true,
             vsync: true,
+            windowed: true,
+            border: true,
+            exclusive_fullscreen: false,
         }
     }
 }
@@ -213,8 +226,9 @@ pub trait AudioDevice {
     fn channels(&self) -> u8;
     /// Queues interleaved stereo samples; returns the number of frames accepted.
     ///
-    /// Implementations must not block indefinitely: when the queue is full they should accept
-    /// what fits (possibly nothing) and let the caller drop the rest.
+    /// Implementations must return promptly instead of spinning or waiting for queue space:
+    /// when the queue is full they should accept what fits (possibly nothing) and let the
+    /// caller drop the rest.
     fn submit(&mut self, frames: &[f32]) -> Result<usize, PlatformError>;
     /// Frames currently queued for playback.
     fn queued_frames(&self) -> usize;
