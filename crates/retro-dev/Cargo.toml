@@ -8,3 +8,11 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+clap.workspace = true
+retro-format-v4.workspace = true
+
+[dev-dependencies]
+retro-engine = { path = "../retro-engine" }
+retro-io.workspace = true

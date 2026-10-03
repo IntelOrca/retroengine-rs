@@ -90,6 +90,11 @@ pub struct Args {
     /// Disable audio output; mixing and `--audio-hash` output are unchanged
     #[arg(long)]
     pub mute: bool,
+    /// Compile scripts with the Origins (`USE_ORIGINS`) platform tag instead of the default
+    /// standalone (`USE_STANDALONE`) platform. Origins data compiles as standalone otherwise,
+    /// even when `Settings.ini` has `gameType=1`
+    #[arg(long)]
+    pub origins: bool,
     /// Directory to persist user data (save RAM) in; seeded from the shipped SData.bin/SGame.bin
     /// on first run. Headless without it uses in-memory storage; windowed runs default to the
     /// SDL preferred path (`%APPDATA%\retroengine-rs\retroengine` on Windows)
@@ -113,6 +118,27 @@ pub fn backend_for(args: &Args) -> BackendKind {
         BackendKind::Headless
     } else {
         BackendKind::Sdl3
+    }
+}
+
+/// Builds the window description from the parsed `Settings.ini` video flags.
+///
+/// `windowed=y`/`border=y` (the shipped default) yields a bordered windowed window and `vsync`
+/// follows the ini; `exclusiveFS` is carried for the backend. The width/height stay the logical
+/// framebuffer size, which the renderer scales to the actual window.
+#[must_use]
+fn window_desc(
+    settings: &retro_format_v4::Settings,
+    title: String,
+    width: u32,
+    height: u32,
+) -> WindowDesc {
+    WindowDesc {
+        vsync: settings.video.vsync,
+        windowed: settings.video.windowed,
+        border: settings.video.border,
+        exclusive_fullscreen: settings.video.exclusive_fs,
+        ..WindowDesc::new(title, width, height)
     }
 }
 
@@ -304,12 +330,15 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     let mut platform = retro_platform::create(backend_for(args))?;
     platform.init()?;
     let storage = save_storage(args, &source)?;
-    let mut engine = Engine::load_with(
+    let mut engine = Engine::load_with_options(
         Arc::clone(&source),
         args.scene.as_deref(),
         args.act.as_deref(),
         seed,
         storage,
+        loader::LoadOptions {
+            origins: args.origins,
+        },
     )?;
 
     if let Some(path) = &args.input {
@@ -332,6 +361,7 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     println!("game: {}", engine.game_title());
     println!("scene: {folder} act {act}");
     println!("profile: {}", engine.settings().profile.name());
+    println!("platform: {}", engine.settings().platform.name());
     println!("backend: {}", backend_for(args).name());
     // Headless runs default to 600 deterministic frames; windowed runs without an explicit
     // limit keep going until the user closes the window.
@@ -365,6 +395,31 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         );
     }
 
+    // Windowed runs push mixed audio to the SDL device. A missing device is not fatal: mixing
+    // (and therefore `--audio-hash`) continues headlessly. Audio is opened before the window is
+    // created so a failing audio backend happens before any window is shown.
+    if !args.headless {
+        if args.mute {
+            println!("audio: muted (--mute)");
+        } else {
+            match platform.open_audio(AudioDesc::stereo(SAMPLE_RATE)) {
+                Ok(device) => {
+                    let description = device.description();
+                    match AudioEngine::new(device) {
+                        Ok(audio) => {
+                            println!("audio: {SAMPLE_RATE} Hz stereo f32 ({description})");
+                            engine.set_audio_device(audio);
+                        }
+                        Err(error) => println!("audio: unavailable: {error}"),
+                    }
+                }
+                Err(error) => println!("audio: unavailable: {error}"),
+            }
+        }
+    }
+
+    // The engine is fully loaded (and any audio device opened) before the window exists, so a
+    // slow or failed load cannot leave a half-created window on screen.
     let (width, height) = (
         engine.framebuffer().width() as u32,
         engine.framebuffer().height() as u32,
@@ -372,24 +427,21 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     let mut window = if args.headless {
         None
     } else {
-        Some(platform.create_window(WindowDesc::new(
-            format!("{} - {folder} {act}", engine.game_title()),
+        let title = format!("{} - {folder} {act}", engine.game_title());
+        let mut window = platform.create_window(window_desc(
+            engine.raw_settings(),
+            title.clone(),
             width,
             height,
-        ))?)
-    };
-
-    // Windowed runs push mixed audio to the SDL device. A missing device is not fatal: mixing
-    // (and therefore `--audio-hash`) continues headlessly.
-    if !args.headless && !args.mute {
-        match platform.open_audio(AudioDesc::stereo(SAMPLE_RATE)) {
-            Ok(device) => match AudioEngine::new(device) {
-                Ok(audio) => engine.set_audio_device(audio),
-                Err(error) => eprintln!("warning: audio disabled: {error}"),
-            },
-            Err(error) => eprintln!("warning: no audio device: {error}"),
+        ))?;
+        // Title again right after creation so the window is never shown untitled on backends
+        // that only apply the title after the first present.
+        window.set_title(&title);
+        if let Some(driver) = platform.video_driver() {
+            println!("video: {driver}");
         }
-    }
+        Some(window)
+    };
 
     if let Some(dir) = &args.dump_frames {
         std::fs::create_dir_all(dir)?;
@@ -550,8 +602,44 @@ mod tests {
         assert!(!args.hash_every_frame);
         assert!(!args.audio_hash);
         assert!(!args.mute);
+        assert!(!args.origins);
         assert_eq!(args.user_dir, None);
         assert_eq!(args.dump_frame_every, 1);
+    }
+
+    #[test]
+    fn window_desc_defaults_to_a_bordered_windowed_window_and_reads_settings() {
+        // `WindowDesc::new` is the Windows-safe default: windowed, bordered, vsync on.
+        let default = WindowDesc::new("default", 424, 240);
+        assert!(default.windowed, "default must be windowed");
+        assert!(default.border, "default must be bordered");
+        assert!(default.vsync, "default must request vsync");
+        assert!(!default.exclusive_fullscreen);
+        assert!(default.integer_scale);
+
+        // The shipped `windowed=y border=y` ini yields exactly that bordered windowed desc.
+        let settings = retro_format_v4::Settings::parse(
+            "[Video]\nwindowed=y\nborder=y\nexclusiveFS=n\nvsync=y\n",
+        )
+        .unwrap();
+        let desc = window_desc(&settings, "Sonic Test".to_owned(), 424, 240);
+        assert!(desc.windowed);
+        assert!(desc.border);
+        assert!(desc.vsync);
+        assert!(!desc.exclusive_fullscreen);
+        assert_eq!(desc.title, "Sonic Test");
+        assert_eq!((desc.width, desc.height), (424, 240));
+
+        // A fullscreen/borderless ini is carried through instead.
+        let settings = retro_format_v4::Settings::parse(
+            "[Video]\nwindowed=n\nborder=n\nexclusiveFS=y\nvsync=n\n",
+        )
+        .unwrap();
+        let desc = window_desc(&settings, "Full".to_owned(), 424, 240);
+        assert!(!desc.windowed);
+        assert!(!desc.border);
+        assert!(desc.exclusive_fullscreen);
+        assert!(!desc.vsync);
     }
 
     #[test]
@@ -577,6 +665,7 @@ mod tests {
             "--hash-every-frame",
             "--audio-hash",
             "--mute",
+            "--origins",
             "--user-dir",
             "user",
         ])
@@ -592,6 +681,7 @@ mod tests {
         assert!(args.hash_every_frame);
         assert!(args.audio_hash);
         assert!(args.mute);
+        assert!(args.origins);
         assert_eq!(args.user_dir, Some(PathBuf::from("user")));
         assert!(!args.list);
         assert_eq!(backend_for(&args), BackendKind::Headless);
@@ -683,6 +773,7 @@ mod tests {
         assert!(help.contains("--scene"), "{help}");
         assert!(help.contains("GHZ"), "{help}");
         assert!(help.contains("--list"), "{help}");
+        assert!(help.contains("--origins"), "{help}");
     }
 
     #[test]

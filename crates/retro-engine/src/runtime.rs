@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use retro_audio::AudioEngine;
 use retro_format_v4::SceneEntity;
+use retro_format_v4::Settings;
 use retro_format_v4::scene::{
     ENTITY_ATTRIB_ALPHA, ENTITY_ATTRIB_ANIMATION, ENTITY_ATTRIB_ANIMATION_SPEED,
     ENTITY_ATTRIB_DIRECTION, ENTITY_ATTRIB_DRAW_ORDER, ENTITY_ATTRIB_FRAME,
@@ -66,6 +67,8 @@ pub struct Engine {
     pub scripts: ScriptRuntime,
     /// Per-frame input source (idle, scripted or raw platform state).
     pub input: EngineInput,
+    /// Parsed `Settings.ini`, retained for host/window configuration.
+    raw_settings: Settings,
     /// Index of the `input.pressButton` global, when the GameConfig defines it.
     press_button_global: Option<usize>,
 }
@@ -110,7 +113,29 @@ impl Engine {
         seed: u32,
         save_storage: Box<dyn Storage>,
     ) -> Result<Self, EngineError> {
-        let world = loader::load_world(&source, requested_scene, act)?;
+        Self::load_with_options(
+            source,
+            requested_scene,
+            act,
+            seed,
+            save_storage,
+            loader::LoadOptions::default(),
+        )
+    }
+
+    /// Loads and instantiates a scene with explicit loader options.
+    ///
+    /// `options.origins` (the CLI's `--origins`) compiles the scripts with the Origins platform
+    /// tag; the default is standalone. Everything else matches [`Engine::load_with`].
+    pub fn load_with_options(
+        source: Arc<dyn DataSource>,
+        requested_scene: Option<&str>,
+        act: Option<&str>,
+        seed: u32,
+        save_storage: Box<dyn Storage>,
+        options: loader::LoadOptions,
+    ) -> Result<Self, EngineError> {
+        let world = loader::load_world_with(&source, requested_scene, act, options)?;
         let rng = crate::rng::GlibcRand::new(seed);
         let file: ScriptFile = world.scripts.file;
         let input = EngineInput::new(&world.raw_settings);
@@ -184,6 +209,7 @@ impl Engine {
                 vm_state,
             },
             input,
+            raw_settings: world.raw_settings,
             press_button_global,
         };
         engine.run_startup()?;
@@ -589,35 +615,14 @@ impl Engine {
     }
 
     /// Deterministic simplified camera follow.
+    ///
+    /// Upstream only recomputes `xScrollOffset`/`yScrollOffset` from the camera while
+    /// `cameraEnabled == 1` (`Scene.cpp:251-579` call `SetPlayerScreenPosition` under that
+    /// guard). Scenes that keep the camera disabled (the title screens) drive the scroll
+    /// themselves through `screen.xoffset`/`screen.yoffset`, so an unconditional follow here
+    /// would clobber the script-set values every frame.
     fn update_camera(&mut self) {
-        let target = usize::try_from(self.state.camera.target).ok();
-        if self.state.camera.enabled == 1
-            && let Some(target) = target
-            && let Some(entity) = self.state.entities.get(target).copied()
-        {
-            let half_x = self.state.screen.center_x();
-            let half_y = self.state.screen.center_y();
-            let target_x = entity.xpos >> 16;
-            let target_y = (entity.ypos >> 16) + self.state.camera.adjust_y;
-            let min_x = self.state.stage.cur_x_boundary1.wrapping_add(half_x);
-            let max_x = self.state.stage.cur_x_boundary2.wrapping_sub(half_x);
-            let min_y = self.state.stage.cur_y_boundary1.wrapping_add(half_y);
-            let max_y = self.state.stage.cur_y_boundary2.wrapping_sub(half_y);
-            self.state.camera.xpos = if min_x <= max_x {
-                target_x.clamp(min_x, max_x)
-            } else {
-                target_x
-            };
-            self.state.camera.ypos = if min_y <= max_y {
-                target_y.clamp(min_y, max_y)
-            } else {
-                target_y
-            };
-        }
-        self.state.screen.x_scroll =
-            self.state.camera.shake_x + self.state.camera.xpos - self.state.screen.center_x();
-        self.state.screen.y_scroll =
-            self.state.camera.shake_y + self.state.camera.ypos - self.state.screen.center_y();
+        follow_camera(&mut self.state);
     }
 
     /// Hashes the canonical engine state.
@@ -808,6 +813,12 @@ impl Engine {
         &self.state.settings
     }
 
+    /// The parsed `Settings.ini` used to load this engine.
+    #[must_use]
+    pub fn raw_settings(&self) -> &Settings {
+        &self.raw_settings
+    }
+
     /// The game config title.
     #[must_use]
     pub fn game_title(&self) -> &str {
@@ -819,6 +830,45 @@ impl Engine {
     pub fn framebuffer(&self) -> &retro_render::Framebuffer {
         &self.state.render.framebuffer
     }
+}
+
+/// Deterministic simplified camera follow, split out for unit testing.
+///
+/// Upstream only recomputes `xScrollOffset`/`yScrollOffset` inside `SetPlayerScreenPosition`,
+/// which `ProcessStage` calls under `cameraEnabled == 1 && cameraTarget > -1`
+/// (`Scene.cpp:250-262`). Scenes that keep the camera disabled or targetless (the title
+/// screens) drive the scroll themselves through `screen.xoffset`/`screen.yoffset`, so an
+/// unconditional follow here would clobber the script-set values every frame.
+pub(crate) fn follow_camera(state: &mut EngineState) {
+    if state.camera.enabled != 1 {
+        return;
+    }
+    let Some(target) = usize::try_from(state.camera.target).ok() else {
+        return;
+    };
+    let Some(entity) = state.entities.get(target).copied() else {
+        return;
+    };
+    let half_x = state.screen.center_x();
+    let half_y = state.screen.center_y();
+    let target_x = entity.xpos >> 16;
+    let target_y = (entity.ypos >> 16) + state.camera.adjust_y;
+    let min_x = state.stage.cur_x_boundary1.wrapping_add(half_x);
+    let max_x = state.stage.cur_x_boundary2.wrapping_sub(half_x);
+    let min_y = state.stage.cur_y_boundary1.wrapping_add(half_y);
+    let max_y = state.stage.cur_y_boundary2.wrapping_sub(half_y);
+    state.camera.xpos = if min_x <= max_x {
+        target_x.clamp(min_x, max_x)
+    } else {
+        target_x
+    };
+    state.camera.ypos = if min_y <= max_y {
+        target_y.clamp(min_y, max_y)
+    } else {
+        target_y
+    };
+    state.screen.x_scroll = state.camera.shake_x + state.camera.xpos - half_x;
+    state.screen.y_scroll = state.camera.shake_y + state.camera.ypos - half_y;
 }
 
 fn place_scene_entities(store: &mut EntityStore, entities: &[SceneEntity]) {

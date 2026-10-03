@@ -30,10 +30,20 @@ pub struct WindowDesc {
     pub integer_scale: bool,
     /// Enable vsync when presenting.
     pub vsync: bool,
+    /// Start windowed rather than fullscreen (`Settings.ini` `windowed`).
+    pub windowed: bool,
+    /// Draw window decorations (`Settings.ini` `border`).
+    pub border: bool,
+    /// Request exclusive fullscreen (`Settings.ini` `exclusiveFS`).
+    ///
+    /// SDL3's fullscreen flag already presents the desktop fullscreen; this flag records the
+    /// request and is applied as a borderless fullscreen window rather than a mode switch.
+    pub exclusive_fullscreen: bool,
 }
 
 impl WindowDesc {
-    /// Creates a window description with nearest-neighbour integer scaling and vsync enabled.
+    /// Creates a window description with nearest-neighbour integer scaling, vsync enabled,
+    /// windowed and bordered.
     #[must_use]
     pub fn new(title: impl Into<String>, width: u32, height: u32) -> Self {
         Self {
@@ -42,6 +52,9 @@ impl WindowDesc {
             height,
             integer_scale: true,
             vsync: true,
+            windowed: true,
+            border: true,
+            exclusive_fullscreen: false,
         }
     }
 }
@@ -178,6 +191,12 @@ pub trait Platform {
     fn storage(&mut self) -> &mut dyn Storage;
     /// Returns the frame clock for this backend.
     fn clock(&mut self) -> &mut dyn Clock;
+    /// Native video driver name for startup diagnostics, when the backend has one.
+    ///
+    /// Backends without a display (or before one is initialized) return `None`.
+    fn video_driver(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// A presentable RGB565 framebuffer target.
@@ -206,11 +225,19 @@ pub trait AudioDevice {
     /// Number of interleaved channels.
     fn channels(&self) -> u8;
     /// Queues interleaved stereo samples; returns the number of frames accepted.
+    ///
+    /// Implementations must return promptly instead of spinning or waiting for queue space:
+    /// when the queue is full they should accept what fits (possibly nothing) and let the
+    /// caller drop the rest.
     fn submit(&mut self, frames: &[f32]) -> Result<usize, PlatformError>;
     /// Frames currently queued for playback.
     fn queued_frames(&self) -> usize;
     /// Closes the device.
     fn close(&mut self) -> Result<(), PlatformError>;
+    /// Human-readable device/driver description for startup diagnostics.
+    fn description(&self) -> String {
+        "unknown".to_owned()
+    }
 }
 
 /// Raw device state captured by one input poll, free of backend-specific types.

@@ -1643,7 +1643,9 @@ impl SceneCollision {
                     .ypos
                     .wrapping_add(16 << 16)
                     .wrapping_add(previous.yvel);
-                let start_y = (y >> 16) - 16;
+                // Upstream's `FloorCollision` measures the vertical snap distance against the
+                // probe's own Y (`startY = sensor->ypos >> 16`, `Collision.cpp:399`).
+                let start_y = y >> 16;
                 sensed[index] = self.find_floor_position(
                     plane,
                     CollisionSensor::new(x, y, previous.angle),
@@ -1656,6 +1658,14 @@ impl SceneCollision {
                     entity.ypos = (sensed[1].ypos - 16) << 16;
                     entity.yvel = 0;
                     entity.angle = sensed[1].angle;
+                    // Upstream's `ProcessAirCollision` landing branch clears `gravity`
+                    // (`Collision.cpp:874`); the player scripts keep flailing in `Player_State_Air`
+                    // until it is `GRAVITY_GROUND`.
+                    entity.gravity = 0;
+                    entity.rotation = sensed[1].angle << 1;
+                    if sensed[1].angle < 0x20 || sensed[1].angle > 0xE0 {
+                        entity.control_lock = 0;
+                    }
                     entity.floor_sensors[0] = u8::from(sensed[0].collided);
                     entity.floor_sensors[1] = 1;
                     entity.floor_sensors[2] = u8::from(sensed[2].collided);
@@ -2211,6 +2221,32 @@ mod tests {
         assert!(on_ground);
         assert_eq!(store.get(0).unwrap().yvel, 0);
         assert_eq!(store.get(0).unwrap().floor_sensors[1], 1);
+    }
+
+    #[test]
+    fn resting_probe_keeps_floor_sensors_and_clears_gravity() {
+        // Regression for the "balance" pose: a player resting exactly on a floor used to be
+        // rejected by the probe's vertical-tolerance check, clearing the L/C/R floor sensors
+        // that `Player_State_Ground` reads to choose the idle animation.
+        let mut collision = SceneCollision::new(layout(), solid_tiles(), solid_floor_masks());
+        let mut store = EntityStore::new();
+        // `solid_floor_masks` puts the sample at height 8 in the tile at y = 48, so the surface
+        // is at y = 56 and a 16px-tall entity rests at 40.
+        store.reset_object_entity(0, 1, 0, 64 << 16, 40 << 16);
+        {
+            let entity = store.get_mut(0).unwrap();
+            entity.gravity = 1;
+            entity.tile_collisions = 1;
+        }
+        assert!(collision.process_object_movement(&mut store, 0));
+        let entity = store.get(0).unwrap();
+        assert_eq!(entity.ypos >> 16, 40, "resting entity must not sink");
+        assert_eq!(entity.gravity, 0, "landing clears gravity");
+        assert_eq!(
+            entity.floor_sensors[..3],
+            [1, 1, 1],
+            "L/C/R probes all touch"
+        );
     }
 
     #[test]

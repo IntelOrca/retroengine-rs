@@ -20,7 +20,9 @@
 //! [`AudioEngine`] owns a [`retro_platform::AudioDevice`] and submits already-mixed interleaved
 //! stereo `f32` buffers; the engine always mixes on its single [`Mixer`] and forwards one engine
 //! tick (735 stereo frames, exactly 60 Hz at 44.1 kHz) per logic frame, so device playback and
-//! headless hashing see the same samples.
+//! headless hashing see the same samples. Submission is best-effort: the buffer is offered to
+//! the device once and whatever is not accepted is dropped, so the frame loop never waits on the
+//! audio device.
 
 #![forbid(unsafe_code)]
 
@@ -95,10 +97,15 @@ impl AudioEngine {
         self.device.channels()
     }
 
-    /// Submits interleaved stereo `f32` samples, retrying until the device accepts them all.
+    /// Submits interleaved stereo `f32` samples once and returns the number of stereo frames the
+    /// device accepted.
     ///
-    /// Returns the number of stereo frames submitted. A device that accepts nothing is reported
-    /// as [`AudioError::Invalid`] rather than spinning.
+    /// The device is allowed to accept fewer frames than `frames` contains (or none at all) when
+    /// its queue is full or it is unresponsive, and frames it did not accept are dropped by the
+    /// caller. This call never retries — the old implementation looped until every frame was
+    /// accepted and detached the device on a partial result — so a device that accepts nothing
+    /// can not stall the engine's frame loop. The local mix (and therefore the deterministic
+    /// hash) is unaffected by dropped output.
     pub fn submit(&mut self, frames: &[f32]) -> Result<usize, AudioError> {
         if !frames.len().is_multiple_of(CHANNELS) {
             return Err(AudioError::Invalid(
@@ -106,20 +113,11 @@ impl AudioEngine {
             ));
         }
         let total = frames.len() / CHANNELS;
-        let mut submitted = 0;
-        while submitted < total {
-            let accepted = self
-                .device
-                .submit(&frames[submitted * CHANNELS..])
-                .map_err(device_error)?;
-            if accepted == 0 {
-                return Err(AudioError::Invalid(
-                    "audio device accepted no frames".to_owned(),
-                ));
-            }
-            submitted += accepted;
+        if total == 0 {
+            return Ok(0);
         }
-        Ok(total)
+        let accepted = self.device.submit(frames).map_err(device_error)?;
+        Ok(accepted.min(total))
     }
 
     /// Frames currently queued on the device.
@@ -143,12 +141,90 @@ mod tests {
     use super::*;
     use retro_platform::headless::HeadlessPlatform;
     use retro_platform::{AudioDesc, Platform};
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
 
     fn headless_device(rate: u32) -> (HeadlessPlatform, Box<dyn AudioDevice>) {
         let mut platform = HeadlessPlatform::new();
         platform.init().unwrap();
         let device = platform.open_audio(AudioDesc::stereo(rate)).unwrap();
         (platform, device)
+    }
+
+    /// Audio device stub whose submissions always accept `accept` frames and count calls.
+    struct MockDevice {
+        sample_rate: u32,
+        channels: u8,
+        accept: usize,
+        queued: usize,
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl MockDevice {
+        fn new(accept: usize, queued: usize) -> (Self, Rc<Cell<usize>>) {
+            let calls = Rc::new(Cell::new(0));
+            (
+                Self {
+                    sample_rate: SAMPLE_RATE,
+                    channels: CHANNELS as u8,
+                    accept,
+                    queued,
+                    calls: Rc::clone(&calls),
+                },
+                calls,
+            )
+        }
+    }
+
+    impl AudioDevice for MockDevice {
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+
+        fn channels(&self) -> u8 {
+            self.channels
+        }
+
+        fn submit(&mut self, frames: &[f32]) -> Result<usize, PlatformError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.accept.min(frames.len() / self.channels as usize))
+        }
+
+        fn queued_frames(&self) -> usize {
+            self.queued
+        }
+
+        fn close(&mut self) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn submit_never_retries_a_stalled_device() {
+        let (device, calls) = MockDevice::new(0, 10_000_000);
+        let mut engine = AudioEngine::new(Box::new(device)).unwrap();
+        let frames = vec![0.0f32; FRAMES_PER_TICK * CHANNELS];
+        let started = Instant::now();
+        assert_eq!(engine.submit(&frames).unwrap(), 0);
+        assert_eq!(
+            calls.get(),
+            1,
+            "a stalled device must be asked exactly once"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "submit must not spin against a stalled device"
+        );
+    }
+
+    #[test]
+    fn submit_reports_a_partial_acceptance_without_looping() {
+        let (device, calls) = MockDevice::new(1, 0);
+        let mut engine = AudioEngine::new(Box::new(device)).unwrap();
+        let frames = vec![0.0f32; FRAMES_PER_TICK * CHANNELS];
+        assert_eq!(engine.submit(&frames).unwrap(), 1);
+        assert_eq!(calls.get(), 1, "one submit call, no retry loop");
     }
 
     #[test]

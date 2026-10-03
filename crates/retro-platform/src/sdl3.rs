@@ -124,12 +124,22 @@ impl Platform for Sdl3Platform {
         self.input
             .set_window((desc.width, desc.height), desc.integer_scale);
         let video = sdl.video().map_err(PlatformError::sdl)?;
-        let window = video
-            .window(&desc.title, desc.width, desc.height)
-            .position_centered()
-            .resizable()
-            .build()
-            .map_err(PlatformError::other)?;
+        let mut builder = video.window(&desc.title, desc.width, desc.height);
+        builder.position_centered();
+        if desc.windowed {
+            if !desc.border {
+                builder.borderless();
+            }
+            builder.resizable();
+        } else {
+            // SDL3's fullscreen flag presents the desktop fullscreen; `exclusive_fullscreen` is
+            // recorded but no display-mode switch is requested.
+            builder.fullscreen();
+            if !desc.border {
+                builder.borderless();
+            }
+        }
+        let window = builder.build().map_err(PlatformError::other)?;
         let canvas = window.into_canvas();
         let renderer = canvas.raw();
         let texture = unsafe {
@@ -179,6 +189,7 @@ impl Platform for Sdl3Platform {
             ));
         }
         let audio = sdl.audio().map_err(PlatformError::sdl)?;
+        let driver = audio.current_audio_driver();
         let spec = AudioSpec {
             freq: Some(desc.sample_rate as i32),
             channels: Some(desc.channels as i32),
@@ -187,14 +198,23 @@ impl Platform for Sdl3Platform {
         let device = audio
             .open_playback_device(&spec)
             .map_err(PlatformError::sdl)?;
+        let device_name = device
+            .name()
+            .unwrap_or_else(|_| "default playback device".to_owned());
         let stream = device
             .open_device_stream(Some(&spec))
             .map_err(PlatformError::sdl)?;
-        stream.resume().map_err(PlatformError::sdl)?;
+        // SDL starts a device stream paused; resume it defensively and keep going when the
+        // backend refuses so a device quirk can never abort the game.
+        if let Err(error) = stream.resume() {
+            eprintln!("warning: audio stream resume failed: {error}");
+        }
         Ok(Box::new(Sdl3Audio {
             stream,
             sample_rate: desc.sample_rate,
             channels: desc.channels,
+            device_name,
+            driver_name: driver,
         }))
     }
 
@@ -208,6 +228,11 @@ impl Platform for Sdl3Platform {
 
     fn clock(&mut self) -> &mut dyn Clock {
         &mut self.clock
+    }
+
+    fn video_driver(&self) -> Option<&'static str> {
+        let video = self.sdl.as_ref()?.video().ok()?;
+        Some(video.current_video_driver())
     }
 }
 
@@ -298,11 +323,31 @@ impl Window for Sdl3Window {
     }
 }
 
+/// Maximum queued audio in engine ticks (about 50 ms at 60 Hz).
+///
+/// [`Sdl3Audio::submit`] never lets the stream queue exceed this. `SDL_PutAudioStreamData` is
+/// non-blocking and appends to the queue, so without a cap a device that stops draining would
+/// grow memory and audio latency without bound. At the cap new frames are dropped until the
+/// device drains, which parks latency at ~50 ms without any clear/resync step.
+pub const MAX_QUEUED_TICKS: usize = 3;
+
+/// Number of frames a single [`Sdl3Audio::submit`] call may enqueue.
+///
+/// Returns 0 when the queue is already at or over `cap`; otherwise the count is limited so the
+/// queue can never be pushed past `cap` by one call. This is a pure function so the cap logic is
+/// unit-testable without an SDL device.
+#[must_use]
+fn frames_within_capacity(queued: usize, total: usize, cap: usize) -> usize {
+    cap.saturating_sub(queued).min(total)
+}
+
 /// SDL3 audio stream accepting interleaved f32 samples.
 pub struct Sdl3Audio {
     stream: AudioStreamOwner,
     sample_rate: u32,
     channels: u8,
+    device_name: String,
+    driver_name: &'static str,
 }
 
 impl AudioDevice for Sdl3Audio {
@@ -321,10 +366,19 @@ impl AudioDevice for Sdl3Audio {
                 "sample count is not a whole number of frames".to_owned(),
             ));
         }
+        let total = frames.len() / channels;
+        let tick_frames = (self.sample_rate as usize / 60).max(1);
+        let cap = tick_frames * MAX_QUEUED_TICKS;
+        let accepted = frames_within_capacity(self.queued_frames(), total, cap);
+        if accepted == 0 {
+            // The queue is at the cap: drop this tick's output until the device drains. There is
+            // no clear/resync branch because the cap itself keeps latency parked at ~50 ms.
+            return Ok(0);
+        }
         self.stream
-            .put_data_f32(frames)
+            .put_data_f32(&frames[..accepted * channels])
             .map_err(PlatformError::sdl)?;
-        Ok(frames.len() / channels)
+        Ok(accepted)
     }
 
     fn queued_frames(&self) -> usize {
@@ -334,6 +388,10 @@ impl AudioDevice for Sdl3Audio {
 
     fn close(&mut self) -> Result<(), PlatformError> {
         Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!("{} ({})", self.device_name, self.driver_name)
     }
 }
 
@@ -924,6 +982,38 @@ impl Clock for SystemClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_queue_parks_at_the_cap_without_a_resync_branch() {
+        let tick = 735usize;
+        let cap = tick * MAX_QUEUED_TICKS;
+        assert_eq!(frames_within_capacity(0, tick, cap), tick);
+        assert_eq!(frames_within_capacity(cap - 1, tick, cap), 1);
+        assert_eq!(frames_within_capacity(cap, tick, cap), 0);
+        assert_eq!(frames_within_capacity(cap * 100, tick, cap), 0);
+        assert_eq!(frames_within_capacity(0, cap + 500, cap), cap);
+        assert_eq!(frames_within_capacity(0, 0, cap), 0);
+        assert_eq!(frames_within_capacity(0, tick, 0), 0);
+
+        // Worst case: the device never drains and every tick offers a full tick of frames. The
+        // cap must park the queue (accepted drops to 0) instead of growing it, which is why no
+        // clear/resync branch is needed.
+        let mut queued = 0usize;
+        for _ in 0..100 {
+            let accepted = frames_within_capacity(queued, tick, cap);
+            assert!(
+                queued + accepted <= cap,
+                "queue grew past the {MAX_QUEUED_TICKS}-tick cap"
+            );
+            queued += accepted;
+        }
+        assert_eq!(queued, cap);
+        assert_eq!(frames_within_capacity(queued, tick, cap), 0);
+
+        // When the device later drains one tick, exactly one tick of room reopens.
+        queued -= tick;
+        assert_eq!(frames_within_capacity(queued, tick, cap), tick);
+    }
 
     #[test]
     fn sdl3_lifecycle_init_shutdown_reinit() {

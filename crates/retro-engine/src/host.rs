@@ -3447,4 +3447,196 @@ mod tests {
         assert_eq!(host.state.render.framebuffer.get(0, 0), 0xF800);
         assert_eq!(host.state.render.framebuffer.get(0, 4), 0xF800);
     }
+
+    #[test]
+    fn camera_follow_keeps_script_scroll_without_a_target() {
+        // Title screens keep `cameraTarget == -1`; `screen.xoffset` must survive the frame.
+        let mut state = test_state(false);
+        state.screen.x_scroll = 44;
+        state.screen.y_scroll = -3;
+        state.camera.enabled = 1;
+        state.camera.target = -1;
+        state.camera.xpos = 0;
+        state.camera.ypos = 0;
+        crate::runtime::follow_camera(&mut state);
+        assert_eq!((state.screen.x_scroll, state.screen.y_scroll), (44, -3));
+        assert_eq!((state.camera.xpos, state.camera.ypos), (0, 0));
+    }
+
+    #[test]
+    fn camera_follow_recomputes_scroll_from_the_target() {
+        let mut state = test_state(false);
+        state.screen.x_scroll = 44;
+        state.screen.y_scroll = 7;
+        state.camera.enabled = 1;
+        state.camera.target = 0;
+        state
+            .entities
+            .reset_object_entity(0, 1, 0, 212 << 16, 120 << 16);
+        crate::runtime::follow_camera(&mut state);
+        assert_eq!((state.camera.xpos, state.camera.ypos), (212, 120));
+        assert_eq!((state.screen.x_scroll, state.screen.y_scroll), (0, 0));
+
+        // A disabled camera leaves the script scroll untouched even with a live target.
+        state.screen.x_scroll = 44;
+        state.camera.enabled = 0;
+        crate::runtime::follow_camera(&mut state);
+        assert_eq!(state.screen.x_scroll, 44);
+    }
+
+    /// Replaces the single-pixel test surface with a `width`-wide row of colour index 1.
+    fn wide_frame_state(width: i32, pivot_x: i32) -> EngineState {
+        let mut state = sprite_state(1);
+        state.object_frames[1] = vec![ScriptFrame {
+            pivot_x,
+            pivot_y: 0,
+            width,
+            height: 1,
+            spr_x: 0,
+            spr_y: 0,
+        }];
+        state.render.surfaces[0] =
+            retro_render::Surface::from_indexed(width as u16, 1, vec![1; width as usize]);
+        state
+    }
+
+    #[test]
+    fn draw_sprite_screen_xy_centers_and_ignores_scroll() {
+        // A 256-wide frame with pivot -128 drawn at the 424-wide screen centre: 212 - 128 = 84.
+        let mut state = wide_frame_state(256, -128);
+        state.screen.x_scroll = 100;
+        state.screen.y_scroll = 100;
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 0;
+        vm_state.operands[1] = 212;
+        vm_state.operands[2] = 50;
+        host.engine_op(Op::DrawSpriteScreenXY, &mut vm_state)
+            .unwrap();
+        let framebuffer = &host.state.render.framebuffer;
+        assert_eq!(framebuffer.get(83, 50), 0, "pivot starts at x = 84");
+        assert_eq!(framebuffer.get(84, 50), 0xF800);
+        assert_eq!(framebuffer.get(212, 50), 0xF800);
+        assert_eq!(framebuffer.get(339, 50), 0xF800, "last column is 84 + 255");
+        assert_eq!(framebuffer.get(340, 50), 0);
+    }
+
+    #[test]
+    fn draw_sprite_xy_subtracts_scroll_and_applies_pivot() {
+        // `screen.xoffset = 44` with the object at world x = 256: 256 - 44 - 128 = 84.
+        let mut state = wide_frame_state(256, -128);
+        state.screen.x_scroll = 44;
+        state.screen.y_scroll = 0;
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 0;
+        vm_state.operands[1] = 256 << 16;
+        vm_state.operands[2] = 120 << 16;
+        host.engine_op(Op::DrawSpriteXY, &mut vm_state).unwrap();
+        let framebuffer = &host.state.render.framebuffer;
+        assert_eq!(framebuffer.get(84, 120), 0xF800);
+        assert_eq!(framebuffer.get(339, 120), 0xF800);
+        assert_eq!(framebuffer.get(340, 120), 0);
+    }
+
+    #[test]
+    fn draw_sprite_screen_xy_clips_negative_coordinates() {
+        // A 4-wide frame at x = -2 keeps its last two columns at x = 0 and 1.
+        let mut state = wide_frame_state(4, 0);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 0;
+        vm_state.operands[1] = -2;
+        vm_state.operands[2] = 0;
+        host.engine_op(Op::DrawSpriteScreenXY, &mut vm_state)
+            .unwrap();
+        let framebuffer = &host.state.render.framebuffer;
+        assert_eq!(framebuffer.get(0, 0), 0xF800);
+        assert_eq!(framebuffer.get(1, 0), 0xF800);
+        assert_eq!(framebuffer.get(2, 0), 0);
+    }
+
+    #[test]
+    fn draw_sprite_fx_flip_mirrors_source_columns() {
+        let mut state = sprite_state(1);
+        state.object_frames[1] = vec![ScriptFrame {
+            pivot_x: 0,
+            pivot_y: 0,
+            width: 4,
+            height: 1,
+            spr_x: 0,
+            spr_y: 0,
+        }];
+        state.render.surfaces[0] = retro_render::Surface::from_indexed(4, 1, vec![1, 2, 3, 4]);
+        state.render.palette.set_bank_entry(0, 2, 0, 255, 0);
+        state.render.palette.set_bank_entry(0, 3, 0, 0, 255);
+        state.render.palette.set_bank_entry(0, 4, 255, 255, 0);
+        state.entities.get_mut(0).unwrap().direction = retro_render::FLIP_X;
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 0;
+        vm_state.operands[1] = 5; // FX_FLIP
+        vm_state.operands[2] = 10 << 16;
+        vm_state.operands[3] = 10 << 16;
+        host.engine_op(Op::DrawSpriteFX, &mut vm_state).unwrap();
+        let framebuffer = &host.state.render.framebuffer;
+        // FLIP_X draws at `x - width - pivot` and samples the source backwards.
+        assert_eq!(framebuffer.get(6, 10), 0xFFE0, "column 0 samples source 3");
+        assert_eq!(framebuffer.get(7, 10), 0x001F);
+        assert_eq!(framebuffer.get(8, 10), 0x07E0);
+        assert_eq!(framebuffer.get(9, 10), 0xF800, "column 3 samples source 0");
+        assert_eq!(framebuffer.get(5, 10), 0);
+    }
+
+    #[test]
+    fn draw_text_advances_glyphs_by_x_advance() {
+        let mut state = sprite_state(1);
+        // Glyphs 'A' and 'B' are 2x1 red pixels advancing 3 px at scale 512 (1x).
+        let mut font = vec![0u8; 65 * 20];
+        for id in [65u32, 66] {
+            font.extend_from_slice(&id.to_le_bytes());
+            font.extend_from_slice(&0u16.to_le_bytes());
+            font.extend_from_slice(&0u16.to_le_bytes());
+            font.extend_from_slice(&2u16.to_le_bytes());
+            font.extend_from_slice(&1u16.to_le_bytes());
+            font.extend_from_slice(&[0, 0, 0, 0, 3, 0, 0, 0]);
+        }
+        let mut source = MemorySource::new();
+        source.insert("Data/Game/Font.bin", font);
+        source.insert("Data/Game/Text.bin", b"AB".to_vec());
+        state.source = Arc::new(source);
+        state.render.surfaces[0] = retro_render::Surface::from_indexed(4, 1, vec![1, 1, 1, 1]);
+        state.object_frames[1] = vec![ScriptFrame {
+            pivot_x: 0,
+            pivot_y: 0,
+            width: 2,
+            height: 1,
+            spr_x: 0,
+            spr_y: 0,
+        }];
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState {
+            script_text: "Data/Game/Font.bin".to_owned(),
+            ..VmState::default()
+        };
+        host.engine_op(Op::LoadFontFile, &mut vm_state).unwrap();
+        vm_state.script_text = "Data/Game/Text.bin".to_owned();
+        vm_state.operands[0] = 0;
+        vm_state.operands[2] = 0;
+        host.engine_op(Op::LoadTextFile, &mut vm_state).unwrap();
+        vm_state.operands[0] = 0;
+        vm_state.operands[1] = 0;
+        vm_state.operands[2] = 0;
+        vm_state.operands[3] = 512;
+        vm_state.operands[4] = 4;
+        vm_state.operands[5] = 0;
+        vm_state.operands[6] = -1;
+        host.engine_op(Op::DrawText, &mut vm_state).unwrap();
+        let framebuffer = &host.state.render.framebuffer;
+        assert_eq!(framebuffer.get(0, 0), 0xF800, "first glyph at x = 0");
+        assert_eq!(framebuffer.get(1, 0), 0xF800);
+        assert_eq!(framebuffer.get(2, 0), 0);
+        assert_eq!(framebuffer.get(3, 0), 0xF800, "advance 3 puts B at x = 3");
+        assert_eq!(framebuffer.get(4, 0), 0xF800);
+    }
 }

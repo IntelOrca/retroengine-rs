@@ -21,6 +21,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Synthetic smoke (headless and dummy window)
+        run: |
+          # Generate a tiny self-contained asset folder (no game data) and boot it both ways
+          # with a hard timeout, so a startup hang/deadlock fails CI instead of hanging it.
+          cargo build --quiet -p retro-dev -p retro-engine
+          ./target/debug/retro-dev gen-synthetic /tmp/retro-synthetic
+          timeout 30 ./target/debug/retroengine /tmp/retro-synthetic --headless --frames 5
+          SDL_VIDEO_DRIVER=dummy SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+            timeout 30 ./target/debug/retroengine /tmp/retro-synthetic --frames 5 \
+            --user-dir /tmp/retro-synthetic-user
 
   windows:
     name: windows
@@ -66,6 +76,27 @@ jobs:
             }
           }
           Write-Host "Only OS-provided libraries (UCRT api-ms-win-crt-*) are required."
+      - name: Synthetic smoke (headless and dummy window)
+        shell: pwsh
+        run: |
+          # Generate a tiny self-contained asset folder (no game data) and boot it both ways
+          # with a hard 30s timeout, so a startup hang/deadlock fails CI instead of hanging it.
+          .\target\release\retro-dev.exe gen-synthetic "$env:RUNNER_TEMP\retro-synthetic"
+          function Invoke-Bounded([string]$exe, [string[]]$arguments) {
+            $process = Start-Process -FilePath $exe -ArgumentList $arguments -PassThru -NoNewWindow
+            if (-not $process.WaitForExit(30000)) {
+              $process.Kill()
+              throw "timed out after 30s: $exe $arguments"
+            }
+            if ($process.ExitCode -ne 0) {
+              throw "exit $($process.ExitCode): $exe $arguments"
+            }
+          }
+          Invoke-Bounded ".\target\release\retroengine.exe" @("$env:RUNNER_TEMP\retro-synthetic", "--headless", "--frames", "5")
+          $env:SDL_VIDEO_DRIVER = "dummy"
+          $env:SDL_VIDEODRIVER = "dummy"
+          $env:SDL_AUDIODRIVER = "dummy"
+          Invoke-Bounded ".\target\release\retroengine.exe" @("$env:RUNNER_TEMP\retro-synthetic", "--frames", "5", "--user-dir", "$env:RUNNER_TEMP\retro-synthetic-user")
       - name: Package retroengine-windows.zip
         shell: pwsh
         run: |
@@ -89,9 +120,13 @@ jobs:
             "  --act ID       Act id (1, 2, B, ...); defaults to the scene's own act",
             "  --list         List categories, scenes and available Act*.bin files, then exit",
             "  --headless     Deterministic run without a window",
-            "  --frames N     Frames to run headlessly (default 600)",
+            "  --frames N     Frames to run (default 600 headlessly; also bounds a windowed session)",
             "  --input FILE   Replay a scripted input file",
             "  --mute         Disable audio output",
+            "  --origins      Compile Origins (#platform: USE_ORIGINS) script blocks",
+            "",
+            "If the window seems unresponsive, rerun with --frames N to bound the session and",
+            "report the platform:/audio:/video: lines printed at startup.",
             "",
             "Saves: written to %APPDATA%\retroengine-rs\retroengine (or --user-dir DIR).",
             "SDL3 and the MSVC C runtime are linked statically; only the OS-provided",

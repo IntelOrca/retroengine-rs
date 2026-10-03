@@ -250,6 +250,10 @@ impl AudioDevice for HeadlessAudio {
     fn close(&mut self) -> Result<(), PlatformError> {
         Ok(())
     }
+
+    fn description(&self) -> String {
+        "headless".to_owned()
+    }
 }
 
 struct HeadlessInput {
