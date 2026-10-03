@@ -37,6 +37,8 @@ pub struct Camera {
     pub shake_x: i32,
     /// `cameraShakeY` (updated by the render loop in upstream).
     pub shake_y: i32,
+    /// `cameraLockedY`: latches the vertical camera once it settles on its target.
+    pub locked_y: i32,
 }
 
 impl Camera {

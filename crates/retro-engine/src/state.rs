@@ -32,8 +32,16 @@ pub const TILE_LAYER_HEIGHT: usize = 0x100;
 pub const PARALLAX_COUNT: usize = 0x100;
 /// `ENGINE_MAINGAME`, the only engine mode modelled by M3.
 pub const ENGINE_MAINGAME: i32 = 1;
+/// `STAGEMODE_LOAD`: the scene-load tick (`LoadStageFiles`), handled by the deferred load path.
+pub const STAGEMODE_LOAD: i32 = 0;
 /// `STAGEMODE_NORMAL`: the stage mode `ProcessStage` enters after finishing `STAGEMODE_LOAD`.
 pub const STAGEMODE_NORMAL: i32 = 1;
+/// `STAGEMODE_PAUSED`: only `PRIORITY_ALWAYS` entities update and draw (`ProcessPausedObjects`).
+pub const STAGEMODE_PAUSED: i32 = 2;
+/// `STAGEMODE_FROZEN`: frozen for debug frame stepping; `ProcessStage` has no plain-mode case.
+pub const STAGEMODE_FROZEN: i32 = 3;
+/// `STAGEMODE_2P`: split-screen mode; `ProcessStage` has no plain-mode case for it.
+pub const STAGEMODE_2P: i32 = 4;
 /// Number of text menus upstream keeps (`TEXTMENU_COUNT`).
 pub const TEXT_MENU_COUNT: usize = 0x2;
 /// Maximum characters stored per text menu (`TEXTDATA_COUNT`).
