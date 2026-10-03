@@ -121,6 +121,27 @@ pub fn backend_for(args: &Args) -> BackendKind {
     }
 }
 
+/// Builds the window description from the parsed `Settings.ini` video flags.
+///
+/// `windowed=y`/`border=y` (the shipped default) yields a bordered windowed window and `vsync`
+/// follows the ini; `exclusiveFS` is carried for the backend. The width/height stay the logical
+/// framebuffer size, which the renderer scales to the actual window.
+#[must_use]
+fn window_desc(
+    settings: &retro_format_v4::Settings,
+    title: String,
+    width: u32,
+    height: u32,
+) -> WindowDesc {
+    WindowDesc {
+        vsync: settings.video.vsync,
+        windowed: settings.video.windowed,
+        border: settings.video.border,
+        exclusive_fullscreen: settings.video.exclusive_fs,
+        ..WindowDesc::new(title, width, height)
+    }
+}
+
 /// Validates that `root` is an unpacked RSDK asset folder.
 pub fn resolve_assets(root: &Path) -> Result<ResolvedAssets, EngineError> {
     if !root.is_dir() {
@@ -376,7 +397,7 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
 
     // Windowed runs push mixed audio to the SDL device. A missing device is not fatal: mixing
     // (and therefore `--audio-hash`) continues headlessly. Audio is opened before the window is
-    // created so a slow or failing audio backend cannot leave a frozen window on screen.
+    // created so a failing audio backend happens before any window is shown.
     if !args.headless {
         if args.mute {
             println!("audio: muted (--mute)");
@@ -398,7 +419,7 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     }
 
     // The engine is fully loaded (and any audio device opened) before the window exists, so a
-    // slow or failed load cannot leave a frozen window on screen.
+    // slow or failed load cannot leave a half-created window on screen.
     let (width, height) = (
         engine.framebuffer().width() as u32,
         engine.framebuffer().height() as u32,
@@ -407,7 +428,12 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         None
     } else {
         let title = format!("{} - {folder} {act}", engine.game_title());
-        let mut window = platform.create_window(WindowDesc::new(title.clone(), width, height))?;
+        let mut window = platform.create_window(window_desc(
+            engine.raw_settings(),
+            title.clone(),
+            width,
+            height,
+        ))?;
         // Title again right after creation so the window is never shown untitled on backends
         // that only apply the title after the first present.
         window.set_title(&title);
@@ -579,6 +605,41 @@ mod tests {
         assert!(!args.origins);
         assert_eq!(args.user_dir, None);
         assert_eq!(args.dump_frame_every, 1);
+    }
+
+    #[test]
+    fn window_desc_defaults_to_a_bordered_windowed_window_and_reads_settings() {
+        // `WindowDesc::new` is the Windows-safe default: windowed, bordered, vsync on.
+        let default = WindowDesc::new("default", 424, 240);
+        assert!(default.windowed, "default must be windowed");
+        assert!(default.border, "default must be bordered");
+        assert!(default.vsync, "default must request vsync");
+        assert!(!default.exclusive_fullscreen);
+        assert!(default.integer_scale);
+
+        // The shipped `windowed=y border=y` ini yields exactly that bordered windowed desc.
+        let settings = retro_format_v4::Settings::parse(
+            "[Video]\nwindowed=y\nborder=y\nexclusiveFS=n\nvsync=y\n",
+        )
+        .unwrap();
+        let desc = window_desc(&settings, "Sonic Test".to_owned(), 424, 240);
+        assert!(desc.windowed);
+        assert!(desc.border);
+        assert!(desc.vsync);
+        assert!(!desc.exclusive_fullscreen);
+        assert_eq!(desc.title, "Sonic Test");
+        assert_eq!((desc.width, desc.height), (424, 240));
+
+        // A fullscreen/borderless ini is carried through instead.
+        let settings = retro_format_v4::Settings::parse(
+            "[Video]\nwindowed=n\nborder=n\nexclusiveFS=y\nvsync=n\n",
+        )
+        .unwrap();
+        let desc = window_desc(&settings, "Full".to_owned(), 424, 240);
+        assert!(!desc.windowed);
+        assert!(!desc.border);
+        assert!(desc.exclusive_fullscreen);
+        assert!(!desc.vsync);
     }
 
     #[test]

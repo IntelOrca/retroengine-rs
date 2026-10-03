@@ -89,7 +89,11 @@ fn write_assets(root: &Path) {
     let game = root.join("Data").join("Game");
     std::fs::create_dir_all(&game).unwrap();
     std::fs::write(game.join("GameConfig.bin"), game_config_bytes()).unwrap();
-    std::fs::write(root.join("Settings.ini"), "[Game]\ngameType=1\n").unwrap();
+    std::fs::write(
+        root.join("Settings.ini"),
+        "[Game]\ngameType=1\n[Video]\nwindowed=y\nborder=y\nvsync=y\n",
+    )
+    .unwrap();
     let stage = root.join("Data").join("Stages").join("Zone01");
     std::fs::create_dir_all(&stage).unwrap();
     std::fs::write(stage.join("StageConfig.bin"), stage_config_bytes()).unwrap();
@@ -222,7 +226,8 @@ fn run_bounded_with_env(
 }
 
 /// A windowed run must create its window, present exactly `--frames` frames and exit 0,
-/// reporting the selected platform, video driver and audio device.
+/// reporting the selected platform, video driver and audio device. The dummy window is never
+/// focused and never receives a close event, so the `--frames` cap alone must terminate it.
 #[cfg(unix)]
 #[test]
 fn windowed_frames_run_exits_promptly() {

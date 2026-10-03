@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use retro_audio::AudioEngine;
 use retro_format_v4::SceneEntity;
+use retro_format_v4::Settings;
 use retro_format_v4::scene::{
     ENTITY_ATTRIB_ALPHA, ENTITY_ATTRIB_ANIMATION, ENTITY_ATTRIB_ANIMATION_SPEED,
     ENTITY_ATTRIB_DIRECTION, ENTITY_ATTRIB_DRAW_ORDER, ENTITY_ATTRIB_FRAME,
@@ -66,6 +67,8 @@ pub struct Engine {
     pub scripts: ScriptRuntime,
     /// Per-frame input source (idle, scripted or raw platform state).
     pub input: EngineInput,
+    /// Parsed `Settings.ini`, retained for host/window configuration.
+    raw_settings: Settings,
     /// Index of the `input.pressButton` global, when the GameConfig defines it.
     press_button_global: Option<usize>,
 }
@@ -206,6 +209,7 @@ impl Engine {
                 vm_state,
             },
             input,
+            raw_settings: world.raw_settings,
             press_button_global,
         };
         engine.run_startup()?;
@@ -807,6 +811,12 @@ impl Engine {
     #[must_use]
     pub fn settings(&self) -> &EngineSettings {
         &self.state.settings
+    }
+
+    /// The parsed `Settings.ini` used to load this engine.
+    #[must_use]
+    pub fn raw_settings(&self) -> &Settings {
+        &self.raw_settings
     }
 
     /// The game config title.
