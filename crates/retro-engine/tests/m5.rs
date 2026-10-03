@@ -184,6 +184,60 @@ fn scripted_right_moves_the_player_and_differs_from_null_input() {
 }
 
 #[test]
+fn scripted_input_lines_are_consumed_by_record_number() {
+    let mut engine = Engine::load(source(), None, None, DEFAULT_SEED).unwrap();
+    let mut text = String::from("retro-input 1\n");
+    // Line 0 belongs to the `Engine::load` tick, which never runs `ProcessInput`.
+    text.push_str("0 RIGHT 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n");
+    text.push_str("1 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n");
+    text.push_str("2 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n");
+    text.push_str("3 RIGHT 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n");
+    engine.set_scripted_input(ScriptedInput::from_str(&text).unwrap());
+    let start = player_x(&engine);
+
+    engine.run_frame().unwrap(); // record 1 -> line 1
+    assert_eq!(
+        player_x(&engine),
+        start,
+        "line 0 is the unused load-tick line"
+    );
+    engine.run_frame().unwrap(); // record 2 -> line 2
+    assert_eq!(player_x(&engine), start);
+    engine.run_frame().unwrap(); // record 3 -> line 3
+    assert_eq!(
+        player_x(&engine),
+        start + 65536,
+        "line N must be consumed on record N"
+    );
+}
+
+#[test]
+fn load_tick_does_not_consume_or_apply_input() {
+    let mut engine = Engine::load(source(), None, None, DEFAULT_SEED).unwrap();
+    let mut text = String::from("retro-input 1\n");
+    text.push_str("0 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n");
+    text.push_str("1 RIGHT 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n");
+    text.push_str("2 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n");
+    text.push_str("3 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n");
+    engine.set_scripted_input(ScriptedInput::from_str(&text).unwrap());
+
+    engine.run_frame().unwrap(); // record 1 -> line 1
+    assert!(engine.state.input.right);
+
+    // Record 2 is a `STAGEMODE_LOAD` tick: `ProcessInput` is not called, so line 2 is neither
+    // applied nor needed; the controller keeps line 1's state.
+    engine.state.load_stage_requested = true;
+    engine.run_frame().unwrap();
+    assert!(
+        engine.state.input.right,
+        "the load tick must not poll input"
+    );
+
+    engine.run_frame().unwrap(); // record 3 -> line 3 (absolute, not shifted by the load tick)
+    assert!(!engine.state.input.right, "record 3 consumes line 3");
+}
+
+#[test]
 fn input_press_button_global_tracks_pressed_edges() {
     let mut idle = Engine::load(source(), None, None, DEFAULT_SEED).unwrap();
     idle.run_frames(3, false).unwrap();

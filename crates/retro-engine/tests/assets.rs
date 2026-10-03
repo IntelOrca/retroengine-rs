@@ -240,6 +240,128 @@ const S2_ZONE01_RIGHT: &[(u64, &str)] = &[
     ),
 ];
 
+/// Pinned `fb.blake3` values for `zone01_right400.input` (RIGHT held from line 400). Record 400
+/// is the first frame the input applies; before the tick-alignment fix Rust consumed line 399
+/// and diverged here. The reference records are indexed by absolute tick, so line `N` belongs
+/// to record `N`.
+const S1_ZONE01_RIGHT400: &[(u64, &str)] = &[
+    (
+        399,
+        "54cea0d080abb5365fe92eb6762997dc5e77bff5173547a3167e129e20dcfda8",
+    ),
+    (
+        400,
+        "74b1da08461bf04d13ddcca239c9f2b398fa1d146e7e390868a3506512718839",
+    ),
+    (
+        401,
+        "4946532824b4a462fb18cd8eead520d2e7861ead44844abeba9d4929dabe1fce",
+    ),
+    (
+        450,
+        "6902212df1cc68574b5b1a0e50b164d9691a86dc9cc1e256522b4c9c32a5b97f",
+    ),
+    (
+        599,
+        "6c868397f495761b00f4bf9b62060031d56848e2b5092f18953c4df69a62bdca",
+    ),
+];
+const S2_ZONE01_RIGHT400: &[(u64, &str)] = &[
+    (
+        399,
+        "70aeaa0e71249ff6d10f462472a87ecd337c775f5fc6d1d22e02bf6a7dc01778",
+    ),
+    (
+        400,
+        "cf850e33011f1ba1de0ba0eead838c349c5082e119efd79480abc4b001c029e3",
+    ),
+    (
+        401,
+        "cf850e33011f1ba1de0ba0eead838c349c5082e119efd79480abc4b001c029e3",
+    ),
+    (
+        450,
+        "c4f7c627245f8d8f96bd728f3dd39c1826258450f5c432ceb77bebb3ec50eca4",
+    ),
+    (
+        599,
+        "de712689faecf9856e083a5dfb28fac6abb832d11b0d6635f8a246dd1b4c39eb",
+    ),
+];
+
+/// Pinned `fb.blake3` values for `title_start.input` (Title screen, A held from line 800). The
+/// pins bracket the START press (800/801), the Zone01 load, and the scripted-press frame the
+/// reference synthesizes from the held A once control unlocks (1010/1028) — the last one only
+/// matches after scripts are allowed to write `keyDown`/`keyPress`.
+const S1_TITLE_START: &[(u64, &str)] = &[
+    (
+        799,
+        "121a1ddd7805bd80b7d2d15c3823bda3c4dccbf84e7ca59891844e2e13de7c73",
+    ),
+    (
+        800,
+        "b376db1445d3d79e1a3302f03815148e8bc4840ddf3faef4b1ecdc0a04c022f1",
+    ),
+    (
+        801,
+        "55c43613158bf94016dd4735377fde6d90c1df04c1c9b4a9aa8cbc96896fda67",
+    ),
+    (
+        810,
+        "470deca280529f3a3c818d7cf9a569eeab4b2ec1e91230dd203b4f59b7d7a052",
+    ),
+    (
+        900,
+        "3408e5d452de309ff60e8139aa8d202ed4e3d2750ca5934da7c2da367902d648",
+    ),
+    (
+        1010,
+        "43b17467378d67a65515f366a904b6b8fdbeba9eac5e260788541b3891eb66b8",
+    ),
+    (
+        1028,
+        "8d08448bc063d3d27db260b805f662d7b2778f697e381c8df215dd3b36b6952d",
+    ),
+    (
+        1199,
+        "ce03a1fd2f2a0602b2a7103bc411338148a0b2fe7a802093b2b07494e7f433c6",
+    ),
+];
+const S2_TITLE_START: &[(u64, &str)] = &[
+    (
+        799,
+        "019a5d0ba09dd477845b4229c77a0e3bc2e42b3c936bd6544df769d872400287",
+    ),
+    (
+        800,
+        "e4a9da8eb828d77bb0ea567f29c99d5dd2e40ebf012cbda8905b09fd773cf03f",
+    ),
+    (
+        801,
+        "f19ce473806d423c06b839c6dfc1caf17e768e7f2d8f42d224823f5d03574721",
+    ),
+    (
+        810,
+        "e1dc29df7dd03c08489c19dc9f77df73e800b3f5010d50a59731bc0bc9a6be6b",
+    ),
+    (
+        900,
+        "31b18548dfcb5e288c39f29540910aeb7ccf1f193acbabf773a4afc505681717",
+    ),
+    (
+        1010,
+        "5af4f38e6b675b25743acf7d705f31e19f871729e25bf15d0a6b6087eaabc0d0",
+    ),
+    (
+        1028,
+        "6ce00da631d143a7a9e62db9e940291349ab6d5fdcb04c7b27620fe1f1f1586e",
+    ),
+    (
+        1199,
+        "59eb4f2fc624acf47b2e582df4dc895840914eaf12fe57287fecd4b976de353c",
+    ),
+];
+
 #[test]
 #[ignore = "requires assets; pins reference-harness framebuffer hashes"]
 fn zone01_idle_framebuffer_matches_reference() {
@@ -261,35 +383,57 @@ fn zone01_idle_framebuffer_matches_reference() {
     }
 }
 
-fn scripted_right_input() -> retro_input::ScriptedInput {
+fn scripted_input(file: &str) -> retro_input::ScriptedInput {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tools/ref-harness/testdata/zone01_right.input");
+        .join("../../tools/ref-harness/testdata")
+        .join(file);
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
     retro_input::ScriptedInput::from_str(&text).expect("scripted input")
+}
+
+/// Runs `input_file` for `pins` and asserts every pinned framebuffer hash. `scene` selects the
+/// starting scene (the Title START replay leaves it mid-run).
+fn check_scripted_pins(game: &str, scene: &str, input_file: &str, pins: &[(u64, &str)]) {
+    let scripted = scripted_input(input_file);
+    let seed = scripted.seed().unwrap_or(DEFAULT_SEED);
+    let mut engine = Engine::load(source(game), Some(scene), Some("1"), seed).expect("engine load");
+    engine.set_scripted_input(scripted);
+    let mut frame = 0u64;
+    for &(target, expected) in pins {
+        while frame < target {
+            engine.run_frame().expect("frame");
+            frame += 1;
+        }
+        assert_eq!(
+            framebuffer_hash(&engine),
+            expected,
+            "{game}/{scene} {input_file} frame {target} must match the reference harness"
+        );
+    }
 }
 
 #[test]
 #[ignore = "requires assets; pins reference-harness framebuffer hashes"]
 fn zone01_right_framebuffer_matches_reference() {
     for (game, pins) in [("S1", S1_ZONE01_RIGHT), ("S2", S2_ZONE01_RIGHT)] {
-        let scripted = scripted_right_input();
-        let seed = scripted.seed().unwrap_or(DEFAULT_SEED);
-        let mut engine =
-            Engine::load(source(game), Some("Zone01"), Some("1"), seed).expect("engine load");
-        engine.set_scripted_input(scripted);
-        let mut frame = 0u64;
-        for &(target, expected) in pins {
-            while frame < target {
-                engine.run_frame().expect("frame");
-                frame += 1;
-            }
-            assert_eq!(
-                framebuffer_hash(&engine),
-                expected,
-                "{game}/Zone01 hold-RIGHT frame {target} must match the reference harness"
-            );
-        }
+        check_scripted_pins(game, "Zone01", "zone01_right.input", pins);
+    }
+}
+
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn zone01_right400_framebuffer_matches_reference() {
+    for (game, pins) in [("S1", S1_ZONE01_RIGHT400), ("S2", S2_ZONE01_RIGHT400)] {
+        check_scripted_pins(game, "Zone01", "zone01_right400.input", pins);
+    }
+}
+
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn title_start_framebuffer_matches_reference() {
+    for (game, pins) in [("S1", S1_TITLE_START), ("S2", S2_TITLE_START)] {
+        check_scripted_pins(game, "Title", "title_start.input", pins);
     }
 }
 
