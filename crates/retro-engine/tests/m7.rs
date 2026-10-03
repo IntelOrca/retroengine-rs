@@ -11,7 +11,9 @@ use std::sync::Arc;
 use retro_engine::Engine;
 use retro_engine::rng::DEFAULT_SEED;
 use retro_format_v4::gameconfig::PALETTE_COUNT;
-use retro_format_v4::scene::{ACTIVE_LAYER_COUNT, ENTITY_ATTRIB_STATE, ENTITY_ATTRIB_VALUES};
+use retro_format_v4::scene::{
+    ACTIVE_LAYER_COUNT, ENTITY_ATTRIB_PRIORITY, ENTITY_ATTRIB_STATE, ENTITY_ATTRIB_VALUES,
+};
 use retro_format_v4::stageconfig::STAGE_PALETTE_COUNT;
 use retro_input::ScriptedInput;
 use retro_io::{DataSource, DirSource, MemorySource};
@@ -48,6 +50,16 @@ end event\n\
 event ObjectUpdate\n\
     object.value1 += 1\n\
     object.value2 = loadCount\n\
+end event\n\
+";
+
+/// `Frozen` object: every entity counts updates, and reaching two freezes the stage.
+const FROZEN_SOURCE: &str = "\
+event ObjectUpdate\n\
+    object.value0 += 1\n\
+    if object.value0 == 2\n\
+        stage.state = 3\n\
+    end if\n\
 end event\n\
 ";
 
@@ -126,6 +138,68 @@ fn scene_bytes(title: &str) -> Vec<u8> {
     bytes.extend_from_slice(&0i32.to_le_bytes()); // state
     bytes.extend_from_slice(&0i32.to_le_bytes()); // value0
     bytes
+}
+
+/// GameConfig with a single global `Frozen` object and a one-entry Regular list.
+fn frozen_game_config_bytes() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    push_string(&mut bytes, "M7 Frozen");
+    push_string(&mut bytes, "m7 frozen stage");
+    for _ in 0..PALETTE_COUNT {
+        bytes.extend_from_slice(&[0, 0, 0]);
+    }
+    bytes.push(1); // objects
+    push_string(&mut bytes, "Frozen");
+    push_string(&mut bytes, "M7/Frozen.txt");
+    bytes.push(0); // global variables
+    bytes.push(0); // sound effects
+    bytes.push(0); // players
+    bytes.push(0); // Presentation
+    bytes.push(1); // Regular
+    scene_entry(&mut bytes, "Zone01", "1", "FROZEN ZONE");
+    bytes.push(0); // Special
+    bytes.push(0); // Bonus
+    bytes
+}
+
+/// Act with two entities of the `Frozen` object: slot 32 is `PRIORITY_ALWAYS`, slot 33 is the
+/// default `PRIORITY_BOUNDS`.
+fn frozen_scene_bytes() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    push_string(&mut bytes, "FROZEN");
+    bytes.extend_from_slice(&[9; ACTIVE_LAYER_COUNT]);
+    bytes.push(3); // midpoint
+    bytes.push(1); // width
+    bytes.push(0);
+    bytes.push(1); // height
+    bytes.push(0);
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // one chunk
+    bytes.extend_from_slice(&2u16.to_le_bytes()); // two entities
+    bytes.extend_from_slice(&ENTITY_ATTRIB_PRIORITY.to_le_bytes());
+    bytes.push(1); // object type 1
+    bytes.push(0); // property value
+    bytes.extend_from_slice(&(64i32 << 16).to_le_bytes());
+    bytes.extend_from_slice(&(64i32 << 16).to_le_bytes());
+    bytes.push(2); // PRIORITY_ALWAYS
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // no attributes: PRIORITY_BOUNDS
+    bytes.push(1); // object type 1
+    bytes.push(0); // property value
+    bytes.extend_from_slice(&(96i32 << 16).to_le_bytes());
+    bytes.extend_from_slice(&(64i32 << 16).to_le_bytes());
+    bytes
+}
+
+fn frozen_source() -> Arc<dyn DataSource> {
+    let mut source = MemorySource::new();
+    source.insert("Settings.ini", "[Game]\ngameType=1\ntxtScripts=n\n");
+    source.insert("Data/Game/GameConfig.bin", frozen_game_config_bytes());
+    source.insert(
+        "Data/Stages/Zone01/StageConfig.bin",
+        stage_config_bytes(1, &[]),
+    );
+    source.insert("Data/Stages/Zone01/Act1.bin", frozen_scene_bytes());
+    source.insert("Data/Scripts/M7/Frozen.txt", FROZEN_SOURCE);
+    Arc::new(source)
 }
 
 fn synthetic_source() -> Arc<dyn DataSource> {
@@ -266,6 +340,45 @@ fn invalid_stage_list_position_errors() {
             retro_engine::EngineError::InvalidStageList { list: 1, pos: 99 }
         ),
         "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn frozen_stage_updates_only_priority_always_entities() {
+    use retro_engine::state::{STAGEMODE_FROZEN, STAGEMODE_NORMAL};
+
+    let mut engine = Engine::load(frozen_source(), None, None, DEFAULT_SEED).unwrap();
+    let value = |engine: &Engine, slot: usize| engine.state.entities.get(slot).unwrap().values[0];
+
+    // Frames 1 and 2: both entities update normally and freeze the stage on frame 2.
+    engine.run_frame().unwrap();
+    assert_eq!(value(&engine, 32), 1);
+    assert_eq!(value(&engine, 33), 1);
+    assert_eq!(engine.state.stage.state, STAGEMODE_NORMAL);
+    engine.run_frame().unwrap();
+    assert_eq!(value(&engine, 32), 2);
+    assert_eq!(value(&engine, 33), 2);
+    assert_eq!(engine.state.stage.state, STAGEMODE_FROZEN);
+
+    // Frame 3 (`ProcessFrozenObjects`): only `PRIORITY_ALWAYS` entities update, but the type
+    // groups are rebuilt and the stage still draws, so the ALWAYS entity enters the draw list.
+    engine.run_frame().unwrap();
+    assert_eq!(value(&engine, 32), 3, "PRIORITY_ALWAYS keeps updating");
+    assert_eq!(value(&engine, 33), 2, "PRIORITY_BOUNDS is frozen");
+    let group = engine
+        .state
+        .type_groups
+        .get(1)
+        .expect("type group for the Frozen object");
+    assert!(
+        group.entity_refs.contains(&32) && group.entity_refs.contains(&33),
+        "frozen type groups still list every active entity: {:?}",
+        group.entity_refs
+    );
+    assert!(
+        engine.state.draw_lists[3].contains(&32) && engine.state.draw_lists[3].contains(&33),
+        "the frozen draw pass still draws every active entity: {:?}",
+        engine.state.draw_lists[3]
     );
 }
 

@@ -53,7 +53,7 @@ use crate::loader::{self, SceneAssets};
 use crate::profile::EngineSettings;
 use crate::rng::DEFAULT_SEED;
 use crate::save::{SaveState, seed_memory_storage};
-use crate::state::{EngineState, STAGEMODE_NORMAL, STAGEMODE_PAUSED};
+use crate::state::{EngineState, STAGEMODE_FROZEN, STAGEMODE_NORMAL, STAGEMODE_PAUSED};
 
 /// The compiled script file and its VM execution state.
 pub struct ScriptRuntime {
@@ -565,8 +565,14 @@ impl Engine {
                 self.process_paused_objects()?;
                 self.draw_paused_gfx()?;
             }
-            // `ProcessStage` has no plain `STAGEMODE_FROZEN`/`STAGEMODE_2P` case; those modes
-            // only run through their `+ STAGEMODE_STEPOVER` variants, which are not modelled.
+            // `STAGEMODE_FROZEN` (death/game-over): only `PRIORITY_ALWAYS` entities update, but
+            // type groups are rebuilt and the stage still draws, so the death animation plays.
+            STAGEMODE_FROZEN => {
+                self.process_frozen_objects()?;
+                self.update_camera();
+                self.draw_stage_gfx()?;
+            }
+            // `STAGEMODE_2P` and the `+ STAGEMODE_STEPOVER` variants are not modelled.
             _ => {}
         }
         // `FlipScreen` updates the display-only dim state after the frame is composed.
@@ -870,6 +876,17 @@ impl Engine {
 
     /// Ports the active-entity check from `ProcessObjects`.
     fn process_objects(&mut self) -> Result<(), EngineError> {
+        self.process_objects_impl(false)
+    }
+
+    /// `ProcessFrozenObjects`: like [`Self::process_objects`], but only `PRIORITY_ALWAYS`
+    /// entities run their update script. Type groups are still rebuilt so frozen ALWAYS
+    /// objects see the same interaction lists as upstream.
+    fn process_frozen_objects(&mut self) -> Result<(), EngineError> {
+        self.process_objects_impl(true)
+    }
+
+    fn process_objects_impl(&mut self, frozen: bool) -> Result<(), EngineError> {
         for list in &mut self.state.draw_lists {
             list.clear();
         }
@@ -916,7 +933,9 @@ impl Engine {
                 continue;
             };
             let update = entry.script.update;
-            if self.script_exists(update.code_pos) {
+            if self.script_exists(update.code_pos)
+                && (!frozen || entity.priority == PRIORITY_ALWAYS)
+            {
                 self.state.object_entity_pos = slot;
                 self.scripts.vm_state.current_event = ScriptEvent::Main;
                 self.run_host_event(update.code_pos, update.jump_pos)?;
