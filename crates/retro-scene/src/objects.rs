@@ -13,7 +13,22 @@
 
 use serde::Serialize;
 
-use retro_script::ObjectScript;
+use retro_script::{EMPTY_EVENT, JUMPTABLE_COUNT, ObjectScript, ScriptPtr};
+
+/// Upstream `ClearScriptData` leaves an object event with no script pointing at the sentinel
+/// `SCRIPTCODE_COUNT - 1` / `JUMPTABLE_COUNT - 1`, so the engine's `scriptCode[ptr] > 0` guard
+/// skips it. A zeroed pointer would alias whatever script happens to start at code position 0.
+fn empty_object_script() -> ObjectScript {
+    let ptr = ScriptPtr {
+        code_pos: EMPTY_EVENT,
+        jump_pos: JUMPTABLE_COUNT as u32 - 1,
+    };
+    ObjectScript {
+        update: ptr,
+        draw: ptr,
+        startup: ptr,
+    }
+}
 
 /// One object type in the merged list.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -49,6 +64,7 @@ impl ObjectRegistry {
         Self {
             objects: vec![ObjectEntry {
                 name: "BlankObject".to_owned(),
+                script: empty_object_script(),
                 ..ObjectEntry::default()
             }],
         }
@@ -151,6 +167,18 @@ mod tests {
         assert!(registry.is_empty());
         assert_eq!(registry.get(0).unwrap().name, "BlankObject");
         assert_eq!(registry.type_id("BlankObject"), Some(0));
+    }
+
+    #[test]
+    fn blank_object_events_use_the_upstream_sentinels() {
+        // A zeroed event pointer would alias whatever script starts at code position 0, so the
+        // blank object must point past the end of the script arrays like `ClearScriptData`.
+        let registry = ObjectRegistry::new();
+        let script = registry.get(0).unwrap().script;
+        for pointer in [script.update, script.draw, script.startup] {
+            assert_eq!(pointer.code_pos, EMPTY_EVENT);
+            assert_eq!(pointer.jump_pos, JUMPTABLE_COUNT as u32 - 1);
+        }
     }
 
     #[test]
