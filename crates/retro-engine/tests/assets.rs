@@ -104,6 +104,93 @@ fn s2_zone01_600_frames() {
     assert_600_frames("S2", "Zone01");
 }
 
+/// BLAKE3 of the visible RGB565 framebuffer, rows contiguous and little-endian, exactly the
+/// `fb.blake3` value the C reference harness writes for each frame.
+fn framebuffer_hash(engine: &Engine) -> String {
+    let framebuffer = engine.framebuffer();
+    let mut bytes = Vec::with_capacity(framebuffer.width() * framebuffer.height() * 2);
+    for y in 0..framebuffer.height() {
+        for x in 0..framebuffer.width() {
+            bytes.extend_from_slice(&framebuffer.get(x as i32, y as i32).to_le_bytes());
+        }
+    }
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
+/// Pinned `fb.blake3` values from `tools/ref-harness/run.sh` with the header-only idle input
+/// (`testdata/zone01_idle.input`; the reference seeds `1592594996`, the Rust run uses
+/// `DEFAULT_SEED` and the frames below do not depend on `Rand`). Frames 0-600 are
+/// pixel-identical, which covers the tile layers, the paused title-card stage mode, the
+/// faithful `SetPlayerScreenPosition` camera and the palette rotation phase.
+///
+/// The hold-RIGHT reference run matches through frame 376; from 377 on it diverges in player
+/// physics (collision), which is tracked by the collision port rather than the renderer.
+const S1_ZONE01_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        60,
+        "7c91097af19244c9d9c878134d1ab692633e0ae9a15b0c41f010076b66db7cd3",
+    ),
+    (
+        155,
+        "0ad5666c971afd738e1f4a5ef1e763e82229285bf3a32a9b9f87e878dce95d79",
+    ),
+    (
+        240,
+        "0134d81718a04d39a02dccc39f4f8a99551531b0254b5cf54642ce713c32ca60",
+    ),
+    (
+        600,
+        "36167df6df9716003b03a39ec3693c3ea090eed8ea7f9634f02e4d1672485940",
+    ),
+];
+const S2_ZONE01_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        60,
+        "bbd21b4d1a50717f804317784d525574e45bf8479714fad95b7b08bf1d4ef819",
+    ),
+    (
+        155,
+        "13898f40d171bac3b568dffc8822f814113ad200601a70e3c7fbe2508c301dda",
+    ),
+    (
+        240,
+        "33aa287fc9677419baf3f8cb49e4f61978b4c97265b11cdf1aa7de70d509c10c",
+    ),
+    (
+        600,
+        "1442e6f5545812096bdd3527a3f8be0c39b03d59a298b31ce5a4f270d852a038",
+    ),
+];
+
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn zone01_idle_framebuffer_matches_reference() {
+    for (game, pins) in [("S1", S1_ZONE01_IDLE), ("S2", S2_ZONE01_IDLE)] {
+        let mut engine = Engine::load(source(game), Some("Zone01"), Some("1"), DEFAULT_SEED)
+            .expect("engine load");
+        let mut frame = 0u64;
+        for &(target, expected) in pins {
+            while frame < target {
+                engine.run_frame().expect("frame");
+                frame += 1;
+            }
+            assert_eq!(
+                framebuffer_hash(&engine),
+                expected,
+                "{game}/Zone01 idle frame {target} must match the reference harness"
+            );
+        }
+    }
+}
+
 /// Prints a combined summary of the four required scenes.
 #[test]
 #[ignore = "requires assets"]
