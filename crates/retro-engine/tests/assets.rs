@@ -122,9 +122,6 @@ fn framebuffer_hash(engine: &Engine) -> String {
 /// `DEFAULT_SEED` and the frames below do not depend on `Rand`). Frames 0-600 are
 /// pixel-identical, which covers the tile layers, the paused title-card stage mode, the
 /// faithful `SetPlayerScreenPosition` camera and the palette rotation phase.
-///
-/// The hold-RIGHT reference run matches through frame 376; from 377 on it diverges in player
-/// physics (collision), which is tracked by the collision port rather than the renderer.
 const S1_ZONE01_IDLE: &[(u64, &str)] = &[
     (
         0,
@@ -170,6 +167,79 @@ const S2_ZONE01_IDLE: &[(u64, &str)] = &[
     ),
 ];
 
+/// Pinned `fb.blake3` values from `tools/ref-harness/run.sh` with `zone01_right.input` (idle
+/// through frame 59, then RIGHT held). All 600 frames are pixel-identical; the pins include the
+/// spring launch (350), the S2 Monitor that the `ForEachAll` stack bug used to destroy (360),
+/// the S1 death trigger (376) and the first frame the frozen death update used to miss (377).
+const S1_ZONE01_RIGHT: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        155,
+        "0ad5666c971afd738e1f4a5ef1e763e82229285bf3a32a9b9f87e878dce95d79",
+    ),
+    (
+        350,
+        "5e3ef5d2e61da802a62d6c1716c2b3ea3682ff773e44825570cbcc381a9264ed",
+    ),
+    (
+        360,
+        "3219999b801abb7411a69d10c80179a639a60dec5031ba4b52f6b83e742960b0",
+    ),
+    (
+        376,
+        "6958cb611f9298cc84449455a21ef9a4c89636df481e2619d1e48385dd7a83df",
+    ),
+    (
+        377,
+        "f103ba91b014c90d1f9f4fce28db635d61a87f7be9c6244779bf549d799d1dab",
+    ),
+    (
+        390,
+        "81cd82c671ceefafdcad0407d6cd75b9ad245223e9233b55d86d1493240e42c5",
+    ),
+    (
+        450,
+        "a8c13aa2185bfd190270f88a817589de00ced1c3270dc71a70af259c56778e24",
+    ),
+    (
+        599,
+        "303d8314155c837392dd7581f3a1a09e4fb92b95f9c690d14cf912a7e86062a1",
+    ),
+];
+const S2_ZONE01_RIGHT: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        155,
+        "13898f40d171bac3b568dffc8822f814113ad200601a70e3c7fbe2508c301dda",
+    ),
+    (
+        350,
+        "ac5763aa55bc3f6467094ddba0c0d1ae57f4719d2740c9a66b6cb78f4bbed896",
+    ),
+    (
+        360,
+        "20566e18acd09bc5500b5ab3a0e35304ebbe8d29f8b033e41665bd02e6c4a3f6",
+    ),
+    (
+        376,
+        "f7ccf5b3f2f196c2895d19be1049ef1866831b26c5658ebf5f74a8b5b8704ec8",
+    ),
+    (
+        390,
+        "60b4237653ddcf3359ce910432eecd717fd07bed6c7d941c94a7a78c8740a751",
+    ),
+    (
+        599,
+        "0963dfe800f1e877761b686dd3760a5dda0c95f52cc5b5eceebedb6c8481fa68",
+    ),
+];
+
 #[test]
 #[ignore = "requires assets; pins reference-harness framebuffer hashes"]
 fn zone01_idle_framebuffer_matches_reference() {
@@ -186,6 +256,38 @@ fn zone01_idle_framebuffer_matches_reference() {
                 framebuffer_hash(&engine),
                 expected,
                 "{game}/Zone01 idle frame {target} must match the reference harness"
+            );
+        }
+    }
+}
+
+fn scripted_right_input() -> retro_input::ScriptedInput {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tools/ref-harness/testdata/zone01_right.input");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    retro_input::ScriptedInput::from_str(&text).expect("scripted input")
+}
+
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn zone01_right_framebuffer_matches_reference() {
+    for (game, pins) in [("S1", S1_ZONE01_RIGHT), ("S2", S2_ZONE01_RIGHT)] {
+        let scripted = scripted_right_input();
+        let seed = scripted.seed().unwrap_or(DEFAULT_SEED);
+        let mut engine =
+            Engine::load(source(game), Some("Zone01"), Some("1"), seed).expect("engine load");
+        engine.set_scripted_input(scripted);
+        let mut frame = 0u64;
+        for &(target, expected) in pins {
+            while frame < target {
+                engine.run_frame().expect("frame");
+                frame += 1;
+            }
+            assert_eq!(
+                framebuffer_hash(&engine),
+                expected,
+                "{game}/Zone01 hold-RIGHT frame {target} must match the reference harness"
             );
         }
     }

@@ -157,7 +157,9 @@ fn animation_global(engine: &Engine, name: &str) -> i32 {
 fn player_spawns_in_the_idle_animation() {
     for (game, scene) in [("S1", "Zone01"), ("S2", "Zone01")] {
         let mut engine = load(game, scene);
-        engine.run_frames(60, false).expect("level must run");
+        // The stage opens in the paused title-card mode, where object updates are
+        // suspended, so sample once the card has lifted and the player is active.
+        engine.run_frames(240, false).expect("level must run");
         let stopped = animation_global(&engine, "ANI_STOPPED");
         let flailing = animation_global(&engine, "ANI_FLAILING1");
         let player = engine.state.entities.get(0).copied().unwrap_or_default();
@@ -168,7 +170,7 @@ fn player_spawns_in_the_idle_animation() {
         assert_eq!(
             i32::from(player.animation),
             stopped,
-            "{game}/{scene}: player must spawn in the idle animation"
+            "{game}/{scene}: player must idle without input"
         );
         assert_ne!(
             i32::from(player.animation),
@@ -178,8 +180,11 @@ fn player_spawns_in_the_idle_animation() {
         assert_eq!(
             player.floor_sensors[..3],
             [1, 1, 1],
-            "{game}/{scene}: L/C/R floor sensors must touch on spawn"
+            "{game}/{scene}: L/C/R floor sensors must touch once active"
         );
-        assert_eq!(player.gravity, 0, "{game}/{scene}: spawn must be grounded");
+        assert_eq!(
+            player.gravity, 0,
+            "{game}/{scene}: player must settle on the ground"
+        );
     }
 }

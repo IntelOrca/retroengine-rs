@@ -441,8 +441,11 @@ fn m5_input_audio_save_600_frames() {
         let mut scripted =
             Engine::load(asset_source(game), Some(scene), None, DEFAULT_SEED).unwrap();
         scripted.set_scripted_input(hold_right(600));
-        let scripted_outcome = scripted.run_frames(600, false).unwrap();
+        // Sample mid-run: in S1/Zone01 the death sequence reloads the stage before frame 600 and
+        // the player respawns at the spawn point, so the end state hides the RIGHT movement.
+        scripted.run_frames(300, false).unwrap();
         let scripted_player = player_state(&scripted);
+        let scripted_outcome = scripted.run_frames(300, false).unwrap();
         if scene == "Zone01" {
             assert!(
                 scripted_player.1 > first_player.1,
@@ -464,7 +467,7 @@ fn m5_input_audio_save_600_frames() {
             outcome.final_hash
         );
         println!(
-            "  scripted: hash={} player={scripted_player:?}",
+            "  scripted: hash={} player(frame 300)={scripted_player:?}",
             scripted_outcome.final_hash
         );
 
