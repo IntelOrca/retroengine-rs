@@ -940,6 +940,14 @@ impl Vm {
         let event = state.current_event;
         match host.foreach_next(op, selector, candidate, event, state)? {
             Some(entity) => {
+                // Upstream `FUNC_FOREACHALL` stores the *matched* entity index in the foreach
+                // stack (it scans forward itself); `FUNC_FOREACHACTIVE` stores the list index
+                // it was given. Storing the scan start for `ForEachAll` would re-run the body
+                // for every slot before the match.
+                state.foreach_stack[position] = match op {
+                    Op::ForEachAll => entity,
+                    _ => candidate,
+                };
                 state.operands[2] = entity;
                 self.push_jump(stacks, index)?;
                 Ok(StepResult::CONTINUE)
@@ -1068,6 +1076,9 @@ mod tests {
         writes: Vec<(i32, i32, i32)>,
         foreach: Vec<Option<i32>>,
         foreach_calls: Vec<(Op, i32, i32, ScriptEvent)>,
+        /// Matching entity slots for a scanning `ForEachAll` host (see
+        /// [`MockHost::foreach_next`]).
+        scan_all: Vec<i32>,
     }
 
     impl ScriptHost for MockHost {
@@ -1112,6 +1123,13 @@ mod tests {
             _state: &mut VmState,
         ) -> Result<Option<i32>, ScriptError> {
             self.foreach_calls.push((op, selector, loop_index, event));
+            if op == Op::ForEachAll && !self.scan_all.is_empty() {
+                return Ok(self
+                    .scan_all
+                    .iter()
+                    .copied()
+                    .find(|slot| *slot >= loop_index));
+            }
             Ok(self
                 .foreach
                 .get(loop_index.max(0) as usize)
@@ -1471,6 +1489,44 @@ mod tests {
                 (Op::ForEachActive, 0, 0, ScriptEvent::Main),
                 (Op::ForEachActive, 0, 1, ScriptEvent::Main),
                 (Op::ForEachActive, 0, 2, ScriptEvent::Main),
+            ]
+        );
+    }
+
+    #[test]
+    fn foreach_all_advances_past_the_matched_entity() {
+        // `ForEachAll` hosts scan forward from the stack value and return the first match, so
+        // the VM must store the *matched* slot; storing the scan start would re-run the body
+        // for every slot before the match (the S2 Monitor startup regression).
+        let mut asm = Asm::default();
+        asm.op("ForEachAll").int(0).int(13).var(0);
+        asm.op("DrawSprite").var(0);
+        asm.op("next");
+        asm.op("End");
+        asm.jump(0).jump(13);
+        let mut vm = Vm::new(asm.file(vec![asm.function("main", 0, 0)]));
+        let mut state = VmState::default();
+        let mut host = MockHost {
+            scan_all: vec![5, 9],
+            ..MockHost::default()
+        };
+        vm.call(&mut host, 0, &mut state).unwrap();
+
+        assert_eq!(state.temp[0], 9, "the loop variable keeps the last match");
+        let draw_values: Vec<i32> = host
+            .ops
+            .iter()
+            .zip(&host.operands)
+            .filter(|(op, _)| **op == Op::DrawSprite)
+            .map(|(_, operands)| operands[0])
+            .collect();
+        assert_eq!(draw_values, vec![5, 9], "each match runs the body once");
+        assert_eq!(
+            host.foreach_calls,
+            vec![
+                (Op::ForEachAll, 13, 0, ScriptEvent::Main),
+                (Op::ForEachAll, 13, 6, ScriptEvent::Main),
+                (Op::ForEachAll, 13, 10, ScriptEvent::Main),
             ]
         );
     }
