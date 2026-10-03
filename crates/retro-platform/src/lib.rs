@@ -178,6 +178,12 @@ pub trait Platform {
     fn storage(&mut self) -> &mut dyn Storage;
     /// Returns the frame clock for this backend.
     fn clock(&mut self) -> &mut dyn Clock;
+    /// Native video driver name for startup diagnostics, when the backend has one.
+    ///
+    /// Backends without a display (or before one is initialized) return `None`.
+    fn video_driver(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// A presentable RGB565 framebuffer target.
@@ -206,11 +212,18 @@ pub trait AudioDevice {
     /// Number of interleaved channels.
     fn channels(&self) -> u8;
     /// Queues interleaved stereo samples; returns the number of frames accepted.
+    ///
+    /// Implementations must not block indefinitely: when the queue is full they should accept
+    /// what fits (possibly nothing) and let the caller drop the rest.
     fn submit(&mut self, frames: &[f32]) -> Result<usize, PlatformError>;
     /// Frames currently queued for playback.
     fn queued_frames(&self) -> usize;
     /// Closes the device.
     fn close(&mut self) -> Result<(), PlatformError>;
+    /// Human-readable device/driver description for startup diagnostics.
+    fn description(&self) -> String {
+        "unknown".to_owned()
+    }
 }
 
 /// Raw device state captured by one input poll, free of backend-specific types.

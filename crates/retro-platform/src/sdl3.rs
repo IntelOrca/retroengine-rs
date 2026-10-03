@@ -179,6 +179,7 @@ impl Platform for Sdl3Platform {
             ));
         }
         let audio = sdl.audio().map_err(PlatformError::sdl)?;
+        let driver = audio.current_audio_driver();
         let spec = AudioSpec {
             freq: Some(desc.sample_rate as i32),
             channels: Some(desc.channels as i32),
@@ -187,14 +188,23 @@ impl Platform for Sdl3Platform {
         let device = audio
             .open_playback_device(&spec)
             .map_err(PlatformError::sdl)?;
+        let device_name = device
+            .name()
+            .unwrap_or_else(|_| "default playback device".to_owned());
         let stream = device
             .open_device_stream(Some(&spec))
             .map_err(PlatformError::sdl)?;
-        stream.resume().map_err(PlatformError::sdl)?;
+        // SDL starts a device stream paused; resume it defensively and keep going when the
+        // backend refuses so a device quirk can never abort the game.
+        if let Err(error) = stream.resume() {
+            eprintln!("warning: audio stream resume failed: {error}");
+        }
         Ok(Box::new(Sdl3Audio {
             stream,
             sample_rate: desc.sample_rate,
             channels: desc.channels,
+            device_name,
+            driver_name: driver,
         }))
     }
 
@@ -208,6 +218,11 @@ impl Platform for Sdl3Platform {
 
     fn clock(&mut self) -> &mut dyn Clock {
         &mut self.clock
+    }
+
+    fn video_driver(&self) -> Option<&'static str> {
+        let video = self.sdl.as_ref()?.video().ok()?;
+        Some(video.current_video_driver())
     }
 }
 
@@ -298,11 +313,34 @@ impl Window for Sdl3Window {
     }
 }
 
+/// Maximum queued audio in engine ticks (about 50 ms at 60 Hz).
+///
+/// Once the device queue holds this much, [`Sdl3Audio::submit`] drops new frames instead of
+/// calling the potentially blocking `SDL_PutAudioStreamData`, so a stalled output device can not
+/// stall the engine's frame loop.
+pub const MAX_QUEUED_TICKS: usize = 3;
+
+/// Backlog above which the stream is cleared so playback resyncs instead of playing minutes
+/// behind, in engine ticks.
+pub const RESYNC_QUEUED_TICKS: usize = 10;
+
+/// Number of frames a single [`Sdl3Audio::submit`] call may enqueue.
+///
+/// Returns 0 when the queue is already at or over `cap`; otherwise the count is limited so the
+/// queue can never be pushed past `cap` by one call. This is a pure function so the cap logic is
+/// unit-testable without an SDL device.
+#[must_use]
+fn frames_within_capacity(queued: usize, total: usize, cap: usize) -> usize {
+    cap.saturating_sub(queued).min(total)
+}
+
 /// SDL3 audio stream accepting interleaved f32 samples.
 pub struct Sdl3Audio {
     stream: AudioStreamOwner,
     sample_rate: u32,
     channels: u8,
+    device_name: String,
+    driver_name: &'static str,
 }
 
 impl AudioDevice for Sdl3Audio {
@@ -321,10 +359,26 @@ impl AudioDevice for Sdl3Audio {
                 "sample count is not a whole number of frames".to_owned(),
             ));
         }
+        let total = frames.len() / channels;
+        let tick_frames = (self.sample_rate as usize / 60).max(1);
+        let cap = tick_frames * MAX_QUEUED_TICKS;
+        let queued = self.queued_frames();
+        if queued >= cap {
+            // Grossly behind (e.g. the device stopped draining): drop the backlog so playback
+            // resyncs with the current frame instead of lagging further and further.
+            if queued > tick_frames * RESYNC_QUEUED_TICKS {
+                let _ = self.stream.clear();
+            }
+            return Ok(0);
+        }
+        let accepted = frames_within_capacity(queued, total, cap);
+        if accepted == 0 {
+            return Ok(0);
+        }
         self.stream
-            .put_data_f32(frames)
+            .put_data_f32(&frames[..accepted * channels])
             .map_err(PlatformError::sdl)?;
-        Ok(frames.len() / channels)
+        Ok(accepted)
     }
 
     fn queued_frames(&self) -> usize {
@@ -334,6 +388,10 @@ impl AudioDevice for Sdl3Audio {
 
     fn close(&mut self) -> Result<(), PlatformError> {
         Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!("{} ({})", self.device_name, self.driver_name)
     }
 }
 
@@ -924,6 +982,20 @@ impl Clock for SystemClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_queue_cap_never_exceeds_the_budget() {
+        let tick = 735usize;
+        let cap = tick * MAX_QUEUED_TICKS;
+        const { assert!(MAX_QUEUED_TICKS < RESYNC_QUEUED_TICKS) };
+        assert_eq!(frames_within_capacity(0, tick, cap), tick);
+        assert_eq!(frames_within_capacity(cap - 1, tick, cap), 1);
+        assert_eq!(frames_within_capacity(cap, tick, cap), 0);
+        assert_eq!(frames_within_capacity(cap * 100, tick, cap), 0);
+        assert_eq!(frames_within_capacity(0, cap + 500, cap), cap);
+        assert_eq!(frames_within_capacity(0, 0, cap), 0);
+        assert_eq!(frames_within_capacity(0, tick, 0), 0);
+    }
 
     #[test]
     fn sdl3_lifecycle_init_shutdown_reinit() {
