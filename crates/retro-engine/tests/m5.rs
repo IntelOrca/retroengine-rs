@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use retro_engine::Engine;
+use retro_engine::LoadOptions;
 use retro_engine::rng::DEFAULT_SEED;
 use retro_format_v4::gameconfig::PALETTE_COUNT;
 use retro_format_v4::scene::{ACTIVE_LAYER_COUNT, ENTITY_ATTRIB_STATE, ENTITY_ATTRIB_VALUES};
@@ -211,6 +212,54 @@ fn input_press_button_global_tracks_pressed_edges() {
         pressed_value, 1,
         "A sets the rev03 input.pressButton global"
     );
+}
+
+#[test]
+fn origins_option_selects_the_platform_block() {
+    let object = "event ObjectUpdate\n\
+        #platform: USE_STANDALONE\n\
+        object.value0 = 11\n\
+        #endplatform\n\
+        #platform: USE_ORIGINS\n\
+        object.value0 = 22\n\
+        #endplatform\n\
+        end event\n";
+    let mut memory = memory_source();
+    memory.insert("Data/Scripts/M5/Mover.txt", object);
+    let source: Arc<dyn retro_io::DataSource> = Arc::new(memory);
+
+    let mut standalone = Engine::load(Arc::clone(&source), None, None, DEFAULT_SEED).unwrap();
+    let mut origins = Engine::load_with_options(
+        Arc::clone(&source),
+        None,
+        None,
+        DEFAULT_SEED,
+        Box::new(MemoryStorage::new()),
+        LoadOptions { origins: true },
+    )
+    .unwrap();
+    standalone.run_frames(1, false).unwrap();
+    origins.run_frames(1, false).unwrap();
+
+    let value = |engine: &Engine| {
+        engine
+            .state
+            .entities
+            .get(retro_scene::SCENE_ENTITY_START)
+            .expect("scene entity")
+            .values[0]
+    };
+    assert_eq!(
+        value(&standalone),
+        11,
+        "gameType=1 must compile the standalone block by default"
+    );
+    assert_eq!(
+        value(&origins),
+        22,
+        "--origins must compile the Origins block"
+    );
+    assert_ne!(standalone.state_hash(), origins.state_hash());
 }
 
 #[test]

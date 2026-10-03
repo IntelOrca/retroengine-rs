@@ -90,6 +90,11 @@ JSON.
 Saves live under `--user-dir`, or `%APPDATA%\retroengine-rs\retroengine` on Windows
 (`SDL_GetPrefPath`), seeded from the shipped `SData.bin`/`SGame.bin` on first run.
 
+Scripts compile with the standalone platform (`#platform: USE_STANDALONE`) by default, even when
+`Settings.ini` has `gameType=1`; pass `--origins` to compile the `#platform: USE_ORIGINS` blocks
+instead. Windowed startup prints one `platform:`, `video:` and `audio:` line, so a missing audio
+device or an unusual driver is visible in the log without aborting the run.
+
 Full verification:
 
 ```sh

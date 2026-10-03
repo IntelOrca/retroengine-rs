@@ -110,7 +110,29 @@ impl Engine {
         seed: u32,
         save_storage: Box<dyn Storage>,
     ) -> Result<Self, EngineError> {
-        let world = loader::load_world(&source, requested_scene, act)?;
+        Self::load_with_options(
+            source,
+            requested_scene,
+            act,
+            seed,
+            save_storage,
+            loader::LoadOptions::default(),
+        )
+    }
+
+    /// Loads and instantiates a scene with explicit loader options.
+    ///
+    /// `options.origins` (the CLI's `--origins`) compiles the scripts with the Origins platform
+    /// tag; the default is standalone. Everything else matches [`Engine::load_with`].
+    pub fn load_with_options(
+        source: Arc<dyn DataSource>,
+        requested_scene: Option<&str>,
+        act: Option<&str>,
+        seed: u32,
+        save_storage: Box<dyn Storage>,
+        options: loader::LoadOptions,
+    ) -> Result<Self, EngineError> {
+        let world = loader::load_world_with(&source, requested_scene, act, options)?;
         let rng = crate::rng::GlibcRand::new(seed);
         let file: ScriptFile = world.scripts.file;
         let input = EngineInput::new(&world.raw_settings);

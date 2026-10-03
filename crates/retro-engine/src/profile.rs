@@ -61,8 +61,24 @@ pub struct EngineSettings {
 
 impl EngineSettings {
     /// Resolves the engine settings from parsed `Settings.ini`.
+    ///
+    /// The script platform always defaults to [`PlatformMode::Standalone`], even when
+    /// `[Game] gameType` says Origins; use [`EngineSettings::from_settings_with`] with
+    /// `origins = true` (the CLI's `--origins`) to opt back into the Origins platform blocks.
     #[must_use]
     pub fn from_settings(settings: &Settings) -> Self {
+        Self::from_settings_with(settings, false)
+    }
+
+    /// Resolves the engine settings, explicitly selecting the script platform.
+    ///
+    /// `origins` compiles the `#platform: USE_ORIGINS` blocks and skips `USE_STANDALONE`; when
+    /// false (the default) those roles are swapped. `[Game] gameType` is still parsed by
+    /// `Settings`, but it no longer selects the platform on its own: this port treats the
+    /// Origins platform as disabled until further notice, so Origins data runs the standalone
+    /// code paths by default.
+    #[must_use]
+    pub fn from_settings_with(settings: &Settings, origins: bool) -> Self {
         let refresh_rate = settings.video.refresh_rate.max(1);
         let dim_limit_frames = if settings.video.dim_limit >= 0 {
             settings.video.dim_limit.saturating_mul(refresh_rate)
@@ -71,7 +87,11 @@ impl EngineSettings {
         };
         Self {
             profile: RuntimeProfile::V4Legacy,
-            platform: RuntimeProfile::platform_mode(settings.game.game_type),
+            platform: if origins {
+                PlatformMode::Origins
+            } else {
+                PlatformMode::Standalone
+            },
             revision: RuntimeProfile::V4Legacy.script_revision(),
             force_scripts: settings.game.txt_scripts,
             dim_limit_frames,
@@ -96,6 +116,34 @@ mod tests {
         assert_eq!(
             RuntimeProfile::platform_mode(GameType::Other(7)),
             PlatformMode::Standalone
+        );
+    }
+
+    #[test]
+    fn standalone_is_the_default_even_for_origins_game_type() {
+        // `Settings::default()` parses as gameType=1 (Origins), matching the shipped assets.
+        let settings = Settings::default();
+        assert_eq!(settings.game.game_type, GameType::Origins);
+        assert_eq!(
+            EngineSettings::from_settings(&settings).platform,
+            PlatformMode::Standalone,
+            "Origins data must compile as standalone unless --origins opts in"
+        );
+        assert_eq!(
+            EngineSettings::from_settings_with(&settings, true).platform,
+            PlatformMode::Origins
+        );
+
+        let mut standalone = Settings::default();
+        standalone.game.game_type = GameType::Standalone;
+        assert_eq!(
+            EngineSettings::from_settings(&standalone).platform,
+            PlatformMode::Standalone
+        );
+        assert_eq!(
+            EngineSettings::from_settings_with(&standalone, true).platform,
+            PlatformMode::Origins,
+            "--origins forces the Origins platform regardless of gameType"
         );
     }
 

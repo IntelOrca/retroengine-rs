@@ -629,11 +629,29 @@ pub fn load_scripts(
     }
 }
 
+/// Options that affect how one world is loaded and compiled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadOptions {
+    /// Compile scripts with the Origins (`USE_ORIGINS`) platform tag instead of the default
+    /// standalone (`USE_STANDALONE`) platform (the CLI's `--origins`).
+    pub origins: bool,
+}
+
 /// Loads settings, configs, scene data and scripts for the requested scene.
 pub fn load_world(
     source: &Arc<dyn DataSource>,
     requested_scene: Option<&str>,
     act: Option<&str>,
+) -> Result<LoadedWorld, EngineError> {
+    load_world_with(source, requested_scene, act, LoadOptions::default())
+}
+
+/// Loads settings, configs, scene data and scripts with explicit [`LoadOptions`].
+pub fn load_world_with(
+    source: &Arc<dyn DataSource>,
+    requested_scene: Option<&str>,
+    act: Option<&str>,
+    options: LoadOptions,
 ) -> Result<LoadedWorld, EngineError> {
     if !source.exists(Settings::PATH) {
         return Err(EngineError::MissingAsset(
@@ -644,7 +662,7 @@ pub fn load_world(
     if detected.version != DataVersion::V4Legacy {
         return Err(EngineError::UnsupportedVersion(detected.version));
     }
-    let settings = EngineSettings::from_settings(&detected.settings);
+    let settings = EngineSettings::from_settings_with(&detected.settings, options.origins);
     let game_config = detected.game_config;
 
     let (folder, act) = resolve_scene(&game_config, requested_scene, act)?;

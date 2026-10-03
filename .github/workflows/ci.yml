@@ -92,6 +92,7 @@ jobs:
             "  --frames N     Frames to run headlessly (default 600)",
             "  --input FILE   Replay a scripted input file",
             "  --mute         Disable audio output",
+            "  --origins      Compile Origins (#platform: USE_ORIGINS) script blocks",
             "",
             "Saves: written to %APPDATA%\retroengine-rs\retroengine (or --user-dir DIR).",
             "SDL3 and the MSVC C runtime are linked statically; only the OS-provided",
