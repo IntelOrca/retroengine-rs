@@ -206,6 +206,35 @@ impl InputState {
         self.down(var - 14)
     }
 
+    /// Writes the key-down variable for a rev03 input id (170..=183); returns whether the id was
+    /// recognised. Scripts may write `keyDown[...]` (upstream `VAR_KEYDOWN*` cases).
+    pub fn set_down(&mut self, var: i32, value: bool) -> bool {
+        match var {
+            170 => self.up = value,
+            171 => self.down = value,
+            172 => self.left = value,
+            173 => self.right = value,
+            174 => self.button_a = value,
+            175 => self.button_b = value,
+            176 => self.button_c = value,
+            177 => self.button_x = value,
+            178 => self.button_y = value,
+            179 => self.button_z = value,
+            180 => self.button_l = value,
+            181 => self.button_r = value,
+            182 => self.start = value,
+            183 => self.select = value,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Writes the key-press variable for a rev03 input id (184..=197); returns whether the id
+    /// was recognised.
+    pub fn set_press(&mut self, var: i32, value: bool) -> bool {
+        self.set_down(var - 14, value)
+    }
+
     /// Whether any button is pressed or held (`inputDevice[INPUT_ANY].press || hold`).
     #[must_use]
     pub fn any_button(&self) -> bool {

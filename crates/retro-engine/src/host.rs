@@ -1520,6 +1520,16 @@ impl ScriptHost for EngineHost<'_> {
             self.write_parallax_var(var, array_index, value);
         } else if (VAR_CAMERA_FIRST..=VAR_CAMERA_LAST).contains(&var) {
             self.write_camera_var(var, array_index, value);
+        } else if (VAR_KEYDOWN_FIRST..=VAR_KEYDOWN_LAST).contains(&var) {
+            // Scripts may write `keyDown[...]`; slots 0/1 both map to the player-1 controller
+            // (`VAR_KEYDOWN*` write cases in `ScriptLegacyv4.cpp`).
+            if array_index <= 1 {
+                self.state.input.set_down(var, value != 0);
+            }
+        } else if (VAR_KEYPRESS_FIRST..=VAR_KEYPRESS_LAST).contains(&var) {
+            if array_index <= 1 {
+                self.state.input_press.set_press(var, value != 0);
+            }
         } else if var == VAR_SAVE_RAM {
             // `saveRAM[arrayVal] = value`; persistence happens on `WriteSaveRAM`.
             self.state.save.write_word(array_index, value);
@@ -2739,6 +2749,27 @@ mod tests {
         );
         host.write_engine_var(23, 7, 500, &mut vm_state).unwrap();
         assert_eq!(host.state.entities.get(7).unwrap().xpos, 500);
+    }
+
+    #[test]
+    fn scripts_can_write_keydown_and_keypress_globals() {
+        let mut state = test_state(false);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+
+        // `keyDown[1].buttonA = true` (`VAR_KEYDOWNBUTTONA` = 174).
+        host.write_engine_var(174, 1, 1, &mut vm_state).unwrap();
+        assert!(host.state.input.button_a);
+        assert_eq!(host.read_engine_var(174, 1, &mut vm_state).unwrap(), 1);
+
+        // `keyPress[1].buttonA = true` (`VAR_KEYPRESSBUTTONA` = 188).
+        host.write_engine_var(188, 1, 1, &mut vm_state).unwrap();
+        assert!(host.state.input_press.button_a);
+
+        // Slots above 1 are not observable through the rev03 `keyDown`/`keyPress` variables
+        // (`arrayVal <= 1`), so their writes are ignored.
+        host.write_engine_var(174, 3, 0, &mut vm_state).unwrap();
+        assert!(host.state.input.button_a, "slot 3 writes must not reach P1");
     }
 
     #[test]
