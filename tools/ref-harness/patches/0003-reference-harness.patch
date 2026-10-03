@@ -1,0 +1,699 @@
+diff --git a/RSDKv5/RSDK/Core/Math.cpp b/RSDKv5/RSDK/Core/Math.cpp
+index f207b0b..8315c98 100644
+--- a/RSDKv5/RSDK/Core/Math.cpp
++++ b/RSDKv5/RSDK/Core/Math.cpp
+@@ -48,8 +48,19 @@ void RSDK::ClearTrigLookupTables()
+ 
+ void RSDK::CalculateTrigAngles()
+ {
+-    srand((uint32)time(NULL));
+-    randSeed = rand();
++#if RETRO_HARNESS
++    if (RefHarness::active) {
++        // Fixed seed for deterministic script Rand() calls.
++        randSeed = RefHarness::seed;
++        srand(RefHarness::seed);
++    }
++    else {
++#endif
++        srand((uint32)time(NULL));
++        randSeed = rand();
++#if RETRO_HARNESS
++    }
++#endif
+ 
+     for (int32 i = 0; i < 0x400; ++i) {
+         sin1024LookupTable[i]  = (int32)(sinf((i / 512.f) * RSDK_PI) * 1024.f);
+diff --git a/RSDKv5/RSDK/Core/RetroEngine.cpp b/RSDKv5/RSDK/Core/RetroEngine.cpp
+index 688b10b..b5bb052 100644
+--- a/RSDKv5/RSDK/Core/RetroEngine.cpp
++++ b/RSDKv5/RSDK/Core/RetroEngine.cpp
+@@ -26,6 +26,10 @@ int32 RSDK::RunRetroEngine(int32 argc, char *argv[])
+ {
+     ParseArguments(argc, argv);
+ 
++#if RETRO_HARNESS
++    RefHarness::Init();
++#endif
++
+     if (engine.consoleEnabled)
+         InitConsole();
+     RenderDevice::isRunning = false;
+@@ -107,7 +111,11 @@ int32 RSDK::RunRetroEngine(int32 argc, char *argv[])
+ 
+     RenderDevice::InitFPSCap();
+ 
+-    while (RenderDevice::isRunning) {
++    while (RenderDevice::isRunning
++#if RETRO_HARNESS
++           && !RefHarness::ShouldQuit()
++#endif
++    ) {
+         RenderDevice::ProcessEvents();
+ 
+         if (!RenderDevice::isRunning)
+@@ -271,6 +279,11 @@ int32 RSDK::RunRetroEngine(int32 argc, char *argv[])
+ #else
+                     ProcessEngine();
+ #endif
++
++#if RETRO_HARNESS
++                    if (RefHarness::active)
++                        RefHarness::ProcessFrame();
++#endif
+                 }
+ 
+ #if RETRO_PLATFORM == RETRO_ANDROID
+diff --git a/RSDKv5/RSDK/Graphics/SDL2/SDL2RenderDevice.cpp b/RSDKv5/RSDK/Graphics/SDL2/SDL2RenderDevice.cpp
+index 82a9b0f..8551f63 100644
+--- a/RSDKv5/RSDK/Graphics/SDL2/SDL2RenderDevice.cpp
++++ b/RSDKv5/RSDK/Graphics/SDL2/SDL2RenderDevice.cpp
+@@ -97,6 +97,12 @@ void RenderDevice::CopyFrameBuffer()
+ 
+ void RenderDevice::FlipScreen()
+ {
++#if RETRO_HARNESS
++    // The reference harness hashes the software framebuffer, so presentation is skipped.
++    if (RefHarness::active)
++        return;
++#endif
++
+     if (windowRefreshDelay > 0) {
+         windowRefreshDelay--;
+         if (!windowRefreshDelay)
+@@ -397,6 +403,12 @@ void RenderDevice::InitFPSCap()
+ }
+ bool RenderDevice::CheckFPSCap()
+ {
++#if RETRO_HARNESS
++    // No frame skipping and no wall-clock pacing while the harness drives the run.
++    if (RefHarness::active)
++        return true;
++#endif
++
+     curTicks = SDL_GetPerformanceCounter();
+     if (curTicks >= prevTicks + targetFreq)
+         return true;
+@@ -595,6 +607,12 @@ bool RenderDevice::SetupRendering()
+ {
+     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+ 
++#if RETRO_HARNESS
++    // Headless/offscreen video drivers have no accelerated renderer.
++    if (!renderer)
++        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
++#endif
++
+     if (!renderer) {
+         PrintLog(PRINT_NORMAL, "ERROR: failed to create renderer!");
+         return false;
+diff --git a/RSDKv5/RSDK/Input/Input.cpp b/RSDKv5/RSDK/Input/Input.cpp
+index c619d40..5baf752 100644
+--- a/RSDKv5/RSDK/Input/Input.cpp
++++ b/RSDKv5/RSDK/Input/Input.cpp
+@@ -196,13 +196,23 @@ void RSDK::ProcessInput()
+     ClearInput();
+ 
+     bool32 anyPress = false;
+-    for (int32 i = 0; i < inputDeviceCount; ++i) {
+-        if (inputDeviceList[i]) {
+-            inputDeviceList[i]->UpdateInput();
++#if RETRO_HARNESS
++    if (RefHarness::active) {
++        RefHarness::InjectInput();
++        anyPress = true;
++    }
++    else {
++#endif
++        for (int32 i = 0; i < inputDeviceCount; ++i) {
++            if (inputDeviceList[i]) {
++                inputDeviceList[i]->UpdateInput();
+ 
+-            anyPress |= inputDeviceList[i]->anyPress;
++                anyPress |= inputDeviceList[i]->anyPress;
++            }
+         }
++#if RETRO_HARNESS
+     }
++#endif
+ 
+ #if RETRO_REV02
+     if (anyPress || touchInfo.count)
+diff --git a/RSDKv5/refharness.cpp b/RSDKv5/refharness.cpp
+new file mode 100644
+index 0000000..e257a17
+--- /dev/null
++++ b/RSDKv5/refharness.cpp
+@@ -0,0 +1,506 @@
++// Deterministic reference harness for the RSDKv5U (RETRO_REVISION=3) decompilation.
++//
++// Enabled at compile time by RETRO_HARNESS and at run time by any REF_HARNESS_* variable:
++//
++//   REF_HARNESS_DUMP       path of the JSONL frame record stream (required for records)
++//   REF_HARNESS_INPUT      path of a `retro-input 1` scripted input file
++//   REF_HARNESS_FRAMES     number of frames to run (default 600)
++//   REF_HARNESS_SEED       RNG seed for libc rand()/randSeed (default 0x5EED1234)
++//   REF_HARNESS_PPM_DIR    directory for keyframe PPM dumps
++//   REF_HARNESS_PPM_FRAMES comma separated frame indices to dump (or `all`)
++//   REF_HARNESS_PPM_EVERY  dump every Nth frame (default 0 = off)
++//
++// The JSONL record format is documented in tools/ref-harness/README.md.
++
++#include "RSDK/Core/RetroEngine.hpp"
++
++#if RETRO_HARNESS
++
++#include "blake3.h"
++
++#include <ctype.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <string>
++#include <vector>
++
++using namespace RSDK;
++
++namespace RefHarness
++{
++
++bool active                   = false;
++unsigned int seed             = 0x5EED1234u;
++unsigned long long frame      = 0;
++unsigned long long maxFrames  = 600;
++bool done                     = false;
++
++static FILE *recordFile = NULL;
++
++// Button bits shared with the Rust `retro-input` format (declaration order).
++enum ScriptedButtons {
++    BTN_UP     = 1 << 0,
++    BTN_DOWN   = 1 << 1,
++    BTN_LEFT   = 1 << 2,
++    BTN_RIGHT  = 1 << 3,
++    BTN_A      = 1 << 4,
++    BTN_B      = 1 << 5,
++    BTN_C      = 1 << 6,
++    BTN_X      = 1 << 7,
++    BTN_Y      = 1 << 8,
++    BTN_Z      = 1 << 9,
++    BTN_L      = 1 << 10,
++    BTN_R      = 1 << 11,
++    BTN_START  = 1 << 12,
++    BTN_SELECT = 1 << 13,
++};
++
++static std::vector<unsigned short> inputMasks;
++static bool inputLoaded = false;
++
++static std::string ppmDir;
++static std::vector<unsigned long long> ppmFrames;
++static unsigned long long ppmEvery = 0;
++static bool entityValues = false;
++
++static bool equalsIgnoreCase(const std::string &a, const char *b)
++{
++    size_t n = strlen(b);
++    if (a.size() != n)
++        return false;
++    for (size_t i = 0; i < n; ++i) {
++        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i]))
++            return false;
++    }
++    return true;
++}
++
++static bool parseButtons(const std::string &token, unsigned short *out)
++{
++    unsigned long value = 0;
++    if (token == "-") {
++        *out = 0;
++        return true;
++    }
++    if (token.size() > 2 && (token[0] == '0') && (token[1] == 'x' || token[1] == 'X')) {
++        char *end = NULL;
++        value     = strtoul(token.c_str() + 2, &end, 16);
++        if (!end || *end)
++            return false;
++        *out = (unsigned short)value;
++        return true;
++    }
++    bool allDigits = !token.empty();
++    for (size_t i = 0; i < token.size(); ++i) {
++        if (token[i] < '0' || token[i] > '9')
++            allDigits = false;
++    }
++    if (allDigits) {
++        *out = (unsigned short)strtoul(token.c_str(), NULL, 10);
++        return true;
++    }
++
++    unsigned short mask = 0;
++    size_t start        = 0;
++    while (start <= token.size()) {
++        size_t bar = token.find('|', start);
++        std::string name = token.substr(start, bar == std::string::npos ? std::string::npos : bar - start);
++        unsigned short bit = 0;
++        if (equalsIgnoreCase(name, "UP"))
++            bit = BTN_UP;
++        else if (equalsIgnoreCase(name, "DOWN"))
++            bit = BTN_DOWN;
++        else if (equalsIgnoreCase(name, "LEFT"))
++            bit = BTN_LEFT;
++        else if (equalsIgnoreCase(name, "RIGHT"))
++            bit = BTN_RIGHT;
++        else if (equalsIgnoreCase(name, "A"))
++            bit = BTN_A;
++        else if (equalsIgnoreCase(name, "B"))
++            bit = BTN_B;
++        else if (equalsIgnoreCase(name, "C"))
++            bit = BTN_C;
++        else if (equalsIgnoreCase(name, "X"))
++            bit = BTN_X;
++        else if (equalsIgnoreCase(name, "Y"))
++            bit = BTN_Y;
++        else if (equalsIgnoreCase(name, "Z"))
++            bit = BTN_Z;
++        else if (equalsIgnoreCase(name, "L"))
++            bit = BTN_L;
++        else if (equalsIgnoreCase(name, "R"))
++            bit = BTN_R;
++        else if (equalsIgnoreCase(name, "START"))
++            bit = BTN_START;
++        else if (equalsIgnoreCase(name, "SELECT"))
++            bit = BTN_SELECT;
++        else
++            return false;
++        mask |= bit;
++        if (bar == std::string::npos)
++            break;
++        start = bar + 1;
++    }
++    *out = mask;
++    return true;
++}
++
++static bool loadInputScript(const char *path)
++{
++    FILE *file = fopen(path, "rb");
++    if (!file) {
++        fprintf(stderr, "[ref-harness] cannot open input script %s\n", path);
++        return false;
++    }
++    std::string text;
++    char buffer[4096];
++    size_t read = 0;
++    while ((read = fread(buffer, 1, sizeof(buffer), file)) > 0) text.append(buffer, read);
++    fclose(file);
++
++    bool sawHeader = false;
++    size_t pos     = 0;
++    while (pos <= text.size()) {
++        size_t end = text.find('\n', pos);
++        if (end == std::string::npos)
++            end = text.size();
++        std::string line = text.substr(pos, end - pos);
++        pos              = end + 1;
++        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
++        size_t first = line.find_first_not_of(" \t");
++        if (first == std::string::npos || line[first] == '#' || line[first] == ';')
++            continue;
++
++        std::vector<std::string> tokens;
++        size_t t = first;
++        while (t < line.size()) {
++            size_t space = line.find_first_of(" \t", t);
++            tokens.push_back(line.substr(t, space == std::string::npos ? std::string::npos : space - t));
++            if (space == std::string::npos)
++                break;
++            t = line.find_first_not_of(" \t", space);
++        }
++        if (tokens.empty())
++            continue;
++
++        if (!sawHeader) {
++            if (tokens[0] != "retro-input" || tokens.size() < 2 || tokens[1] != "1") {
++                fprintf(stderr, "[ref-harness] %s: expected header `retro-input 1`\n", path);
++                return false;
++            }
++            sawHeader = true;
++            continue;
++        }
++
++        if (equalsIgnoreCase(tokens[0], "seed")) {
++            if (tokens.size() < 2) {
++                fprintf(stderr, "[ref-harness] %s: seed without value\n", path);
++                return false;
++            }
++            if (!getenv("REF_HARNESS_SEED"))
++                seed = (unsigned int)strtoul(tokens[1].c_str(), NULL, 10);
++            continue;
++        }
++
++        size_t expected = inputMasks.size();
++        char *parseEnd  = NULL;
++        unsigned long index = strtoul(tokens[0].c_str(), &parseEnd, 10);
++        if (!parseEnd || *parseEnd || index != expected) {
++            fprintf(stderr, "[ref-harness] %s: expected frame %llu, found `%s`\n", path, (unsigned long long)expected, tokens[0].c_str());
++            return false;
++        }
++        unsigned short mask = 0;
++        if (tokens.size() < 2 || !parseButtons(tokens[1], &mask)) {
++            fprintf(stderr, "[ref-harness] %s: bad buttons on frame %llu\n", path, (unsigned long long)expected);
++            return false;
++        }
++        inputMasks.push_back(mask);
++    }
++
++    if (!sawHeader) {
++        fprintf(stderr, "[ref-harness] %s: missing `retro-input 1` header\n", path);
++        return false;
++    }
++    inputLoaded = true;
++    return true;
++}
++
++static void parseList(const char *env, std::vector<unsigned long long> *out)
++{
++    if (!env || !*env)
++        return;
++    std::string text(env);
++    size_t pos = 0;
++    while (pos <= text.size()) {
++        size_t comma = text.find(',', pos);
++        std::string token = text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
++        if (!token.empty())
++            out->push_back(strtoull(token.c_str(), NULL, 10));
++        if (comma == std::string::npos)
++            break;
++        pos = comma + 1;
++    }
++}
++
++bool Init()
++{
++    const char *dumpEnv  = getenv("REF_HARNESS_DUMP");
++    const char *inputEnv = getenv("REF_HARNESS_INPUT");
++    const char *frames   = getenv("REF_HARNESS_FRAMES");
++    const char *seedEnv  = getenv("REF_HARNESS_SEED");
++    const char *ppmDirEnv = getenv("REF_HARNESS_PPM_DIR");
++    const char *ppmFramesEnv = getenv("REF_HARNESS_PPM_FRAMES");
++    const char *ppmEveryEnv  = getenv("REF_HARNESS_PPM_EVERY");
++    const char *entValuesEnv = getenv("REF_HARNESS_ENT_VALUES");
++
++    entityValues = entValuesEnv && *entValuesEnv && *entValuesEnv != '0';
++    active = dumpEnv || inputEnv || frames || seedEnv || ppmDirEnv;
++    if (!active)
++        return false;
++
++    if (seedEnv)
++        seed = (unsigned int)strtoul(seedEnv, NULL, 0);
++    if (frames)
++        maxFrames = strtoull(frames, NULL, 10);
++    if (inputEnv) {
++        if (!loadInputScript(inputEnv))
++            exit(2);
++    }
++    if (dumpEnv) {
++        recordFile = fopen(dumpEnv, "wb");
++        if (!recordFile) {
++            fprintf(stderr, "[ref-harness] cannot open record stream %s\n", dumpEnv);
++            exit(2);
++        }
++    }
++    if (ppmDirEnv)
++        ppmDir = ppmDirEnv;
++    parseList(ppmFramesEnv, &ppmFrames);
++    if (ppmEveryEnv)
++        ppmEvery = strtoull(ppmEveryEnv, NULL, 10);
++
++    fprintf(stderr, "[ref-harness] active seed=%u frames=%llu input=%s records=%s\n", seed, maxFrames, inputEnv ? inputEnv : "(none)",
++            dumpEnv ? dumpEnv : "(none)");
++    return true;
++}
++
++void InjectInput()
++{
++    unsigned short mask = 0;
++    if (inputLoaded && !inputMasks.empty()) {
++        size_t index = frame < inputMasks.size() ? (size_t)frame : inputMasks.size() - 1;
++        mask         = inputMasks[index];
++    }
++
++    for (int c = 0; c < 2; ++c) {
++        ControllerState *state = &controller[c];
++        state->keyUp.press     = (mask & BTN_UP) != 0;
++        state->keyDown.press   = (mask & BTN_DOWN) != 0;
++        state->keyLeft.press   = (mask & BTN_LEFT) != 0;
++        state->keyRight.press  = (mask & BTN_RIGHT) != 0;
++        state->keyA.press      = (mask & BTN_A) != 0;
++        state->keyB.press      = (mask & BTN_B) != 0;
++        state->keyC.press      = (mask & BTN_C) != 0;
++        state->keyX.press      = (mask & BTN_X) != 0;
++        state->keyY.press      = (mask & BTN_Y) != 0;
++        state->keyZ.press      = (mask & BTN_Z) != 0;
++        state->keyStart.press  = (mask & BTN_START) != 0;
++        state->keySelect.press = (mask & BTN_SELECT) != 0;
++
++        stickL[c].keyUp.press    = (mask & BTN_UP) != 0;
++        stickL[c].keyDown.press  = (mask & BTN_DOWN) != 0;
++        stickL[c].keyLeft.press  = (mask & BTN_LEFT) != 0;
++        stickL[c].keyRight.press = (mask & BTN_RIGHT) != 0;
++    }
++}
++
++static std::string escapeJSON(const char *text)
++{
++    std::string out;
++    if (!text)
++        return out;
++    for (const char *c = text; *c; ++c) {
++        switch (*c) {
++            case '"': out += "\\\""; break;
++            case '\\': out += "\\\\"; break;
++            case '\n': out += "\\n"; break;
++            case '\r': out += "\\r"; break;
++            case '\t': out += "\\t"; break;
++            default:
++                if ((unsigned char)*c < 0x20) {
++                    char buffer[8];
++                    snprintf(buffer, sizeof(buffer), "\\u%04x", (unsigned char)*c);
++                    out += buffer;
++                }
++                else {
++                    out += *c;
++                }
++                break;
++        }
++    }
++    return out;
++}
++
++static void framebufferHash(char *out)
++{
++    static std::vector<unsigned char> scratch;
++    ScreenInfo *screen = &screens[0];
++    scratch.clear();
++    scratch.reserve((size_t)screen->size.x * screen->size.y * 2);
++    for (int32 y = 0; y < screen->size.y; ++y) {
++        const uint16 *row = screen->frameBuffer + (size_t)y * screen->pitch;
++        for (int32 x = 0; x < screen->size.x; ++x) {
++            scratch.push_back((unsigned char)(row[x] & 0xFF));
++            scratch.push_back((unsigned char)((row[x] >> 8) & 0xFF));
++        }
++    }
++
++    unsigned char digest[32];
++    blake3_hasher hasher;
++    blake3_hasher_init(&hasher);
++    blake3_hasher_update(&hasher, scratch.data(), scratch.size());
++    blake3_hasher_finalize(&hasher, digest, sizeof(digest));
++    static const char *hex = "0123456789abcdef";
++    for (int i = 0; i < 32; ++i) {
++        out[i * 2]     = hex[digest[i] >> 4];
++        out[i * 2 + 1] = hex[digest[i] & 0xF];
++    }
++    out[64] = 0;
++}
++
++static void writeEntity(FILE *file, int32 slot, const Legacy::v4::Entity *entity, bool withValues)
++{
++    fprintf(file, "[%d,%u,\"%s\",%d,%u,%d,%d,%d,%d,%d,%d,", slot, (unsigned)entity->type, escapeJSON(Legacy::v4::typeNames[entity->type]).c_str(),
++            (int)entity->propertyValue, (unsigned)entity->groupID, entity->xpos, entity->ypos, entity->xvel, entity->yvel, entity->speed,
++            entity->state);
++    fprintf(file, "%d,%d,%d,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d,%u,[", entity->angle, entity->scale, entity->rotation,
++            (unsigned)entity->alpha, (unsigned)entity->animationTimer, (unsigned)entity->animationSpeed, (unsigned)entity->priority,
++            (unsigned)entity->drawOrder, (unsigned)entity->direction, (unsigned)entity->inkEffect, (unsigned)entity->animation,
++            (unsigned)entity->prevAnimation, (unsigned)entity->frame, (unsigned)entity->collisionMode, (unsigned)entity->collisionPlane,
++            (unsigned)entity->gravity, (int)entity->controlMode, (unsigned)entity->controlLock);
++    if (withValues) {
++        for (int i = 0; i < 48; ++i) {
++            if (i)
++                fputc(',', file);
++            fprintf(file, "%d", entity->values[i]);
++        }
++    }
++    fputs("]]", file);
++}
++
++static void writeCamera(FILE *file, const Legacy::Camera *camera)
++{
++    fprintf(file, "{\"x\":%d,\"y\":%d,\"target\":%u,\"adjustY\":%d,\"enabled\":%u,\"style\":%u}", camera->xpos, camera->ypos,
++            (unsigned)camera->target, camera->adjustY, (unsigned)camera->enabled, (unsigned)camera->style);
++}
++
++static void writeRecord(char *hash)
++{
++    FILE *file = recordFile;
++    const Legacy::v4::Entity *player = &Legacy::v4::objectEntityList[Legacy::v4::playerListPos];
++
++    fprintf(file, "{\"f\":%llu,\"ver\":%d,\"engine\":{\"state\":%d,\"cat\":%d,\"list\":%d}", frame, engine.version,
++            (int)RSDK::sceneInfo.state, (int)RSDK::sceneInfo.activeCategory, (int)RSDK::sceneInfo.listPos);
++
++    if (RSDK::sceneInfo.listData && RSDK::sceneInfo.listPos >= 0) {
++        const SceneListEntry *entry = &RSDK::sceneInfo.listData[RSDK::sceneInfo.listPos];
++        fprintf(file, ",\"catname\":\"%s\",\"folder\":\"%s\",\"sceneid\":\"%s\",\"scenename\":\"%s\"",
++                escapeJSON(RSDK::sceneInfo.listCategory[RSDK::sceneInfo.activeCategory].name).c_str(), escapeJSON(entry->folder).c_str(),
++                escapeJSON(entry->id).c_str(), escapeJSON(entry->name).c_str());
++    }
++
++    fprintf(file, ",\"fb\":{\"w\":%d,\"h\":%d,\"blake3\":\"%s\"}", screens[0].size.x, screens[0].size.y, hash);
++
++    if (engine.version == 4) {
++        fprintf(file, ",\"v4\":{\"gmode\":%d,\"smode\":%d,\"plr\":%d,\"scroll\":[%d,%d],\"shake\":[%d,%d],\"lag\":%d,\"cameras\":[",
++                Legacy::gameMode, Legacy::stageMode, Legacy::v4::playerListPos, Legacy::xScrollOffset, Legacy::yScrollOffset,
++                Legacy::cameraShakeX, Legacy::cameraShakeY, Legacy::cameraLag);
++        writeCamera(file, &Legacy::cameras[0]);
++        fputc(',', file);
++        writeCamera(file, &Legacy::cameras[1]);
++        fputs("],\"player\":", file);
++        writeEntity(file, Legacy::v4::playerListPos, player, true);
++        fputs(",\"ents\":[", file);
++
++        bool first = true;
++        for (int32 slot = 0; slot < LEGACY_v4_ENTITY_COUNT; ++slot) {
++            const Legacy::v4::Entity *entity = &Legacy::v4::objectEntityList[slot];
++            if (slot != Legacy::v4::playerListPos && entity->type == 0)
++                continue;
++            if (!first)
++                fputc(',', file);
++            first = false;
++            writeEntity(file, slot, entity, entityValues);
++        }
++        fputs("]}", file);
++    }
++
++    fputs("}\n", file);
++    fflush(file);
++}
++
++static void writePPM()
++{
++    ScreenInfo *screen = &screens[0];
++    char path[1024];
++    snprintf(path, sizeof(path), "%s/frame_%04llu.ppm", ppmDir.c_str(), frame);
++    FILE *file = fopen(path, "wb");
++    if (!file) {
++        fprintf(stderr, "[ref-harness] cannot write %s\n", path);
++        return;
++    }
++    fprintf(file, "P6\n%d %d\n255\n", screen->size.x, screen->size.y);
++    for (int32 y = 0; y < screen->size.y; ++y) {
++        const uint16 *row = screen->frameBuffer + (size_t)y * screen->pitch;
++        for (int32 x = 0; x < screen->size.x; ++x) {
++            uint16 pixel = row[x];
++            uint8 r = (uint8)((pixel >> 11) & 0x1F);
++            uint8 g = (uint8)((pixel >> 5) & 0x3F);
++            uint8 b = (uint8)(pixel & 0x1F);
++            unsigned char rgb[3] = { (unsigned char)((r << 3) | (r >> 2)), (unsigned char)((g << 2) | (g >> 4)),
++                                     (unsigned char)((b << 3) | (b >> 2)) };
++            fwrite(rgb, 1, 3, file);
++        }
++    }
++    fclose(file);
++}
++
++void ProcessFrame()
++{
++    if (!active)
++        return;
++
++    char hash[65];
++    framebufferHash(hash);
++    if (recordFile)
++        writeRecord(hash);
++
++    bool dumpPPM = false;
++    if (!ppmDir.empty()) {
++        if (ppmEvery && frame % ppmEvery == 0)
++            dumpPPM = true;
++        for (size_t i = 0; i < ppmFrames.size(); ++i) {
++            if (ppmFrames[i] == frame)
++                dumpPPM = true;
++        }
++    }
++    if (dumpPPM)
++        writePPM();
++
++    ++frame;
++    if (maxFrames && frame >= maxFrames) {
++        done = true;
++        if (recordFile) {
++            fclose(recordFile);
++            recordFile = NULL;
++        }
++    }
++}
++
++bool ShouldQuit() { return done; }
++
++} // namespace RefHarness
++
++#endif // RETRO_HARNESS
+diff --git a/RSDKv5/refharness.hpp b/RSDKv5/refharness.hpp
+new file mode 100644
+index 0000000..633c278
+--- /dev/null
++++ b/RSDKv5/refharness.hpp
+@@ -0,0 +1,40 @@
++#ifndef REFHARNESS_H
++#define REFHARNESS_H
++
++#if RETRO_HARNESS
++
++namespace RefHarness
++{
++
++// Enabled when any REF_HARNESS_* environment variable is set.
++extern bool active;
++
++// Deterministic RNG seed applied to both libc rand() and randSeed.
++extern unsigned int seed;
++
++// Number of ProcessEngine ticks executed so far.
++extern unsigned long long frame;
++
++// Stop after this many recorded frames (0 = never).
++extern unsigned long long maxFrames;
++
++// Set once the frame limit has been reached.
++extern bool done;
++
++// Parses the environment and loads the input script. Returns `active`.
++bool Init();
++
++// Feeds the scripted button state into controller[CONT_ANY]/controller[CONT_P1].
++void InjectInput();
++
++// Writes the per-frame record after a ProcessEngine tick.
++void ProcessFrame();
++
++// True when the run should stop (frame limit reached).
++bool ShouldQuit();
++
++} // namespace RefHarness
++
++#endif // RETRO_HARNESS
++
++#endif // REFHARNESS_H
