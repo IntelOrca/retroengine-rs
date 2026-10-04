@@ -34,8 +34,9 @@
 //! * Each submission is appended to a small in-process backlog and then offered to the device up
 //!   to a high-water mark of [`MAX_QUEUED_TICKS`] on the device queue (about 100 ms). A device
 //!   that is momentarily full (or has not drained since the last logic frame) no longer rejects
-//!   the tick; the frames wait in the backlog and are pushed as room appears.
-//! * If the backlog itself exceeds [`MAX_BACKLOG_TICKS`], the engine is more than
+//!   the tick; the frames wait in the backlog and are pushed as room appears. The offer happens
+//!   before any trim, so a catch-up burst flows into device queue room instead of being dropped.
+//! * If the backlog still exceeds [`MAX_BACKLOG_TICKS`] after that offer, the engine is more than
 //!   `~200 ms` ahead of real time and cannot stay there; it drops the *oldest* backlog frames
 //!   (resynchronizing to live audio instead of adding permanent latency) and counts them.
 //! * Every drop, every device underrun and the deepest queue/backlog seen are recorded in
@@ -281,33 +282,6 @@ impl AudioEngine {
             .expect("prebuffered engine has a queue control");
         let backlogged_before = queue.backlog.len() / CHANNELS;
         queue.backlog.extend(frames.iter().copied());
-        self.counters.max_backlog_frames = self
-            .counters
-            .max_backlog_frames
-            .max(queue.backlog.len() / CHANNELS);
-
-        // Resynchronization: the backlog exceeded its cap, so the engine is further ahead of real
-        // time than the policy allows. Trim the oldest frames and report the gap.
-        let mut retained = total;
-        if queue.backlog.len() > queue.backlog_cap_frames * CHANNELS {
-            let excess = queue.backlog.len().div_ceil(CHANNELS) - queue.backlog_cap_frames;
-            queue.backlog.drain(..excess * CHANNELS);
-            // This submission sits at the back of the backlog, so it only loses frames once the
-            // trim has consumed everything queued before it.
-            retained = (backlogged_before + total)
-                .min(queue.backlog_cap_frames)
-                .saturating_sub(backlogged_before);
-            self.counters.dropped_frames += excess as u64;
-            self.counters.resyncs += 1;
-            if !queue.warned_resync {
-                queue.warned_resync = true;
-                eprintln!(
-                    "audio: resync: backlog above {MAX_BACKLOG_TICKS} ticks, dropped {} ms of \
-                     oldest queued audio (further resyncs only counted)",
-                    excess as f64 * 1000.0 / f64::from(SAMPLE_RATE)
-                );
-            }
-        }
 
         // A started device with an empty queue ran dry between logic frames. Keep playing into
         // the gap (there is no silence to splice), but count and report it: it means production
@@ -323,8 +297,11 @@ impl AudioEngine {
             }
         }
 
-        // Offer the backlog to the device while there is room below the high-water mark. The
-        // loop stops on a partial acceptance so a stalled device is never retried within a tick.
+        // Offer the backlog to the device while there is room below the high-water mark. This
+        // runs before any trim: a burst (a catch-up tick sequence) flows into the device queue
+        // whenever it has room, and only frames the device cannot take contribute to the
+        // backlog. The loop stops on a partial acceptance so a stalled device is never retried
+        // within a tick.
         loop {
             let queued = self.device.queued_frames();
             self.counters.max_queued_frames = self.counters.max_queued_frames.max(queued);
@@ -343,6 +320,34 @@ impl AudioEngine {
             queue.backlog.drain(..accepted * CHANNELS);
             if accepted < take {
                 break;
+            }
+        }
+
+        // Resynchronization: even after offering everything the device had room for, the backlog
+        // still exceeds its cap, so the engine is further ahead of real time than the policy
+        // allows. Trim the oldest frames and report the gap.
+        self.counters.max_backlog_frames = self
+            .counters
+            .max_backlog_frames
+            .max(queue.backlog.len() / CHANNELS);
+        let mut retained = total;
+        if queue.backlog.len() > queue.backlog_cap_frames * CHANNELS {
+            let excess = queue.backlog.len().div_ceil(CHANNELS) - queue.backlog_cap_frames;
+            queue.backlog.drain(..excess * CHANNELS);
+            // This submission sits at the back of the backlog, so it only loses frames once the
+            // trim has consumed everything queued before it.
+            retained = (backlogged_before + total)
+                .min(queue.backlog_cap_frames)
+                .saturating_sub(backlogged_before);
+            self.counters.dropped_frames += excess as u64;
+            self.counters.resyncs += 1;
+            if !queue.warned_resync {
+                queue.warned_resync = true;
+                eprintln!(
+                    "audio: resync: backlog above {MAX_BACKLOG_TICKS} ticks, dropped {} ms of \
+                     oldest queued audio (further resyncs only counted)",
+                    excess as f64 * 1000.0 / f64::from(SAMPLE_RATE)
+                );
             }
         }
 

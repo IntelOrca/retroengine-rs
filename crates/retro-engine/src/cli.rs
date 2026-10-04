@@ -6,9 +6,16 @@
 //! closes, headless runs when SIGINT/SIGTERM arrives; an explicit `--frames N` caps either mode
 //! after `N` frames (`--frames 0` keeps the unbounded default). `--dump-frames DIR` writes the
 //! presented RGB565 framebuffer to `frame_%04d.png` headlessly; without `--headless` the same
-//! frames are presented through the SDL3 backend at 60 Hz.
+//! frames are presented through the SDL3 backend at 60 Hz. `--dump-audio FILE` writes the exact
+//! mixed audio stream to a 32-bit float WAV.
+//!
+//! Windowed runs are paced by the wall clock, not by presentation: the loop mixes every 60 Hz
+//! logic frame the schedule owes (bounded catch-up) and only then presents, so a blocking present
+//! (vsync, a busy driver) can drop or repeat a presentation but never starve audio production.
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -23,6 +30,13 @@ use crate::EngineError;
 use crate::loader;
 use crate::runtime::{Engine, FrameLimit};
 use crate::save::{seed_memory_storage, seed_storage_from_source};
+
+/// Maximum number of missed 60 Hz logic frames one windowed loop iteration catches up.
+///
+/// Matches the audio engine's backlog cap (`MAX_BACKLOG_TICKS`): the prebuffered device retains
+/// that many ticks if the device queue is momentarily full, so catching up this far never forces
+/// an audio resync. Longer stalls (engine load, process suspend) are rebased away by the clock.
+const MAX_CATCHUP_FRAMES: u64 = MAX_BACKLOG_TICKS as u64;
 
 /// Command line arguments for the engine binary.
 #[derive(Debug, Parser)]
@@ -77,6 +91,11 @@ pub struct Args {
     /// Dump every Nth frame (default 1; frame 0 is dumped before the loop)
     #[arg(long, default_value_t = 1)]
     pub dump_frame_every: u64,
+    /// Dump the exact mixed audio stream to FILE as a 32-bit float WAV (44.1 kHz stereo).
+    /// The dump covers the frames the run actually mixes, so pair it with `--frames N`
+    /// (60 frames = 1 second) and `--mute` for a clean capture
+    #[arg(long)]
+    pub dump_audio: Option<PathBuf>,
     /// RNG seed; overrides the `--input` replay's `seed` header. Without either, the built-in
     /// default is used
     #[arg(long)]
@@ -469,11 +488,28 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         println!("0,{}", engine.state_hash());
     }
 
+    // `--dump-audio` captures the mixed PCM from every frame loop iteration and streams it to a
+    // float WAV: the samples written are exactly the ones `--audio-hash` hashes and the device
+    // receives, so a user can send the file as audible evidence of what the run produced.
+    let mut audio_dump = match &args.dump_audio {
+        Some(path) => {
+            engine.state.audio.set_capture(true);
+            println!("dump audio: {}", path.display());
+            Some(AudioDumpWriter::create(path)?)
+        }
+        None => None,
+    };
+
     let dump_every = args.dump_frame_every.max(1);
     let mut present_buffer = Vec::new();
     let mut presented = 0u64;
     let mut executed = 0u64;
     let mut stopped_by_signal = false;
+    // Start the wall-clock schedule at the loop, after asset loading: load time (and the clock
+    // creation that precedes it) must not be replayed as logic ticks or counted as production
+    // debt. With no frames advanced yet this rebases the origin to now and does not sleep.
+    platform.clock().sleep_until_next_frame()?;
+    let wall_start_ms = platform.clock().now_ms();
     loop {
         if frame_limit.reached(executed) {
             break;
@@ -482,40 +518,75 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
             stopped_by_signal = true;
             break;
         }
-        executed += 1;
-        // Pump SDL events every frame a window exists so close/resize/quit keep working with
-        // scripted input (`--input`), which bypasses platform polling; raw device state is only
-        // forwarded in platform-input mode.
-        if window.is_some() {
-            let raw = platform.input().poll_raw();
-            if engine.input.uses_platform_input() {
-                engine.set_raw_input(raw);
+        // Windowed runs are paced by the wall clock, not by presentation: every 60 Hz deadline
+        // that has passed is mixed now (up to the catch-up bound), and the frame is presented
+        // afterwards. A present that blocks past a deadline (vsync, a busy driver) therefore
+        // repeats or drops a presentation but can never starve audio production. Headless runs
+        // stay unpaced and tick once per iteration.
+        let due = window
+            .as_ref()
+            .map_or(1, |_| platform.clock().frames_due(MAX_CATCHUP_FRAMES));
+        if due == 0 {
+            platform.clock().sleep_until_next_frame()?;
+            continue;
+        }
+        for _ in 0..due {
+            if frame_limit.reached(executed) {
+                break;
+            }
+            executed += 1;
+            // Pump SDL events every frame a window exists so close/resize/quit keep working
+            // with scripted input (`--input`), which bypasses platform polling; raw device
+            // state is only forwarded in platform-input mode.
+            if window.is_some() {
+                let raw = platform.input().poll_raw();
+                if engine.input.uses_platform_input() {
+                    engine.set_raw_input(raw);
+                }
+            }
+            engine.run_frame()?;
+            if window.is_some() {
+                platform.clock().advance_frame();
+            }
+            if let Some(dump) = &mut audio_dump {
+                // Capture is on, so this drains exactly the tick this frame just mixed.
+                // Streaming per frame keeps memory flat for unbounded runs.
+                let samples = engine.state.audio.take_captured_pcm();
+                dump.write(&samples)?;
+            }
+            let frame = engine.state.frame;
+            if let Some(dir) = &args.dump_frames
+                && frame % dump_every == 0
+            {
+                dump_frame(dir, frame, engine.framebuffer())?;
+            }
+            if args.hash_every_frame {
+                println!("{frame},{}", engine.state_hash());
+            }
+            if args.audio_hash {
+                println!("{frame},{}", engine.audio_hash());
             }
         }
-        engine.run_frame()?;
-        let frame = engine.state.frame;
         if let Some(window) = &mut window {
             engine.framebuffer().copy_visible_into(&mut present_buffer);
             apply_dim(&mut present_buffer, engine.state.render.dim_amount());
             window.present(&present_buffer, width, height)?;
-            platform.clock().advance_frame();
-            platform.clock().sleep_until_next_frame()?;
             presented += 1;
             if window.should_close() {
                 break;
             }
         }
-        if let Some(dir) = &args.dump_frames
-            && frame % dump_every == 0
-        {
-            dump_frame(dir, frame, engine.framebuffer())?;
-        }
-        if args.hash_every_frame {
-            println!("{frame},{}", engine.state_hash());
-        }
-        if args.audio_hash {
-            println!("{frame},{}", engine.audio_hash());
-        }
+    }
+
+    // Finalize the WAV header before the summary so an interrupted sink still yields a valid
+    // file up to the last flushed frame.
+    if let Some(dump) = audio_dump.take() {
+        let frames = dump.frames();
+        dump.finish()?;
+        println!(
+            "dump audio: {frames} stereo frames ({:.2} s)",
+            frames as f64 / f64::from(SAMPLE_RATE)
+        );
     }
 
     // Device flow-control totals: dropped ticks (overrun resyncs) and underruns are the audible
@@ -531,6 +602,17 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         println!("quit: signal");
     }
     println!("executed-frames: {executed}");
+    // Wall-clock pacing evidence: when a window exists the logic rate should be ~60 Hz
+    // regardless of display refresh or present cost (`--audio-hash` mixes exactly one tick per
+    // executed frame, so this is also the audio production rate).
+    let wall_ms = platform.clock().now_ms().saturating_sub(wall_start_ms);
+    if window.is_some() && wall_ms > 0 {
+        println!(
+            "logic-rate: {:.2} fps over {} ms",
+            executed as f64 * 1000.0 / wall_ms as f64,
+            wall_ms
+        );
+    }
     if !args.hash_every_frame {
         let hash = engine.state_hash();
         println!("hash: {hash}");
@@ -559,6 +641,91 @@ fn apply_dim(pixels: &mut [u16], amount: f32) {
         let b = (u32::from(*pixel) & 0x1F) * scale / 255;
         *pixel = ((r << 11) | (g << 5) | b) as u16;
     }
+}
+
+/// Streaming 32-bit float WAV writer for `--dump-audio`.
+///
+/// The header is written with placeholder sizes and patched on [`AudioDumpWriter::finish`], so
+/// the mixed stream can be flushed frame by frame without buffering the whole run. Samples are
+/// the engine's own interleaved stereo `f32` values at [`SAMPLE_RATE`], written verbatim so the
+/// file is the exact stream the device would play and `--audio-hash` hashes.
+struct AudioDumpWriter {
+    file: File,
+    data_bytes: u32,
+}
+
+impl AudioDumpWriter {
+    /// Creates `path` and writes a float WAV header with zero data size.
+    fn create(path: &Path) -> Result<Self, EngineError> {
+        let mut file = File::create(path)?;
+        file.write_all(&float_wav_header(0))?;
+        Ok(Self {
+            file,
+            data_bytes: 0,
+        })
+    }
+
+    /// Appends interleaved stereo samples in little-endian `f32` order.
+    fn write(&mut self, samples: &[f32]) -> Result<(), EngineError> {
+        let mut bytes = Vec::with_capacity(std::mem::size_of_val(samples));
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        self.file.write_all(&bytes)?;
+        self.data_bytes = self
+            .data_bytes
+            .saturating_add(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
+        Ok(())
+    }
+
+    /// Number of stereo frames written so far.
+    fn frames(&self) -> usize {
+        self.data_bytes as usize / (std::mem::size_of::<f32>() * retro_audio::CHANNELS)
+    }
+
+    /// Patches the RIFF and `data` sizes so the file is a valid WAV, then flushes.
+    fn finish(mut self) -> Result<(), EngineError> {
+        self.finalize()?;
+        Ok(())
+    }
+
+    /// Best-effort header patch used by both [`AudioDumpWriter::finish`] and `Drop` (a run that
+    /// exits through an error still leaves a readable file).
+    fn finalize(&mut self) -> std::io::Result<()> {
+        self.file.seek(SeekFrom::Start(4))?;
+        self.file.write_all(&(36 + self.data_bytes).to_le_bytes())?;
+        self.file.seek(SeekFrom::Start(40))?;
+        self.file.write_all(&self.data_bytes.to_le_bytes())?;
+        self.file.flush()
+    }
+}
+
+impl Drop for AudioDumpWriter {
+    fn drop(&mut self) {
+        let _ = self.finalize();
+    }
+}
+
+/// Builds a 44-byte WAVE header for 32-bit IEEE float stereo at [`SAMPLE_RATE`].
+fn float_wav_header(data_bytes: u32) -> [u8; 44] {
+    let mut header = [0u8; 44];
+    let channels = retro_audio::CHANNELS as u32;
+    let bytes_per_sample = std::mem::size_of::<f32>() as u32;
+    let byte_rate = SAMPLE_RATE * channels * bytes_per_sample;
+    header[0..4].copy_from_slice(b"RIFF");
+    header[4..8].copy_from_slice(&(36 + data_bytes).to_le_bytes());
+    header[8..12].copy_from_slice(b"WAVE");
+    header[12..16].copy_from_slice(b"fmt ");
+    header[16..20].copy_from_slice(&16u32.to_le_bytes());
+    header[20..22].copy_from_slice(&3u16.to_le_bytes());
+    header[22..24].copy_from_slice(&(channels as u16).to_le_bytes());
+    header[24..28].copy_from_slice(&SAMPLE_RATE.to_le_bytes());
+    header[28..32].copy_from_slice(&byte_rate.to_le_bytes());
+    header[32..34].copy_from_slice(&((channels * bytes_per_sample) as u16).to_le_bytes());
+    header[34..36].copy_from_slice(&((bytes_per_sample * 8) as u16).to_le_bytes());
+    header[36..40].copy_from_slice(b"data");
+    header[40..44].copy_from_slice(&data_bytes.to_le_bytes());
+    header
 }
 
 /// Writes one framebuffer to `DIR/frame_%04d.png`.
@@ -636,6 +803,7 @@ mod tests {
         assert!(!args.origins);
         assert_eq!(args.user_dir, None);
         assert_eq!(args.dump_frame_every, 1);
+        assert_eq!(args.dump_audio, None);
     }
 
     #[test]
@@ -730,6 +898,8 @@ mod tests {
             "out",
             "--dump-frame-every",
             "60",
+            "--dump-audio",
+            "audio.wav",
             "--seed",
             "7",
             "--hash-every-frame",
@@ -747,6 +917,7 @@ mod tests {
         assert_eq!(args.input, Some(PathBuf::from("replay.bin")));
         assert_eq!(args.dump_frames, Some(PathBuf::from("out")));
         assert_eq!(args.dump_frame_every, 60);
+        assert_eq!(args.dump_audio, Some(PathBuf::from("audio.wav")));
         assert_eq!(args.seed, Some(7));
         assert!(args.hash_every_frame);
         assert!(args.audio_hash);
@@ -755,6 +926,53 @@ mod tests {
         assert_eq!(args.user_dir, Some(PathBuf::from("user")));
         assert!(!args.list);
         assert_eq!(backend_for(&args), BackendKind::Headless);
+    }
+
+    #[test]
+    fn float_wav_header_describes_engine_rate_float_stereo() {
+        let header = float_wav_header(16);
+        assert_eq!(&header[0..4], b"RIFF");
+        assert_eq!(&header[8..12], b"WAVE");
+        assert_eq!(&header[12..16], b"fmt ");
+        assert_eq!(&header[36..40], b"data");
+        assert_eq!(
+            u32::from_le_bytes(header[4..8].try_into().unwrap()),
+            36 + 16
+        );
+        assert_eq!(u16::from_le_bytes(header[20..22].try_into().unwrap()), 3);
+        assert_eq!(u16::from_le_bytes(header[22..24].try_into().unwrap()), 2);
+        assert_eq!(
+            u32::from_le_bytes(header[24..28].try_into().unwrap()),
+            SAMPLE_RATE
+        );
+        assert_eq!(
+            u32::from_le_bytes(header[28..32].try_into().unwrap()),
+            352_800
+        );
+        assert_eq!(u16::from_le_bytes(header[32..34].try_into().unwrap()), 8);
+        assert_eq!(u16::from_le_bytes(header[34..36].try_into().unwrap()), 32);
+        assert_eq!(u32::from_le_bytes(header[40..44].try_into().unwrap()), 16);
+    }
+
+    #[test]
+    fn audio_dump_writer_patches_riff_and_data_sizes() {
+        let path =
+            std::env::temp_dir().join(format!("retro-engine-cli-dump-{}.wav", std::process::id()));
+        let mut writer = AudioDumpWriter::create(&path).unwrap();
+        writer.write(&[0.5, -0.5, 1.0, -1.0]).unwrap();
+        assert_eq!(writer.frames(), 2);
+        writer.finish().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 44 + 16, "header plus two stereo float frames");
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 36 + 16);
+        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 16);
+        assert_eq!(
+            f32::from_le_bytes(bytes[44..48].try_into().unwrap()),
+            0.5,
+            "samples are the exact mixed f32 values"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     fn listing_config() -> GameConfig {

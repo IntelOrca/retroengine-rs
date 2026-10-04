@@ -529,6 +529,15 @@ impl AudioState {
             }
         }
     }
+
+    /// Takes the samples captured since the last call, leaving the capture buffer empty.
+    ///
+    /// `--dump-audio` streams the mixed PCM to disk per frame through this: capture stays
+    /// enabled but the buffer never grows with the run length. Returns an empty vector while
+    /// capture is off, so a caller can drain unconditionally.
+    pub fn take_captured_pcm(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.captured)
+    }
 }
 
 impl Default for AudioState {

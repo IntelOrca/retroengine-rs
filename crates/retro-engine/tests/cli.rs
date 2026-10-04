@@ -249,7 +249,19 @@ fn windowed_frames_run_exits_promptly() {
     let text = stdout(&output);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(text.contains("platform: standalone"), "{text}");
-    assert!(text.contains("presented-frames: 5"), "{text}");
+    assert!(
+        text.contains("executed-frames: 5"),
+        "every logic frame must run: {text}"
+    );
+    // Presentation may be dropped or repeated when a present blocks past a deadline; the
+    // invariant is that at least the final frame is presented and no more than one per frame.
+    let presented: u64 = text
+        .lines()
+        .find_map(|line| line.strip_prefix("presented-frames: "))
+        .and_then(|value| value.trim().parse().ok())
+        .expect("windowed runs report presented-frames");
+    assert!((1..=5).contains(&presented), "presented {presented}");
+    assert!(text.contains("logic-rate: "), "{text}");
     assert!(text.contains("hash: "), "{text}");
     assert!(text.contains("audio: 44100 Hz stereo f32"), "{text}");
     assert!(
@@ -257,6 +269,62 @@ fn windowed_frames_run_exits_promptly() {
         "windowed runs must report audio flow-control diagnostics: {text}"
     );
     assert!(text.contains("video: dummy"), "{text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `--dump-audio` writes the exact mixed stream as a 32-bit float stereo WAV at the engine
+/// rate, sized from the frames the run actually mixed.
+#[test]
+fn dump_audio_writes_the_mixed_stream_as_a_float_wav() {
+    let root = temp_assets("dump-audio");
+    write_assets(&root);
+    let wav = root.join("audio.wav");
+    let output = run(&[
+        root.to_str().unwrap(),
+        "--headless",
+        "--frames",
+        "4",
+        "--mute",
+        "--dump-audio",
+        wav.to_str().unwrap(),
+    ]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(text.contains("dump audio:"), "{text}");
+
+    let bytes = std::fs::read(&wav).expect("dump-audio must write the WAV");
+    assert_eq!(&bytes[0..4], b"RIFF", "RIFF magic");
+    assert_eq!(&bytes[8..12], b"WAVE", "WAVE form");
+    assert_eq!(&bytes[12..16], b"fmt ", "fmt chunk");
+    assert_eq!(&bytes[36..40], b"data", "data chunk");
+    assert_eq!(
+        u16::from_le_bytes(bytes[20..22].try_into().unwrap()),
+        3,
+        "IEEE float format tag"
+    );
+    assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 2);
+    assert_eq!(
+        u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+        44_100,
+        "engine sample rate"
+    );
+    assert_eq!(u16::from_le_bytes(bytes[34..36].try_into().unwrap()), 32);
+    let data_bytes = u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize;
+    assert_eq!(
+        data_bytes,
+        4 * 735 * 2 * 4,
+        "4 ticks * 735 frames * 2ch * 4B"
+    );
+    assert_eq!(bytes.len(), 44 + data_bytes);
+    // The synthetic scene has no music or SFX, so the exact mixed stream is digital silence.
+    assert!(
+        bytes[44..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|sample| sample == &[0, 0, 0, 0]),
+        "an empty mix must dump as digital silence"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
