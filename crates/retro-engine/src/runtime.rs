@@ -54,8 +54,8 @@ use crate::profile::EngineSettings;
 use crate::rng::DEFAULT_SEED;
 use crate::save::{SaveState, seed_memory_storage};
 use crate::state::{
-    ENGINE_EXITPAUSE, ENGINE_INITPAUSE, ENGINE_MAINGAME, ENGINE_WAIT, EngineState,
-    STAGEMODE_FROZEN, STAGEMODE_NORMAL, STAGEMODE_PAUSED,
+    ENGINE_ENDGAME, ENGINE_EXITPAUSE, ENGINE_INITPAUSE, ENGINE_MAINGAME, ENGINE_RESETGAME,
+    ENGINE_WAIT, EngineState, STAGEMODE_FROZEN, STAGEMODE_NORMAL, STAGEMODE_PAUSED,
 };
 
 /// The compiled script file and its VM execution state.
@@ -562,6 +562,23 @@ impl Engine {
     /// next frame, exactly like upstream's `STAGEMODE_LOAD` (which resets the frame state, runs
     /// `LoadStageFiles` and skips that frame's updates and draw).
     pub fn run_frame(&mut self) -> Result<(), EngineError> {
+        // `Legacy::v4::ProcessEngine` dispatches on `gameMode` before `ProcessStage` runs.
+        // `ENGINE_ENDGAME`/`ENGINE_RESETGAME` (`RetroEnginev4.cpp:300-305`) reset the category and
+        // list position, re-enter `ENGINE_MAINGAME` and request `STAGEMODE_LOAD`; the reset tick
+        // itself neither updates nor draws, and the request is consumed by the deferred-load path
+        // on the following tick, exactly like a script `LoadStage`.
+        if matches!(self.state.game_mode, ENGINE_ENDGAME | ENGINE_RESETGAME) {
+            self.state.game_mode = ENGINE_MAINGAME;
+            self.state.stage.active_list = 0;
+            self.state.stage.list_pos = 0;
+            self.state.load_stage_requested = true;
+            // `FlipScreen` still runs on a skipped frame, matching the pause/`STAGEMODE_LOAD`
+            // ticks: presentation, the frame counter and the audio mixer advance.
+            self.state.render.process_dimming();
+            self.state.frame += 1;
+            self.state.audio.tick();
+            return Ok(());
+        }
         if self.state.load_stage_requested {
             self.apply_deferred_load()?;
             // `STAGEMODE_LOAD` never calls `ProcessInput`: the load tick neither consumes an
@@ -576,7 +593,7 @@ impl Engine {
         // `Legacy::v4::ProcessEngine` dispatches on `gameMode`, which scripts write through
         // `engine.state` (`VAR_ENGINESTATE`). The pause handshake and `ENGINE_WAIT` run no stage
         // logic at all; the pause cases also reset the mode, so exactly one frame is skipped
-        // (`RetroEnginev4.cpp:307-309`). `ENGINE_DEVMENU`/`ENGINE_INITDEVMENU`/`ENGINE_SCRIPTERROR`
+        // (`RetroEnginev4.cpp:297-298`). `ENGINE_DEVMENU`/`ENGINE_INITDEVMENU`/`ENGINE_SCRIPTERROR`
         // are not modelled and keep the existing normal-stage path.
         if matches!(
             self.state.game_mode,

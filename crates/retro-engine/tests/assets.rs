@@ -568,6 +568,35 @@ fn s2_br8zone09_act3_600_frames_regression() {
     assert_eq!(outcome.frames, 600);
 }
 
+/// S1 `Continue` idle: the scripted countdown expires without input, `ContinueSetup` writes
+/// `engine.state = 8` (`ENGINE_RESETGAME`) on standalone and the engine must reset to the first
+/// GameConfig entry. No reference-harness window exists for this flow yet, so this is a
+/// completion guard rather than a framebuffer pin.
+#[test]
+#[ignore = "requires assets; flow guard without a reference pin yet"]
+fn s1_continue_idle_resets_to_the_first_game_config_entry() {
+    let mut engine = Engine::load(source("S1"), Some("Continue"), Some("1"), DEFAULT_SEED)
+        .expect("S1/Continue must load");
+    assert_eq!(engine.stage_info(), ("Continue", "1"));
+
+    let mut reset_frame = None;
+    for frame in 0..2400u64 {
+        engine.run_frame().expect("frame");
+        if engine.stage_info().0 != "Continue" {
+            reset_frame = Some(frame);
+            break;
+        }
+    }
+    let reset_frame = reset_frame.expect("the idle countdown must expire into the reset flow");
+    assert_eq!(engine.state.stage.active_list, 0);
+    assert_eq!(engine.state.stage.list_pos, 0);
+    println!(
+        "S1/Continue idle reset to {} act {} at frame {reset_frame}",
+        engine.stage_info().0,
+        engine.stage_info().1
+    );
+}
+
 /// Boots every `Data/Stages/*/Act*.bin` in S1 and S2 for 60 frames and asserts that none of
 /// them panics or returns a `HostError`. This is the sweep that found the `BoxCollision`
 /// overflow; it is kept as an asset-gated regression guard.
