@@ -171,6 +171,8 @@ const S2_ZONE01_IDLE: &[(u64, &str)] = &[
 /// through frame 59, then RIGHT held). All 600 frames are pixel-identical; the pins include the
 /// spring launch (350), the S2 Monitor that the `ForEachAll` stack bug used to destroy (360),
 /// the S1 death trigger (376) and the first frame the frozen death update used to miss (377).
+/// S1's death sets `camera[0].enabled = false` (`PlayerObject.txt:1582`), so frames 376-555 run
+/// `SetPlayerLockedScreenPosition` (pins 400/500); 556 resumes the follow after respawn.
 const S1_ZONE01_RIGHT: &[(u64, &str)] = &[
     (
         0,
@@ -201,8 +203,20 @@ const S1_ZONE01_RIGHT: &[(u64, &str)] = &[
         "81cd82c671ceefafdcad0407d6cd75b9ad245223e9233b55d86d1493240e42c5",
     ),
     (
+        400,
+        "22d7cb5662beb35c229cee6f1bc6f02a28a2e0e572fe86ce29dd211c67ab957f",
+    ),
+    (
         450,
         "a8c13aa2185bfd190270f88a817589de00ced1c3270dc71a70af259c56778e24",
+    ),
+    (
+        500,
+        "4e3c60bc81c9ea24361c5b1759a9433eb10e9903edebf7438220ac5182cfa5c5",
+    ),
+    (
+        556,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
     ),
     (
         599,
@@ -286,6 +300,98 @@ const S2_ZONE01_RIGHT400: &[(u64, &str)] = &[
     (
         599,
         "de712689faecf9856e083a5dfb28fac6abb832d11b0d6635f8a246dd1b4c39eb",
+    ),
+];
+
+/// Pinned `fb.blake3` values for S2 `Zone03` (ARZ) Act 1 idle 600 frames (`zone01_idle.input`).
+/// The camera stays `CAMERASTYLE_FOLLOW` for the whole window: ARZ's `Water.txt:464` only
+/// writes `CAMERASTYLE_STATIC` under `USE_ORIGINS` + vs mode, and the standalone drowning path
+/// (`Water.txt:460`, `camera[0].enabled = false`) needs 1800 frames underwater that idle input
+/// never reaches. The window still pins the second camera's out-of-range `target == -1` early
+/// return and the ARZ tile/palette state.
+const S2_ARZ_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        60,
+        "bbd21b4d1a50717f804317784d525574e45bf8479714fad95b7b08bf1d4ef819",
+    ),
+    (
+        155,
+        "ce049c7ad23431200a39caaf0d4142c90bd588b67c04475229417dc8223e0805",
+    ),
+    (
+        240,
+        "b975203682371f3d6623a6a469b084621a88aa78bb0fe3f30f658c8897688787",
+    ),
+    (
+        300,
+        "f66e647a8b1aa324c7b33b2ffa3fc293e3e7e02ad1c3bdbd4de8eaacccc617fb",
+    ),
+    (
+        400,
+        "3a72059b08861f5f373bffb954976c989551eca5c4cfc90334f17719be8feed3",
+    ),
+    (
+        500,
+        "ed7dc2c15616ccc29cb1d11235e804f5c1ce2113e5e6cb01b0aeb6b9c74d4618",
+    ),
+    (
+        599,
+        "fa6bc0fe6891c2bab3eb78f30840de66cc1faaf291ac7cb122a92f989e60d74d",
+    ),
+];
+
+/// Pinned `fb.blake3` values for `zone01_spindash.input` (S1 Zone01): crouch from line 220,
+/// spindash charge presses on 270/273/276 and release on line 290. `PlayerObject.txt:3874`
+/// then sets `camera[0].style = CAMERASTYLE_HLOCKED` with `scrollDelay = 15`, so frames
+/// 290-304 run `SetPlayerHLockedScreenPosition` and frame 305 is back on `FOLLOW`.
+///
+/// The shipped `SGame.bin` has the `spindash` option off (`saveRAM[35] == 0`), so both the
+/// reference harness run and this test feed the engine a scratch save with word 35 set; the
+/// option also clears `speedCap`/`airSpeedCap`/`spikeBehavior`, which both sides share.
+const S1_ZONE01_SPINDASH: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        269,
+        "aa1ffcc89adeef97415a7fa2bf785729f3a40d8d2b795c6e19ced905a73fa49e",
+    ),
+    (
+        290,
+        "daca1b272457fdd883990b06334245157b6cee82a76c0914992bf9389ae7af81",
+    ),
+    (
+        291,
+        "68e85c9228fa80f213d6a8c613f63a4942709c0ed18c5daa637c8e008a744bc0",
+    ),
+    (
+        295,
+        "7fff25c1764044c25316e4b48617cbaad84662aab05f23e509ea2526ebef8913",
+    ),
+    (
+        300,
+        "52f5c917d3e31e9c1d04fb101b9d5181579d2d64c3e4914e256e60b506cc2dea",
+    ),
+    (
+        304,
+        "3fe5e6a765b1366af27ffa5fb7d1e97d6f34a41f83506bb0bdf552ce40398a1c",
+    ),
+    (
+        305,
+        "db04b16066a7501c3b7482906bcc42dbbcb8e12ff217ee66ae1c99f7baf29f87",
+    ),
+    (
+        320,
+        "cc5d52de308940a2f8937210fce71acd5813156f1fe7038980ffae92b1404b1d",
+    ),
+    (
+        359,
+        "fcc7e3ae7687d46cc4c06c57c42e1f63f84cbca883ec0c3868fa2046c626c41c",
     ),
 ];
 
@@ -457,6 +563,28 @@ fn zone01_idle_framebuffer_matches_reference() {
     }
 }
 
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn s2_arz_idle_framebuffer_matches_reference() {
+    let scripted = scripted_input("zone01_idle.input");
+    let seed = scripted.seed().unwrap_or(DEFAULT_SEED);
+    let mut engine =
+        Engine::load(source("S2"), Some("Zone03"), Some("1"), seed).expect("engine load");
+    engine.set_scripted_input(scripted);
+    let mut frame = 0u64;
+    for &(target, expected) in S2_ARZ_IDLE {
+        while frame < target {
+            engine.run_frame().expect("frame");
+            frame += 1;
+        }
+        assert_eq!(
+            framebuffer_hash(&engine),
+            expected,
+            "S2/Zone03 idle frame {target} must match the reference harness"
+        );
+    }
+}
+
 fn scripted_input(file: &str) -> retro_input::ScriptedInput {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tools/ref-harness/testdata")
@@ -500,6 +628,53 @@ fn zone01_right_framebuffer_matches_reference() {
 fn zone01_right400_framebuffer_matches_reference() {
     for (game, pins) in [("S1", S1_ZONE01_RIGHT400), ("S2", S2_ZONE01_RIGHT400)] {
         check_scripted_pins(game, "Zone01", "zone01_right400.input", pins);
+    }
+}
+
+/// Save storage with the shipped save RAM but `saveRAM[35]` (`options.spindash`) forced on.
+///
+/// `PlayerObject`'s startup copies word 35 into `options.spindash`; the shipped `SGame.bin`
+/// leaves it zero, which makes `actionSpindash` jump instead. The reference window was captured
+/// with an identical scratch save, so both engines see the option on. Also exercised:
+/// `ReadSaveRAM` must load the provided storage before the startup op reads the word.
+fn spindash_storage() -> Box<dyn retro_platform::Storage> {
+    use retro_platform::Storage;
+    let path = asset_root().join("S1").join("SGame.bin");
+    let mut bytes =
+        std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    assert!(bytes.len() >= 36 * 4, "save RAM must hold word 35");
+    bytes[35 * 4..36 * 4].copy_from_slice(&1i32.to_le_bytes());
+    let mut storage = retro_platform::headless::MemoryStorage::new();
+    storage.write("SGame.bin", &bytes).expect("seed save RAM");
+    Box::new(storage)
+}
+
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn zone01_spindash_framebuffer_matches_reference() {
+    let scripted = scripted_input("zone01_spindash.input");
+    let seed = scripted.seed().unwrap_or(DEFAULT_SEED);
+    let mut engine = Engine::load_with_options(
+        source("S1"),
+        Some("Zone01"),
+        Some("1"),
+        seed,
+        spindash_storage(),
+        retro_engine::LoadOptions::default(),
+    )
+    .expect("engine load");
+    engine.set_scripted_input(scripted);
+    let mut frame = 0u64;
+    for &(target, expected) in S1_ZONE01_SPINDASH {
+        while frame < target {
+            engine.run_frame().expect("frame");
+            frame += 1;
+        }
+        assert_eq!(
+            framebuffer_hash(&engine),
+            expected,
+            "S1/Zone01 spindash frame {target} must match the reference harness"
+        );
     }
 }
 
