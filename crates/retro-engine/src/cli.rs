@@ -1,17 +1,19 @@
 //! Command line interface for the headless engine.
 //!
 //! The runtime loads settings/configs/scripts/scenes, runs startup and 60 Hz update/draw events
-//! for `--frames` frames and prints a BLAKE3 hash of the canonical engine state (which includes
-//! the software framebuffer). `--dump-frames DIR` writes the presented RGB565 framebuffer to
-//! `frame_%04d.png` headlessly; without `--headless` the same frames are presented through the
-//! SDL3 backend at 60 Hz.
+//! until stopped and prints a BLAKE3 hash of the canonical engine state (which includes the
+//! software framebuffer). Runs are unbounded by default: windowed runs stop when the window
+//! closes, headless runs when SIGINT/SIGTERM arrives; an explicit `--frames N` caps either mode
+//! after `N` frames (`--frames 0` keeps the unbounded default). `--dump-frames DIR` writes the
+//! presented RGB565 framebuffer to `frame_%04d.png` headlessly; without `--headless` the same
+//! frames are presented through the SDL3 backend at 60 Hz.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
-use retro_audio::{AudioEngine, MAX_QUEUED_TICKS, PREBUFFER_TICKS, SAMPLE_RATE};
+use retro_audio::{AudioEngine, MAX_BACKLOG_TICKS, MAX_QUEUED_TICKS, PREBUFFER_TICKS, SAMPLE_RATE};
 use retro_format_v4::GameConfig;
 use retro_input::ScriptedInput;
 use retro_io::{DataSource, DirSource};
@@ -19,13 +21,8 @@ use retro_platform::{AudioDesc, BackendKind, FsStorage, Storage, WindowDesc};
 
 use crate::EngineError;
 use crate::loader;
-use crate::runtime::Engine;
+use crate::runtime::{Engine, FrameLimit};
 use crate::save::{seed_memory_storage, seed_storage_from_source};
-
-/// Default headless frame count used when `--frames` is omitted or `0`.
-///
-/// Windowed runs without an explicit `--frames` run until the window closes instead.
-pub const DEFAULT_FRAMES: u64 = 600;
 
 /// Command line arguments for the engine binary.
 #[derive(Debug, Parser)]
@@ -35,7 +32,8 @@ pub const DEFAULT_FRAMES: u64 = 600;
     about = "Retro Engine (RSDK v4 legacy) reimplementation",
     long_about = "Runs an unpacked Sonic 1 or Sonic 2 (RSDK v4 legacy) asset folder.\n\
         Headless mode is deterministic and prints a BLAKE3 state hash; without --headless \
-        the game opens in an SDL3 window and runs until the window closes.",
+        the game opens in an SDL3 window and runs until the window closes. Headless runs \
+        until SIGINT/SIGTERM by default; --frames N caps either mode after N frames.",
     after_help = "EXAMPLES:\n  \
         retroengine C:\\games\\S1 --headless --frames 600\n  \
         retroengine C:\\games\\S1 --scene GHZ --act 1\n  \
@@ -59,8 +57,8 @@ pub struct Args {
     /// Run without a window using the deterministic headless backend
     #[arg(long)]
     pub headless: bool,
-    /// Number of frames to run; 0 means the 600-frame default headlessly and "until the
-    /// window closes" in windowed mode
+    /// Number of frames to run before exiting; 0 (the default) means run until quit: the
+    /// window closes, or headlessly SIGINT/SIGTERM arrives
     #[arg(long, default_value_t = 0)]
     pub frames: u64,
     /// List categories, scenes and available `Act*.bin` files, then exit
@@ -69,7 +67,8 @@ pub struct Args {
     /// Like `--list` but prints machine-readable JSON
     #[arg(long)]
     pub list_json: bool,
-    /// Scripted input file to replay; overrides the windowed SDL input in either mode
+    /// Scripted input file to replay; overrides the windowed SDL input in either mode. Its
+    /// `seed` header seeds the run when `--seed` is omitted
     #[arg(long)]
     pub input: Option<PathBuf>,
     /// Directory to dump presented frames into as `frame_%04d.png`
@@ -78,7 +77,8 @@ pub struct Args {
     /// Dump every Nth frame (default 1; frame 0 is dumped before the loop)
     #[arg(long, default_value_t = 1)]
     pub dump_frame_every: u64,
-    /// RNG seed
+    /// RNG seed; overrides the `--input` replay's `seed` header. Without either, the built-in
+    /// default is used
     #[arg(long)]
     pub seed: Option<u32>,
     /// Print one `frame,hash` line per frame instead of only the final hash
@@ -318,14 +318,37 @@ pub fn list(args: &Args) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// Picks the RNG seed for a run: an explicit `--seed` wins, then the `--input` replay's `seed`
+/// header, then the built-in default.
+fn resolve_seed(explicit: Option<u32>, scripted: Option<&ScriptedInput>) -> u32 {
+    explicit
+        .or_else(|| scripted.and_then(ScriptedInput::seed))
+        .unwrap_or(crate::rng::DEFAULT_SEED)
+}
+
 /// Parses arguments, loads the requested scene and runs the frame loop.
 pub fn run(args: &Args) -> Result<(), EngineError> {
     if args.list || args.list_json {
         return list(args);
     }
+    // Headless runs have no window or SDL event pump, so Ctrl-C/SIGTERM would otherwise kill the
+    // process without flushing saves or printing the run summary. SDL installs equivalent
+    // handlers for windowed runs and turns the signals into quit events.
+    let quit_signals = args.headless && retro_platform::signals::install();
     let assets = resolve_assets(&args.assets_dir)?;
     let source: Arc<dyn DataSource> = Arc::new(DirSource::new(&assets.root)?);
-    let seed = args.seed.unwrap_or(crate::rng::DEFAULT_SEED);
+    // Parse the replay before the engine is loaded: the engine is constructed with the final
+    // seed, and an explicit `--seed` must override the replay's `seed` header.
+    let scripted = if let Some(path) = &args.input {
+        let bytes = std::fs::read(path)?;
+        Some(
+            ScriptedInput::load(&bytes)
+                .map_err(|error| EngineError::Input(format!("{}: {error}", path.display())))?,
+        )
+    } else {
+        None
+    };
+    let seed = resolve_seed(args.seed, scripted.as_ref());
 
     let mut platform = retro_platform::create(backend_for(args))?;
     platform.init()?;
@@ -341,10 +364,7 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         },
     )?;
 
-    if let Some(path) = &args.input {
-        let bytes = std::fs::read(path)?;
-        let scripted = ScriptedInput::load(&bytes)
-            .map_err(|error| EngineError::Input(format!("{}: {error}", path.display())))?;
+    if let Some(scripted) = scripted {
         engine.set_scripted_input(scripted);
     } else if !args.headless {
         engine.set_platform_input();
@@ -363,20 +383,12 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     println!("profile: {}", engine.settings().profile.name());
     println!("platform: {}", engine.settings().platform.name());
     println!("backend: {}", backend_for(args).name());
-    // Headless runs default to 600 deterministic frames; windowed runs without an explicit
-    // limit keep going until the user closes the window.
-    let frame_limit = if args.frames == 0 {
-        if args.headless {
-            Some(DEFAULT_FRAMES)
-        } else {
-            None
-        }
-    } else {
-        Some(args.frames)
-    };
+    // Runs are unbounded unless the user asked for a concrete frame count.
+    let frame_limit = FrameLimit::from_frames(args.frames);
     match frame_limit {
-        Some(frames) => println!("frames: {frames}"),
-        None => println!("frames: until the window closes"),
+        FrameLimit::Bounded(frames) => println!("frames: {frames}"),
+        FrameLimit::Unbounded if args.headless => println!("frames: until quit (Ctrl-C/SIGTERM)"),
+        FrameLimit::Unbounded => println!("frames: until the window closes"),
     }
     println!("seed: {seed}");
     if !args.headless && args.input.is_none() && !engine.input.has_keyboard_bindings() {
@@ -411,7 +423,8 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
                         Ok(audio) => {
                             println!(
                                 "audio: {SAMPLE_RATE} Hz stereo f32 ({description}, \
-                                 {PREBUFFER_TICKS}-tick prebuffer, {MAX_QUEUED_TICKS}-tick cap)"
+                                 {PREBUFFER_TICKS}-tick prebuffer, {MAX_QUEUED_TICKS}-tick queue, \
+                                 {MAX_BACKLOG_TICKS}-tick backlog)"
                             );
                             engine.set_audio_device(audio);
                         }
@@ -460,10 +473,13 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     let mut present_buffer = Vec::new();
     let mut presented = 0u64;
     let mut executed = 0u64;
+    let mut stopped_by_signal = false;
     loop {
-        if let Some(limit) = frame_limit
-            && executed >= limit
-        {
+        if frame_limit.reached(executed) {
+            break;
+        }
+        if quit_signals && retro_platform::signals::requested() {
+            stopped_by_signal = true;
             break;
         }
         executed += 1;
@@ -502,9 +518,19 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         }
     }
 
+    // Device flow-control totals: dropped ticks (overrun resyncs) and underruns are the audible
+    // gaps the frame loop cannot show, so they are always reported for windowed runs.
+    if let Some(report) = engine.audio_diagnostics() {
+        println!("audio: {report}");
+    }
+
     if !engine.flush_save() {
         eprintln!("warning: could not persist save RAM");
     }
+    if stopped_by_signal {
+        println!("quit: signal");
+    }
+    println!("executed-frames: {executed}");
     if !args.hash_every_frame {
         let hash = engine.state_hash();
         println!("hash: {hash}");
@@ -645,6 +671,45 @@ mod tests {
         assert!(!desc.border);
         assert!(desc.exclusive_fullscreen);
         assert!(!desc.vsync);
+    }
+
+    #[test]
+    fn frames_zero_and_the_default_are_unbounded() {
+        // Omitted `--frames` parses as 0, which must mean "run until quit", not a hidden cap.
+        let args = Args::try_parse_from(["retro-engine", "/tmp/assets"]).unwrap();
+        assert_eq!(args.frames, 0);
+        assert_eq!(FrameLimit::from_frames(args.frames), FrameLimit::Unbounded);
+        assert_eq!(FrameLimit::from_frames(0), FrameLimit::Unbounded);
+        assert_eq!(FrameLimit::from_frames(1), FrameLimit::Bounded(1));
+        assert_eq!(FrameLimit::from_frames(600), FrameLimit::Bounded(600));
+
+        assert!(!FrameLimit::Unbounded.reached(0));
+        assert!(!FrameLimit::Unbounded.reached(u64::MAX));
+        assert!(!FrameLimit::Bounded(5).reached(4));
+        assert!(FrameLimit::Bounded(5).reached(5));
+        assert!(FrameLimit::Bounded(5).reached(6));
+    }
+
+    #[test]
+    fn replay_seed_header_is_used_unless_seed_flag_overrides_it() {
+        let with_seed = ScriptedInput::from_str(
+            "retro-input 1\nseed 12345\n0 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n",
+        )
+        .unwrap();
+        // An explicit `--seed` wins over the replay header.
+        assert_eq!(resolve_seed(Some(7), Some(&with_seed)), 7);
+        // Without `--seed`, the replay header seeds the run.
+        assert_eq!(resolve_seed(None, Some(&with_seed)), 12345);
+
+        // A replay without a seed header (and no input at all) keeps the built-in default.
+        let headerless =
+            ScriptedInput::from_str("retro-input 1\n0 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n")
+                .unwrap();
+        assert_eq!(
+            resolve_seed(None, Some(&headerless)),
+            crate::rng::DEFAULT_SEED
+        );
+        assert_eq!(resolve_seed(None, None), crate::rng::DEFAULT_SEED);
     }
 
     #[test]

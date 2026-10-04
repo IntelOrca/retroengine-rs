@@ -53,7 +53,10 @@ use crate::loader::{self, SceneAssets};
 use crate::profile::EngineSettings;
 use crate::rng::DEFAULT_SEED;
 use crate::save::{SaveState, seed_memory_storage};
-use crate::state::{EngineState, STAGEMODE_FROZEN, STAGEMODE_NORMAL, STAGEMODE_PAUSED};
+use crate::state::{
+    ENGINE_EXITPAUSE, ENGINE_INITPAUSE, ENGINE_MAINGAME, ENGINE_WAIT, EngineState,
+    STAGEMODE_FROZEN, STAGEMODE_NORMAL, STAGEMODE_PAUSED,
+};
 
 /// The compiled script file and its VM execution state.
 pub struct ScriptRuntime {
@@ -88,6 +91,40 @@ pub struct RunOutcome {
     pub frame_hashes: Vec<(u64, String)>,
     /// `(frame, audio hash)` for every executed frame.
     pub audio_hashes: Vec<(u64, String)>,
+}
+
+/// Frame budget for a run: a concrete count or no limit at all.
+///
+/// [`Engine::run_frames`] always takes a concrete count so deterministic tests stay bounded;
+/// hosts that can be stopped by something else (a closing window, a quit signal) use this enum
+/// to distinguish "run `N` frames" from "run until stopped".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameLimit {
+    /// Stop after exactly this many frames.
+    Bounded(u64),
+    /// Never stop from a frame count; run until the window closes or a quit signal arrives.
+    Unbounded,
+}
+
+impl FrameLimit {
+    /// Converts the CLI `--frames` convention: `0` (also the default) means [`Self::Unbounded`].
+    #[must_use]
+    pub const fn from_frames(frames: u64) -> Self {
+        if frames == 0 {
+            Self::Unbounded
+        } else {
+            Self::Bounded(frames)
+        }
+    }
+
+    /// Whether a run that has executed `executed` frames should stop.
+    #[must_use]
+    pub const fn reached(self, executed: u64) -> bool {
+        match self {
+            Self::Bounded(limit) => executed >= limit,
+            Self::Unbounded => false,
+        }
+    }
 }
 
 impl Engine {
@@ -536,6 +573,24 @@ impl Engine {
             self.state.audio.tick();
             return Ok(());
         }
+        // `Legacy::v4::ProcessEngine` dispatches on `gameMode`, which scripts write through
+        // `engine.state` (`VAR_ENGINESTATE`). The pause handshake and `ENGINE_WAIT` run no stage
+        // logic at all; the pause cases also reset the mode, so exactly one frame is skipped
+        // (`RetroEnginev4.cpp:307-309`). `ENGINE_DEVMENU`/`ENGINE_INITDEVMENU`/`ENGINE_SCRIPTERROR`
+        // are not modelled and keep the existing normal-stage path.
+        if matches!(
+            self.state.game_mode,
+            ENGINE_INITPAUSE | ENGINE_EXITPAUSE | ENGINE_WAIT
+        ) {
+            if self.state.game_mode != ENGINE_WAIT {
+                self.state.game_mode = ENGINE_MAINGAME;
+            }
+            // `FlipScreen` still runs on a skipped frame; the framebuffer is left untouched.
+            self.state.render.process_dimming();
+            self.state.frame += 1;
+            self.state.audio.tick();
+            return Ok(());
+        }
         // `ProcessInput` runs at the start of every non-load tick. The tick being produced is
         // `state.frame + 1` (`Engine::load` performs record 0, the `STAGEMODE_LOAD` tick), and
         // the reference harness input script's line `N` belongs to record `N`.
@@ -687,6 +742,15 @@ impl Engine {
         self.state.audio.last_hash_hex()
     }
 
+    /// One-line flow-control report for the attached audio device (`audio:` diagnostics).
+    ///
+    /// `None` when no device is attached (headless or muted runs). Reported after a windowed
+    /// run to expose device underruns and overrun resyncs that would otherwise be silent gaps.
+    #[must_use]
+    pub fn audio_diagnostics(&self) -> Option<String> {
+        self.state.audio.audio_diagnostics()
+    }
+
     /// Persists a dirty save RAM (called at exit; `WriteSaveRAM` writes immediately).
     pub fn flush_save(&mut self) -> bool {
         self.state.save.flush()
@@ -819,6 +883,10 @@ impl Engine {
     }
 
     /// Runs `frames` frames, optionally hashing every frame.
+    ///
+    /// This is the bounded, deterministic path used by tests; it always stops after a concrete
+    /// count. Unbounded runs are driven by [`FrameLimit`] plus an external stop check (window
+    /// close or quit signal) in the CLI loop.
     pub fn run_frames(
         &mut self,
         frames: u64,

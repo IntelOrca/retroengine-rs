@@ -14,9 +14,12 @@
 //! # Music streams
 //!
 //! `SetMusicTrack`/`SwapMusicTrack` only store the track metadata (`Data/Music/<file>`, loop flag
-//! and loop point); `PlayMusic` decodes the Ogg Vorbis stream on first use. Upstream's
-//! `musicRatio` cross-fade start position is accepted but ignored: the deterministic mixer always
-//! starts a swapped track at frame `0` of the loop point it was given.
+//! and loop point); `PlayMusic` decodes the Ogg Vorbis stream on first use. Cached streams are
+//! keyed by the resolved file path, and changing a track's file drops its cached stream, so
+//! `SetMusicTrack` + `PlayMusic` always plays the track's current file (upstream
+//! `AudioLegacy.cpp` reloads the current `fileName` on every `PlayMusic`). Upstream's `musicRatio`
+//! cross-fade start position is accepted but ignored: the deterministic mixer always starts a
+//! track at frame `0` of the loop point it was given.
 
 use std::sync::Arc;
 
@@ -40,6 +43,18 @@ struct TrackInfo {
     loop_point: i32,
 }
 
+/// A loaded music stream cached for one track slot, remembering the file it came from.
+///
+/// Keying the cache by path is what stops a stale stream being replayed after the track's file
+/// changes: a slot whose current `TrackInfo::file` differs from `path` is a cache miss.
+#[derive(Clone)]
+struct CachedStream {
+    /// The resolved `Data/Music/<file>` path the stream was loaded from.
+    path: String,
+    /// Mixer stream loaded from `path`.
+    id: StreamId,
+}
+
 /// Mixer, SFX/music tables and the optional output device.
 ///
 /// The state is deliberately deterministic: identical op sequences over identical assets produce
@@ -52,8 +67,10 @@ pub struct AudioState {
     sfx_cache: Vec<Option<SfxId>>,
     sfx_failed: Vec<bool>,
     tracks: Vec<TrackInfo>,
-    stream_cache: Vec<Option<StreamId>>,
-    stream_failed: Vec<bool>,
+    /// Per-track loaded stream, tagged with the path it was loaded from.
+    stream_cache: Vec<Option<CachedStream>>,
+    /// Per-track path whose stream load last failed (`None` when it has not failed).
+    stream_failed: Vec<Option<String>>,
     scratch: Vec<f32>,
     capture: bool,
     captured: Vec<f32>,
@@ -74,7 +91,7 @@ impl AudioState {
             sfx_failed: Vec::new(),
             tracks: vec![TrackInfo::default(); TRACK_COUNT],
             stream_cache: vec![None; TRACK_COUNT],
-            stream_failed: vec![false; TRACK_COUNT],
+            stream_failed: vec![None; TRACK_COUNT],
             scratch: Vec::new(),
             capture: false,
             captured: Vec::new(),
@@ -140,7 +157,7 @@ impl AudioState {
             *track = TrackInfo::default();
         }
         self.stream_cache.fill(None);
-        self.stream_failed.fill(false);
+        self.stream_failed.fill(None);
     }
 
     /// Attaches a windowed output device; mixing continues through it from now on.
@@ -174,6 +191,35 @@ impl AudioState {
     #[must_use]
     pub fn captured_pcm(&self) -> &[f32] {
         &self.captured
+    }
+
+    /// Flow-control counters of the attached device, or `None` when no device is attached.
+    #[must_use]
+    pub fn audio_counters(&self) -> Option<retro_audio::AudioCounters> {
+        self.device.as_ref().map(AudioEngine::counters)
+    }
+
+    /// One-line `audio:` flow-control report for the attached device, or `None` without one.
+    ///
+    /// Reports the totals that diagnose playback gaps: device-accepted audio, audio dropped by a
+    /// backlog resync, resyncs, underruns, and the deepest device queue and backlog seen. This is
+    /// how a windowed run shows whether the logic loop outran (drops) or fell behind (underruns)
+    /// the device; the numbers never affect mixing or the PCM hash.
+    #[must_use]
+    pub fn audio_diagnostics(&self) -> Option<String> {
+        let counters = self.audio_counters()?;
+        let seconds = |frames: u64| frames as f64 / f64::from(SAMPLE_RATE);
+        let millis = |frames: usize| frames as f64 * 1000.0 / f64::from(SAMPLE_RATE);
+        Some(format!(
+            "submitted {:.2} s, dropped {:.2} s in {} resync(s), {} underrun(s), \
+             peak queue {:.0} ms, peak backlog {:.0} ms",
+            seconds(counters.submitted_frames),
+            seconds(counters.dropped_frames),
+            counters.resyncs,
+            counters.underruns,
+            millis(counters.max_queued_frames),
+            millis(counters.max_backlog_frames),
+        ))
     }
 
     /// The hash of the most recent [`AudioState::tick`].
@@ -253,19 +299,36 @@ impl AudioState {
     }
 
     /// `SetMusicTrack`: stores a track's file, loop flag and loop point.
+    ///
+    /// Changing the file drops the track's cached stream (and any recorded load failure), so the
+    /// next [`AudioState::play_music`] loads the new file. Like upstream `SetMusicTrack`, this
+    /// only writes the track table: music already playing keeps playing until the next
+    /// `PlayMusic`. Setting the same file again keeps the cached stream; only the loop flag and
+    /// loop point are updated.
     pub fn set_track(&mut self, track: i32, file: &str, looping: bool, loop_point: i32) {
         let Ok(track) = usize::try_from(track) else {
             return;
         };
+        let new_file = if file.is_empty() {
+            None
+        } else {
+            Some(format!("Data/Music/{file}"))
+        };
         let Some(info) = self.tracks.get_mut(track) else {
             return;
         };
-        if file.is_empty() {
+        let file_changed = info.file != new_file;
+        if new_file.is_none() {
             *info = TrackInfo::default();
         } else {
-            info.file = Some(format!("Data/Music/{file}"));
+            info.file = new_file;
             info.looping = looping;
             info.loop_point = loop_point.max(0);
+        }
+        if file_changed {
+            // The cached stream (or failed path) belongs to the previous file.
+            self.stream_cache[track] = None;
+            self.stream_failed[track] = None;
         }
     }
 
@@ -367,9 +430,10 @@ impl AudioState {
     ///
     /// With a device attached the mixed samples are submitted through [`AudioEngine`] unless
     /// muted; the submitted buffer is exactly the hashed buffer, so device playback, `--mute`
-    /// and headless runs all agree. Submission is best-effort: a short or zero acceptance (a
-    /// full device queue) drops only device output and never changes the hash. The device is
-    /// detached only when submission returns a real error.
+    /// and headless runs all agree. A prebuffered engine retains ticks the device cannot accept
+    /// yet, so a full queue never drops a mixed tick; only a sustained overrun resyncs (counted
+    /// in [`AudioState::audio_counters`]). The device is detached only when submission returns a
+    /// real error.
     pub fn tick(&mut self) -> [u8; 32] {
         self.scratch.resize(FRAMES_PER_TICK * CHANNELS, 0.0);
         // Always mix on the single engine mixer; the device (when attached and unmuted) receives
@@ -425,29 +489,42 @@ impl AudioState {
         }
     }
 
+    /// Loads the stream for `track`'s current file, reusing the cached stream only when it was
+    /// loaded from that same path.
+    ///
+    /// A changed path always misses the cache (even if [`AudioState::set_track`] did not clear
+    /// it), so `PlayMusic` can never replay a stream belonging to a previous file. Load failures
+    /// are remembered per path: a path that already failed is not read again until the track's
+    /// file changes.
     fn ensure_stream(&mut self, track: usize) -> Option<StreamId> {
-        if let Some(Some(id)) = self.stream_cache.get(track).copied() {
-            return Some(id);
+        let path = self.tracks.get(track)?.file.clone()?;
+        if let Some(Some(cached)) = self.stream_cache.get(track)
+            && cached.path == path
+        {
+            return Some(cached.id);
         }
-        if self.stream_failed.get(track).copied().unwrap_or(true) {
+        if self
+            .stream_failed
+            .get(track)
+            .is_some_and(|failed| failed.as_deref() == Some(path.as_str()))
+        {
             return None;
         }
-        let path = self.tracks.get(track)?.file.clone()?;
         let source = self.source.clone()?;
         let bytes = match source.read(&path) {
             Ok(bytes) => bytes,
             Err(_) => {
-                self.stream_failed[track] = true;
+                self.stream_failed[track] = Some(path);
                 return None;
             }
         };
         match self.mixer.load_stream(bytes) {
             Ok(id) => {
-                self.stream_cache[track] = Some(id);
+                self.stream_cache[track] = Some(CachedStream { path, id });
                 Some(id)
             }
             Err(_) => {
-                self.stream_failed[track] = true;
+                self.stream_failed[track] = Some(path);
                 None
             }
         }
@@ -540,6 +617,31 @@ mod tests {
             Arc::clone(&source) as Arc<dyn DataSource>,
             &game,
             &stage,
+            &AudioSettings::default(),
+        );
+        (state, source)
+    }
+
+    /// Two distinct valid Ogg Vorbis tracks, shared with the `retro-audio` fixtures.
+    const TONE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../retro-audio/tests/fixtures/tone.ogg"
+    ));
+    const TONE_MONO: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../retro-audio/tests/fixtures/tone_mono.ogg"
+    ));
+
+    /// An audio state with two music files at `Data/Music/{a,b}.ogg` for swap tests.
+    fn state_with_music() -> (AudioState, Arc<MemorySource>) {
+        let mut source = MemorySource::new();
+        source.insert("Data/Music/a.ogg", TONE.to_vec());
+        source.insert("Data/Music/b.ogg", TONE_MONO.to_vec());
+        let source = Arc::new(source);
+        let state = AudioState::for_scene(
+            Arc::clone(&source) as Arc<dyn DataSource>,
+            &game_config(Vec::new()),
+            &stage_config(Vec::new()),
             &AudioSettings::default(),
         );
         (state, source)
@@ -651,8 +753,11 @@ mod tests {
         state.set_track(0, "Theme.ogg", true, 100);
         assert!(state.stream_cache[0].is_none());
         state.play_music(0);
-        // The asset is missing, so the slot is marked failed and nothing plays.
-        assert!(state.stream_failed[0]);
+        // The asset is missing, so the slot's current path is marked failed and nothing plays.
+        assert_eq!(
+            state.stream_failed[0].as_deref(),
+            Some("Data/Music/Theme.ogg")
+        );
         assert!(!state.mixer.stream_playing());
 
         state.set_track(1, "", false, 0);
@@ -666,6 +771,113 @@ mod tests {
 
         state.swap_music_track(2, "", 0);
         assert!(!state.mixer.stream_playing());
+    }
+
+    #[test]
+    fn changing_a_tracks_file_loads_and_mixes_the_new_stream() {
+        // Repro of the review finding: playing a.ogg, then setting b.ogg and playing again must
+        // mix b.ogg, not the cached a.ogg stream.
+        let (mut swapped, _) = state_with_music();
+        swapped.set_track(0, "a.ogg", false, 0);
+        assert!(swapped.play_music(0), "a.ogg loads");
+        let a_first = swapped.tick();
+
+        swapped.set_track(0, "b.ogg", false, 0);
+        assert!(swapped.play_music(0), "b.ogg loads after the swap");
+        let swapped_first = swapped.tick();
+
+        let (mut fresh_a, _) = state_with_music();
+        fresh_a.set_track(0, "a.ogg", false, 0);
+        assert!(fresh_a.play_music(0));
+        let (mut fresh_b, _) = state_with_music();
+        fresh_b.set_track(0, "b.ogg", false, 0);
+        assert!(fresh_b.play_music(0));
+
+        assert_eq!(
+            swapped_first,
+            fresh_b.tick(),
+            "the swapped state must mix b.ogg exactly"
+        );
+        assert_ne!(
+            swapped_first,
+            fresh_a.tick(),
+            "the old a.ogg stream must not be replayed"
+        );
+        assert_ne!(swapped_first, a_first, "b.ogg differs from a.ogg");
+        for frame in 1..4 {
+            assert_eq!(swapped.tick(), fresh_b.tick(), "frame {frame}");
+        }
+    }
+
+    #[test]
+    fn replaying_the_same_track_reuses_the_cached_stream_and_restarts_it() {
+        let (mut state, _) = state_with_music();
+        state.set_track(0, "a.ogg", true, 0);
+        assert!(state.play_music(0));
+        let first_tick = state.tick();
+        for _ in 0..3 {
+            state.tick();
+        }
+        assert_ne!(state.music_position(), 0, "playback advanced");
+
+        assert!(state.play_music(0), "the same file plays again");
+        assert_eq!(
+            state.mixer.stream_count(),
+            1,
+            "the cached stream is reused, not loaded twice"
+        );
+        assert_eq!(state.music_position(), 0, "PlayMusic restarts at frame 0");
+        assert_eq!(
+            state.tick(),
+            first_tick,
+            "the restart is byte-identical to the first play"
+        );
+    }
+
+    #[test]
+    fn changing_the_file_drops_the_stale_cache_and_failure_state() {
+        let (mut state, _) = state_with_music();
+        state.set_track(0, "a.ogg", true, 0);
+        assert!(state.play_music(0));
+        let first_id = state.stream_cache[0].as_ref().map(|cached| cached.id);
+        assert_eq!(
+            state.stream_cache[0]
+                .as_ref()
+                .map(|cached| cached.path.as_str()),
+            Some("Data/Music/a.ogg")
+        );
+
+        state.set_track(0, "b.ogg", true, 0);
+        assert!(
+            state.stream_cache[0].is_none(),
+            "the cached stream belongs to the old file"
+        );
+        assert!(state.stream_failed[0].is_none());
+        assert!(state.play_music(0));
+        let second_id = state.stream_cache[0].as_ref().map(|cached| cached.id);
+        assert_ne!(first_id, second_id, "the new file loaded a new stream");
+
+        // Setting the same path again keeps the cache; only the loop metadata changes.
+        state.set_track(0, "b.ogg", false, 42);
+        assert_eq!(
+            state.stream_cache[0].as_ref().map(|cached| cached.id),
+            second_id,
+            "an unchanged path keeps its cached stream"
+        );
+
+        // A failed path is remembered, and switching to a new path retries.
+        state.set_track(1, "missing.ogg", true, 0);
+        assert!(!state.play_music(1));
+        assert_eq!(
+            state.stream_failed[1].as_deref(),
+            Some("Data/Music/missing.ogg")
+        );
+        state.set_track(1, "a.ogg", true, 0);
+        assert!(
+            state.stream_failed[1].is_none(),
+            "the failure belonged to the old path"
+        );
+        assert!(state.play_music(1), "a new path must be attempted");
     }
 
     #[test]
@@ -974,6 +1186,16 @@ mod tests {
             attached.captured_pcm(),
             "the device receives the hashed samples unchanged"
         );
+        // This probe drains at one third of real time, so the engine must have resynced rather
+        // than silently skipping: the gap is counted and reported.
+        let counters = attached.audio_counters().expect("device attached");
+        assert!(counters.resyncs > 0, "a slow device must resync");
+        assert!(
+            counters.dropped_frames > 0,
+            "resyncs must count the frames they trimmed"
+        );
+        let report = attached.audio_diagnostics().expect("device attached");
+        assert!(report.contains("dropped "), "{report}");
     }
 
     #[test]

@@ -252,7 +252,81 @@ fn windowed_frames_run_exits_promptly() {
     assert!(text.contains("presented-frames: 5"), "{text}");
     assert!(text.contains("hash: "), "{text}");
     assert!(text.contains("audio: 44100 Hz stereo f32"), "{text}");
+    assert!(
+        text.contains("audio: submitted ") && text.contains("underrun(s)"),
+        "windowed runs must report audio flow-control diagnostics: {text}"
+    );
     assert!(text.contains("video: dummy"), "{text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A headless run with no explicit frame cap must not stop on a hidden 600-frame default: it
+/// keeps running past 600 frames and exits cleanly on SIGTERM, printing the normal summary.
+#[cfg(unix)]
+#[test]
+fn headless_unbounded_run_exits_cleanly_on_signal() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let root = temp_assets("headless-unbounded");
+    write_assets(&root);
+
+    for frames_args in [Vec::<&str>::new(), vec!["--frames", "0"]] {
+        let mut child = Command::new(bin())
+            .arg(&root)
+            .arg("--headless")
+            .arg("--mute")
+            .args(&frames_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn retroengine");
+
+        // The synthetic asset load is near-instant, so the run is still going after this sleep.
+        std::thread::sleep(Duration::from_secs(2));
+        let killed = Command::new("kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .status()
+            .expect("send SIGTERM");
+        assert!(killed.success(), "kill -TERM failed");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if child.try_wait().expect("try_wait").is_some() {
+                break;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("headless run did not exit after SIGTERM (args: {frames_args:?})");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let output = child.wait_with_output().expect("wait_with_output");
+        let text = stdout(&output);
+        assert!(
+            output.status.success(),
+            "{frames_args:?}: {}",
+            stderr(&output)
+        );
+        assert!(
+            text.contains("frames: until quit (Ctrl-C/SIGTERM)"),
+            "{text}"
+        );
+        assert!(text.contains("quit: signal"), "{text}");
+        assert!(text.contains("hash: "), "{text}");
+        let executed: u64 = text
+            .lines()
+            .find_map(|line| line.strip_prefix("executed-frames: "))
+            .and_then(|value| value.trim().parse().ok())
+            .expect("summary must report executed-frames");
+        assert!(
+            executed > 600,
+            "headless default must not stop at 600 frames (ran {executed})"
+        );
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -375,6 +449,88 @@ fn origins_flag_selects_the_script_platform() {
         stdout(&origins).contains("platform: origins"),
         "{}",
         stdout(&origins)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The `--input` replay's `seed` header seeds the run when `--seed` is omitted; an explicit
+/// `--seed` overrides it and a missing header (or no input) keeps the built-in default.
+#[test]
+fn replay_seed_header_is_used_unless_seed_flag_overrides_it() {
+    let root = temp_assets("replay-seed");
+    write_assets(&root);
+    let replay = root.join("input.txt");
+    std::fs::write(
+        &replay,
+        "retro-input 1\n\
+         seed 12345\n\
+         0 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n",
+    )
+    .unwrap();
+
+    let input_args = [
+        root.to_str().unwrap(),
+        "--headless",
+        "--frames",
+        "1",
+        "--mute",
+        "--input",
+        replay.to_str().unwrap(),
+    ];
+    let header = run(&input_args);
+    assert!(header.status.success(), "{}", stderr(&header));
+    assert!(
+        stdout(&header).contains("seed: 12345"),
+        "{}",
+        stdout(&header)
+    );
+
+    let with_override = run(&[
+        root.to_str().unwrap(),
+        "--headless",
+        "--frames",
+        "1",
+        "--mute",
+        "--input",
+        replay.to_str().unwrap(),
+        "--seed",
+        "7",
+    ]);
+    assert!(with_override.status.success(), "{}", stderr(&with_override));
+    assert!(
+        stdout(&with_override).contains("seed: 7"),
+        "{}",
+        stdout(&with_override)
+    );
+
+    // A replay without a seed header leaves the built-in default in place.
+    std::fs::write(
+        &replay,
+        "retro-input 1\n\
+         0 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n",
+    )
+    .unwrap();
+    let headerless = run(&input_args);
+    assert!(headerless.status.success(), "{}", stderr(&headerless));
+    assert!(
+        stdout(&headerless).contains(&format!("seed: {}", retro_engine::rng::DEFAULT_SEED)),
+        "{}",
+        stdout(&headerless)
+    );
+
+    // No `--input` at all keeps the same default.
+    let no_input = run(&[
+        root.to_str().unwrap(),
+        "--headless",
+        "--frames",
+        "1",
+        "--mute",
+    ]);
+    assert!(no_input.status.success(), "{}", stderr(&no_input));
+    assert!(
+        stdout(&no_input).contains(&format!("seed: {}", retro_engine::rng::DEFAULT_SEED)),
+        "{}",
+        stdout(&no_input)
     );
     let _ = std::fs::remove_dir_all(&root);
 }

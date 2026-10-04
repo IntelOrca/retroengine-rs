@@ -6,6 +6,7 @@ pub mod error;
 pub mod headless;
 #[cfg(feature = "sdl3")]
 pub mod sdl3;
+pub mod signals;
 pub mod storage;
 
 pub use error::PlatformError;
@@ -228,7 +229,8 @@ pub trait AudioDevice {
     ///
     /// Implementations must return promptly instead of spinning or waiting for queue space:
     /// when the queue is full they should accept what fits (possibly nothing) and let the
-    /// caller drop the rest.
+    /// caller decide what to do with the rest (`retro_audio::AudioEngine` retains unaccepted
+    /// frames in a bounded backlog in prebuffered mode, and drops them in immediate mode).
     fn submit(&mut self, frames: &[f32]) -> Result<usize, PlatformError>;
     /// Frames currently queued for playback.
     fn queued_frames(&self) -> usize;

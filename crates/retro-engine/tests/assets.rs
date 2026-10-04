@@ -289,6 +289,80 @@ const S2_ZONE01_RIGHT400: &[(u64, &str)] = &[
     ),
 ];
 
+/// Pinned `fb.blake3` values for `zone01_pause.input` (START held from line 200). The Player
+/// object's pause path writes `engine.state = 5` (`ENGINE_INITPAUSE`); upstream's
+/// `Legacy::v4::ProcessEngine` resets the mode and skips that frame entirely, so the ring
+/// animation advances one frame later than a naive normal-stage pass would. The pins bracket the
+/// skipped frame (201) and the first frame after it.
+const S1_ZONE01_PAUSE: &[(u64, &str)] = &[
+    (
+        199,
+        "ef6c6a3fc1e658c5b39b613a96e2cf3f76eb26ad01e7e14808b45b0f5d37b4a8",
+    ),
+    (
+        200,
+        "75ca993239d1846c99ab64575ced2f2660d08844de611ef7603223a5ea4e64a2",
+    ),
+    (
+        201,
+        "75ca993239d1846c99ab64575ced2f2660d08844de611ef7603223a5ea4e64a2",
+    ),
+    (
+        202,
+        "17589b2e8ea1dd431a14fd96d3d507a7e230ea19ac5c6d973a33a0c30e9cb922",
+    ),
+    (
+        203,
+        "1e88e6f8c55cd0e15ebf70ec7e0deba3d5ba25017d35c536283fa3a842e59a10",
+    ),
+    (
+        204,
+        "348a3fdf922a0aebd5ff1d87b62d2860ccdb0cf5b9f3ae63762808594c39eab4",
+    ),
+    (
+        205,
+        "ddb215c828cf362a6f432fc556da664e6bf5b3b17e9d1f382eb28d80ba14652f",
+    ),
+    (
+        250,
+        "28762717777d553b6485d86152523650a54dc632f68154e41b99daeb898aadac",
+    ),
+];
+const S2_ZONE01_PAUSE: &[(u64, &str)] = &[
+    (
+        199,
+        "bd448c9e3a9d4aebe9438461ef1ceb3824dc7cc1fddc43d6088d3a27c3c94403",
+    ),
+    (
+        200,
+        "bd448c9e3a9d4aebe9438461ef1ceb3824dc7cc1fddc43d6088d3a27c3c94403",
+    ),
+    (
+        201,
+        "bd448c9e3a9d4aebe9438461ef1ceb3824dc7cc1fddc43d6088d3a27c3c94403",
+    ),
+    (
+        202,
+        "bd448c9e3a9d4aebe9438461ef1ceb3824dc7cc1fddc43d6088d3a27c3c94403",
+    ),
+    (
+        203,
+        "bd448c9e3a9d4aebe9438461ef1ceb3824dc7cc1fddc43d6088d3a27c3c94403",
+    ),
+    (
+        204,
+        "45a45e8a77d904addb8547b06d124340cf7228075ed1506e3e4d7af4747f4b05",
+    ),
+    (
+        205,
+        "45a45e8a77d904addb8547b06d124340cf7228075ed1506e3e4d7af4747f4b05",
+    ),
+    (
+        250,
+        "191f16026cf57e7b50ee995578caa8ecca26fb6c5137ba8108cf4c91cf6d546a",
+    ),
+];
+
 /// Pinned `fb.blake3` values for `title_start.input` (Title screen, A held from line 800). The
 /// pins bracket the START press (800/801), the Zone01 load, and the scripted-press frame the
 /// reference synthesizes from the held A once control unlocks (1010/1028) — the last one only
@@ -426,6 +500,17 @@ fn zone01_right_framebuffer_matches_reference() {
 fn zone01_right400_framebuffer_matches_reference() {
     for (game, pins) in [("S1", S1_ZONE01_RIGHT400), ("S2", S2_ZONE01_RIGHT400)] {
         check_scripted_pins(game, "Zone01", "zone01_right400.input", pins);
+    }
+}
+
+/// The scripted pause (`engine.state = 5`, `ENGINE_INITPAUSE`) makes upstream skip exactly one
+/// stage frame before resetting the mode; the port used to ignore the write and process the frame
+/// normally, shifting the shared ring animation by one frame.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn zone01_pause_framebuffer_matches_reference() {
+    for (game, pins) in [("S1", S1_ZONE01_PAUSE), ("S2", S2_ZONE01_PAUSE)] {
+        check_scripted_pins(game, "Zone01", "zone01_pause.input", pins);
     }
 }
 

@@ -44,7 +44,7 @@ pub(crate) fn decode_vorbis(bytes: &[u8]) -> Result<DecodedAudio, AudioError> {
     })
 }
 
-fn map_error(error: lewton::VorbisError) -> AudioError {
+pub(crate) fn map_error(error: lewton::VorbisError) -> AudioError {
     AudioError::Decode(error.to_string())
 }
 
