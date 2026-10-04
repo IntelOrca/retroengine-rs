@@ -10,13 +10,13 @@ index 0360e1d..34cb955 100644
 +//                             full vertex/face buffer digests; off by default)
  //
  // The JSONL record format is documented in tools/ref-harness/README.md.
- 
+
 @@ -76,6 +78,7 @@ static bool recordInput  = false;
  static bool inputTrace   = false;
  static bool recordScreens   = false;
  static bool recordTextMenus = false;
 +static bool recordScene3D   = false;
- 
+
  static bool equalsIgnoreCase(const std::string &a, const char *b)
  {
 @@ -284,13 +287,16 @@ bool Init()
@@ -24,7 +24,7 @@ index 0360e1d..34cb955 100644
      const char *screensEnv     = getenv("REF_HARNESS_SCREENS");
      const char *textMenusEnv   = getenv("REF_HARNESS_TEXT_MENUS");
 +    const char *scene3dEnv     = getenv("REF_HARNESS_SCENE3D");
- 
+
      entityValues    = entValuesEnv && *entValuesEnv && *entValuesEnv != '0';
      recordInput     = recordInputEnv && *recordInputEnv && *recordInputEnv != '0';
      inputTrace      = inputTraceEnv && *inputTraceEnv && *inputTraceEnv != '0';
@@ -36,11 +36,11 @@ index 0360e1d..34cb955 100644
 +             || scene3dEnv;
      if (!active)
          return false;
- 
+
 @@ -510,6 +516,70 @@ static void writeTextMenus(FILE *file)
      fputc(']', file);
  }
- 
+
 +// The buffer digests below reinterpret the structs as i32 arrays, so the layouts must stay
 +// tightly packed (integer fields only, no padding).
 +static_assert(sizeof(Legacy::Vertex) == 5 * sizeof(int32), "Vertex layout changed");
@@ -116,5 +116,5 @@ index 0360e1d..34cb955 100644
 +        if (recordScene3D)
 +            writeScene3D(file);
      }
- 
+
      if (recordTextMenus)

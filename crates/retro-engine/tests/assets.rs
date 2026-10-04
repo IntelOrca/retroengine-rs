@@ -1397,10 +1397,9 @@ fn s2_special_act1_runs_past_the_text_message_divide_by_zero() {
     );
 }
 
-/// M9 WP1 wiring: `Special`'s `Halfpipe` startup builds the persistent tube mesh
+/// M9 wiring: `Special`'s `Halfpipe` startup builds the persistent tube mesh
 /// (`vertexCount = 1400`, `faceCount = 740`) and sets the projection/fog scalars. After 600
-/// idle frames every matrix/transform op must be ported; `Draw3DScene` stays the only 3D stub
-/// until M9b owns the rasterizer.
+/// idle frames every matrix/transform op and `Draw3DScene` must be ported with no 3D stubs left.
 #[test]
 #[ignore = "requires assets; M9 WP1 scene3D wiring"]
 fn s2_special_act1_scene3d_wiring() {

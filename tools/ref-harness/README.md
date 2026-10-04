@@ -416,3 +416,10 @@ digests cover the full buffers, so a divergence localizes to the matrices (`matW
   `crates/retro-parity` gains a JSONL emitter matching this format, `diff_records.py` will work
   C↔Rust unchanged: scripted input is now indexed by absolute tick, so record `N` consumes line
   `N` and `--offset 0` aligns the streams.
+* The M9 rasterizer intentionally diverges from upstream where upstream reads out of bounds:
+  texture samples outside the sheet return index 0 (transparent) instead of reading the shared
+  `graphicData` pool (`retro-render/src/faces.rs:14`), and out-of-range `vertexCount`/
+  `faceCount`/vertex/face indices are skipped instead of corrupting memory
+  (`retro-render/src/scene3d.rs`, `retro-engine/src/draw3d.rs`). Neither produced a divergence in
+  the S2 `Special` act 1-8 600-frame windows (8 x 600 frames framebuffer-identical); the
+  out-of-sheet path is not instrumented, so "never sampled" is not proven.

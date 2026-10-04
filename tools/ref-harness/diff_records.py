@@ -150,12 +150,11 @@ def compare_frame(
         print(f"frame {index_a} (B frame {index_b}): {field}: A={value_a!r} B={value_b!r}")
         return True
 
-    if "scene3D" in a and "scene3D" in b:
-        found = first_diff(a.get("scene3D"), b.get("scene3D"), "scene3D")
-        if found:
-            field, value_a, value_b = found
-            print(f"frame {index_a} (B frame {index_b}): {field}: A={value_a!r} B={value_b!r}")
-            return True
+    found = first_diff(a.get("scene3D"), b.get("scene3D"), "scene3D")
+    if found:
+        field, value_a, value_b = found
+        print(f"frame {index_a} (B frame {index_b}): {field}: A={value_a!r} B={value_b!r}")
+        return True
 
     return compare_entities(index_a, a, b, max_entities, report_all)
 

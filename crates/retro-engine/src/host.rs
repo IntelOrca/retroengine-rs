@@ -517,8 +517,9 @@ impl EngineHost<'_> {
     }
 
     /// `scene3D.*` reads (ids 218..=234). The scalars read directly; the `vertexBuffer` /
-    /// `faceBuffer` fields bound-check `array_index` (`0..0x1000` / `0..0x400`) and return 0 for
-    /// out-of-range indices (`ScriptLegacyv4.cpp:3844-3861`).
+    /// `faceBuffer` fields are indexed at `ScriptLegacyv4.cpp:3850-3860`, where upstream does no
+    /// bounds check. The port deliberately bound-checks `array_index` (`0..0x1000` / `0..0x400`)
+    /// and returns 0 for out-of-range indices instead of reading out of bounds.
     fn read_scene3d_var(&self, var: i32, array_index: i32) -> i32 {
         let scene3d = &self.state.scene3d;
         match var {
@@ -563,8 +564,10 @@ impl EngineHost<'_> {
         }
     }
 
-    /// `scene3D.*` writes (ids 218..=234). Out-of-range `array_index` values are ignored
-    /// (`ScriptLegacyv4.cpp:5977-5994`); `faceBuffer[].color` stores the operand bit pattern.
+    /// `scene3D.*` writes (ids 218..=234). Upstream indexes `vertexBuffer`/`faceBuffer` without a
+    /// bounds check (`ScriptLegacyv4.cpp:5983-5993`); the port deliberately ignores out-of-range
+    /// `array_index` values instead of writing out of bounds. `faceBuffer[].color` stores the
+    /// operand bit pattern.
     fn write_scene3d_var(&mut self, var: i32, array_index: i32, value: i32) {
         let scene3d = &mut self.state.scene3d;
         match var {
