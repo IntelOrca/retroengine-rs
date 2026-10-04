@@ -542,6 +542,80 @@ const S2_TITLE_START: &[(u64, &str)] = &[
     ),
 ];
 
+/// Pinned `fb.blake3` values from `tools/ref-harness/run.sh --game S1 --scene LSelect --act 1
+/// --frames 600` (idle input). The level-select `MenuControl` object sets up both text menus,
+/// right-aligns them (`alignment = 1`), draws 20+19 rows and highlights `selection1` with the
+/// `+128` font rows. The pins cover the initial draw (0), the first drawn frame (6, when the
+/// back-scan clears `selection2`), the settled menu (21) and the column scroll phase.
+const S1_LSELECT_ACT1_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        1,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        6,
+        "26cbbb3bcf6d68ffd1809948ff34e295357a467bdfab3264e33a24fbd02fa4eb",
+    ),
+    (
+        21,
+        "129bd878c03d9c295f920416949a59d57576da5c4fea5eff5be8067ba6b02d42",
+    ),
+    (
+        251,
+        "2c6640017aa12aa0f5092acb6e25c7e9b7f25f1585bdc825b152bb742a5abc97",
+    ),
+    (
+        256,
+        "e46cb4d0567548b04c7a11d22322f1c042c1f9d5506e1862921be73037727505",
+    ),
+    (
+        262,
+        "816ab15bdc3606a2b3b6bae0038592f7d090598468aad942b93dd09f38d88705",
+    ),
+    (
+        599,
+        "129bd878c03d9c295f920416949a59d57576da5c4fea5eff5be8067ba6b02d42",
+    ),
+];
+const S2_LSELECT_ACT1_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        1,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        6,
+        "f236e5f364ab5b984e8f561428c0ad621d0ee09249b1bc17b0a86c33e7dae598",
+    ),
+    (
+        21,
+        "5fcbd9dbe431d6033343857ba737623357e00cf344108aca3fea5e3f11c00b88",
+    ),
+    (
+        251,
+        "175bdab39b08bacae2dbbd695ca96773fc02833ccf3394f981fdd34f75e73e03",
+    ),
+    (
+        256,
+        "276bf8beae03c64512e48913e89e63aa8b60d2cbbc3cb5c57ef3f7779a03eb55",
+    ),
+    (
+        262,
+        "6261d2dff3d77207a6b16eaf82b1bece7bad83665a1cedc8870163251de1926f",
+    ),
+    (
+        599,
+        "5fcbd9dbe431d6033343857ba737623357e00cf344108aca3fea5e3f11c00b88",
+    ),
+];
+
 #[test]
 #[ignore = "requires assets; pins reference-harness framebuffer hashes"]
 fn zone01_idle_framebuffer_matches_reference() {
@@ -695,6 +769,73 @@ fn title_start_framebuffer_matches_reference() {
     for (game, pins) in [("S1", S1_TITLE_START), ("S2", S2_TITLE_START)] {
         check_scripted_pins(game, "Title", "title_start.input", pins);
     }
+}
+
+/// Ports `SetupTextMenu`/`AddTextMenuEntry`/`DrawTextMenu`; the level-select cursor, row
+/// highlights, right alignment and `DrawTextMenu`'s selection handling all feed the framebuffer.
+/// Also proves the op arms report through `record_op` rather than the stub histogram.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn lselect_act1_menus_framebuffer_matches_reference() {
+    for (game, pins) in [("S1", S1_LSELECT_ACT1_IDLE), ("S2", S2_LSELECT_ACT1_IDLE)] {
+        let mut engine = Engine::load(source(game), Some("LSelect"), Some("1"), DEFAULT_SEED)
+            .expect("engine load");
+        let mut frame = 0u64;
+        for &(target, expected) in pins {
+            while frame < target {
+                engine.run_frame().expect("frame");
+                frame += 1;
+            }
+            assert_eq!(
+                framebuffer_hash(&engine),
+                expected,
+                "{game}/LSelect Act1 idle frame {target} must match the reference harness"
+            );
+        }
+        for op in ["SetupMenu", "AddMenuEntry", "DrawMenu"] {
+            assert!(
+                engine.op_histogram().contains_key(op),
+                "{game}/LSelect must record {op}"
+            );
+            assert!(
+                !engine.stub_histogram().contains_key(op),
+                "{game}/LSelect must not stub {op}"
+            );
+        }
+    }
+}
+
+/// `TextMessage`'s startup fills `MENU_1` through `SetupMenu`/`AddMenuEntry`; before M8 WP2 the
+/// menu was empty, so `TextMessage_SetupTextChars` divided by a zero
+/// `GetTextInfo(MENU_1, TEXTINFO_TEXTSIZE, ...)` at frame 321. 3D rendering is still stubbed
+/// (M9 owns the framebuffer pin), so this is a completion regression.
+#[test]
+#[ignore = "requires assets; flow guard until the M9 3D render pass is ported"]
+fn s2_special_act1_runs_past_the_text_message_divide_by_zero() {
+    let mut engine = Engine::load(source("S2"), Some("Special"), Some("1"), DEFAULT_SEED)
+        .expect("S2/Special must load");
+    let outcome = engine
+        .run_frames(600, false)
+        .expect("S2/Special Act1 must run 600 frames without HostError");
+    assert_eq!(outcome.frames, 600);
+    assert_eq!(
+        engine.op_histogram().get("SetupMenu"),
+        Some(&1),
+        "TextMessage's startup must set up MENU_1"
+    );
+    assert!(
+        engine
+            .op_histogram()
+            .get("AddMenuEntry")
+            .copied()
+            .unwrap_or(0)
+            >= 15,
+        "all 15 message rows must be added"
+    );
+    assert_eq!(
+        engine.state.text_menus[0].row_count, 15,
+        "MENU_1 holds the 15 special-stage messages"
+    );
 }
 
 /// Prints a combined summary of the four required scenes.
