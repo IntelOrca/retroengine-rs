@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audio;
+pub mod camera;
 pub mod cli;
 pub mod error;
 pub mod host;
