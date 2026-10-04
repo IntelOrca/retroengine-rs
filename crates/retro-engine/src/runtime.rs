@@ -341,6 +341,11 @@ impl Engine {
     /// the port of that handoff. `stage.activeList`/`stage.listPos` select the GameConfig entry.
     fn apply_deferred_load(&mut self) -> Result<(), EngineError> {
         self.state.load_stage_requested = false;
+        // `STAGEMODE_LOAD` clears both text menus' scroll offset before `LoadStageFiles`
+        // (`SceneLegacyv4.cpp:40-41`).
+        for menu in &mut self.state.text_menus {
+            menu.visible_row_offset = 0;
+        }
         let (folder, act, list_size) = {
             let (entry, size) = loader::stage_list_entry(
                 &self.state.game_config,
@@ -456,6 +461,13 @@ impl Engine {
         state.frame = self.state.frame;
         state.menu1_selection = self.state.menu1_selection;
         state.menu2_selection = self.state.menu2_selection;
+        // `gameMenu` is a global that survives `LoadStageFiles`; carry the script-visible
+        // selections into the rebuilt menus.
+        for (index, selection) in [(0, state.menu1_selection), (1, state.menu2_selection)] {
+            if let Some(menu) = state.text_menus.get_mut(index) {
+                menu.selection1 = selection;
+            }
+        }
         state.op_histogram = std::mem::take(&mut self.state.op_histogram);
         state.stub_histogram = std::mem::take(&mut self.state.stub_histogram);
         // `activeStageList`/`stageListPosition` are script globals upstream and survive the load.
