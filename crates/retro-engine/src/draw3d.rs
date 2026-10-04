@@ -118,6 +118,7 @@ fn centered_quad(scene: &Scene3DState, face: &Face) -> Option<[Vertex; 4]> {
     }
     let extent = vertex(scene, face.b)?;
     let center_uv = vertex(scene, face.a)?;
+    let uv_extent = vertex(scene, face.c)?;
     let z = center_point.z;
     let x_minus = SCREEN_CENTER_X.wrapping_add(
         scene
@@ -143,10 +144,10 @@ fn centered_quad(scene: &Scene3DState, face: &Face) -> Option<[Vertex; 4]> {
             .wrapping_mul(center_point.y.wrapping_sub(extent.v))
             / z,
     );
-    let u_minus = center_uv.u.wrapping_sub(extent.u);
-    let u_plus = center_uv.u.wrapping_add(extent.u);
-    let v_minus = center_uv.v.wrapping_sub(extent.v);
-    let v_plus = center_uv.v.wrapping_add(extent.v);
+    let u_minus = center_uv.u.wrapping_sub(uv_extent.u);
+    let u_plus = center_uv.u.wrapping_add(uv_extent.u);
+    let v_minus = center_uv.v.wrapping_sub(uv_extent.v);
+    let v_plus = center_uv.v.wrapping_add(uv_extent.v);
     Some([
         Vertex {
             x: x_minus,
@@ -339,5 +340,52 @@ impl EngineState {
             .ok()
             .and_then(|type_id| self.objects.get(type_id))
             .map_or(0, |entry| entry.sprite_sheet_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vertex(x: i32, y: i32, u: i32, v: i32) -> Vertex {
+        Vertex {
+            x,
+            y,
+            u,
+            v,
+            ..Vertex::default()
+        }
+    }
+
+    /// `TEXTURED_C` uses `vertexBuffer[b]` for the world-space extent but `vertexBuffer[c]` for
+    /// the UV extent (`Scene3DLegacyv4.cpp:413-465`); mixing them up garbles the sampled sheet.
+    #[test]
+    fn centered_quad_uses_b_for_world_extent_and_c_for_uvs() {
+        let mut scene = Scene3DState::new();
+        scene.projection_x = 216;
+        scene.projection_y = 216;
+        scene.vertex_buffer_t[0] = vertex(0x1000, 0x2000, 0, 0);
+        scene.vertex_buffer_t[0].z = 0x100;
+        scene.vertex_buffer[0] = vertex(0, 0, 100, 50);
+        scene.vertex_buffer[1] = vertex(0, 0, 0x800, 0x400);
+        scene.vertex_buffer[2] = vertex(0, 0, 8, 4);
+        let face = Face {
+            a: 0,
+            b: 1,
+            c: 2,
+            ..Face::default()
+        };
+
+        let quad = centered_quad(&scene, &face).expect("centered quad");
+        // x/y use b's world extent (0x800/0x400) around T[a] = (0x1000, 0x2000, 0x100).
+        assert_eq!(quad[0].x, 1940);
+        assert_eq!(quad[1].x, 5396);
+        assert_eq!(quad[0].y, -7656);
+        assert_eq!(quad[2].y, -5928);
+        // u/v use c's UV extent (8, 4) around a's UV centre (100, 50).
+        assert_eq!((quad[0].u, quad[0].v), (92, 46));
+        assert_eq!((quad[1].u, quad[1].v), (108, 46));
+        assert_eq!((quad[2].u, quad[2].v), (92, 54));
+        assert_eq!((quad[3].u, quad[3].v), (108, 54));
     }
 }
