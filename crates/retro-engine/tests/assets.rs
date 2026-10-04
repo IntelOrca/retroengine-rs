@@ -542,6 +542,151 @@ const S2_TITLE_START: &[(u64, &str)] = &[
     ),
 ];
 
+/// Pinned `fb.blake3` values from `tools/ref-harness/run.sh --game S1 --boot --frames 1600`
+/// (idle input). `--boot` starts with no `stage=`/`scene=` argument, so the real `GameConfig`
+/// list is used with `Title` at list position 0. The idle attract demo expires and the engine
+/// `LoadStage`s `Zone01` (flat list position 6) on the `STAGEMODE_LOAD` tick at frame 1049;
+/// frames 1048/1049 are blank load ticks and 1088 is the first drawn title-card frame.
+const S1_BOOT_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        59,
+        "abcfd1e06c5bd7703a8d0d2c5b6fba0c07e3344be1aeaae573fbfa761b6106f3",
+    ),
+    (
+        600,
+        "8adbfbf024411853d5f55d951802f99dc08699fda78636c33528f2c14973c2b5",
+    ),
+    (
+        900,
+        "156d3aee7f24a6a902436e8356f4a3503999f29dedb25807aeeee9d348e581d8",
+    ),
+    (
+        1048,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        1049,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        1088,
+        "b1ba7eb993931deeee16a397137fff1e66ae215ad7d73bf8d10df8bf99db7405",
+    ),
+    (
+        1100,
+        "d41a0ba386feccb4d5c86bc47cd1e5daedbf2b88ee18b1d235ff809afcfe2923",
+    ),
+    (
+        1500,
+        "d8692a82710f10577d3a4bfde55ff79e1605735b172ddc1958ad0b0e058cb52f",
+    ),
+    (
+        1599,
+        "f69be45a040048f841e49fb14d64227478cec862bc8ec41ace67873f048b1e5f",
+    ),
+];
+
+/// Pinned `fb.blake3` values from `tools/ref-harness/run.sh --game S1 --scene Continue --act 1
+/// --frames 1200` (idle input). The countdown expires with no input: `ContinueScreen` reaches
+/// `CONTINUESETUP_FADETOMENU`, fades to black, and `ContinueSetup` writes `engine.state = 8`
+/// (`ENGINE_RESETGAME`) on frame 806. The reset tick keeps the black framebuffer (805-807) and
+/// the engine re-enters the first `GameConfig` entry (`Title`, list position 0) on the
+/// `STAGEMODE_LOAD` tick at 807; the Title screen starts drawing at 818.
+const S1_CONTINUE_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        320,
+        "12fb9c27bbdf93e762f8ea9aad3573f4772ca414cc1304360c83f39b91fe23d1",
+    ),
+    (
+        599,
+        "185bf124b602857645f274754e6f7162886fcf743c101ccec3dda08c1e9833f8",
+    ),
+    (
+        805,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        806,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        807,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        818,
+        "6a5cdea50a08d8995db4db69d5246516241c136e6d363c173860a7763173a93c",
+    ),
+    (
+        850,
+        "637666f70f29a0de6936769d668cfea383ede7870745cbb82ba845b6ae85d8bf",
+    ),
+    (
+        900,
+        "a29d1c259e1606bc5bbd5c5cf51940728ff7079f60d17d65dbfbaca5ce976029",
+    ),
+    (
+        1199,
+        "a56d468a842f8cda4fb6c2bcbdff51b10356a65e494127462caa3ddd8676ef0f",
+    ),
+];
+
+/// Pinned `fb.blake3` values from `tools/ref-harness/run.sh --game S1 --scene Credits --act 1
+/// --frames 1200` (idle input). `CreditsControl` walks the demo stages: `Zone01` (flat list
+/// position 6) loads at 211, the `Credits` stage returns at 831 (`Presentation` position 2)
+/// and `Zone02` Act 2 (flat list position 10) loads at 1043. The blank frames around each
+/// load pin the `STAGEMODE_LOAD` ticks; 215/843 are the first drawn frames after a load.
+const S1_CREDITS_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        210,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        211,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        215,
+        "c169c5cd18806a2bf7b0d764d0b0c6cc61b4a28702e441d55869ef1a61e52a7c",
+    ),
+    (
+        600,
+        "2a1e533c46850df37333852eb4aa001ac18ddb9fc2a77948c77143fb8748f2b1",
+    ),
+    (
+        830,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        831,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        843,
+        "dbd64f4fc9c0a4f2bd12417aa8f506ee3c9b68da765fa9e8b6140306a5ec4f4e",
+    ),
+    (
+        1043,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        1199,
+        "93df4c0be3a32bbb20821531ba6534b2a818bba73d69b30393ce0c1b40aed45c",
+    ),
+];
+
 /// Pinned `fb.blake3` values from `tools/ref-harness/run.sh --game S1 --scene LSelect --act 1
 /// --frames 600` (idle input). The level-select `MenuControl` object sets up both text menus,
 /// right-aligns them (`alignment = 1`), draws 20+19 rows and highlights `selection1` with the
@@ -852,6 +997,107 @@ fn title_start_framebuffer_matches_reference() {
     }
 }
 
+/// The full boot flow without `--scene`: the real `GameConfig` list with `Title` at position 0.
+/// The idle attract demo must `LoadStage` into `Zone01` (flat reference list position 6) at
+/// frame 1049 and keep drawing the demo through 1599, matching the `--boot` reference window
+/// frame for frame.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn s1_boot_idle_framebuffer_matches_reference() {
+    let mut engine = Engine::load(source("S1"), None, None, DEFAULT_SEED).expect("engine load");
+    assert_eq!(engine.stage_info(), ("Title", "1"), "boot starts on Title");
+    let mut frame = 0u64;
+    for &(target, expected) in S1_BOOT_IDLE {
+        while frame < target {
+            engine.run_frame().expect("frame");
+            frame += 1;
+        }
+        assert_eq!(
+            framebuffer_hash(&engine),
+            expected,
+            "S1 boot idle frame {target} must match the reference harness"
+        );
+    }
+    assert_eq!(
+        engine.stage_info(),
+        ("Zone01", "1"),
+        "the attract demo must end up in Zone01"
+    );
+    assert_eq!(
+        engine.state.stage.active_list, 1,
+        "the attract demo selects the regular category"
+    );
+}
+
+/// The idle `Continue` countdown expiring into `ENGINE_RESETGAME`: the framebuffer pins bracket
+/// the reset tick (806) and the Title reload, and the completion assertions prove the reset
+/// lands on the first `GameConfig` entry rather than replaying `Continue`.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn s1_continue_idle_framebuffer_matches_reference() {
+    let scripted = scripted_input("zone01_idle.input");
+    let seed = scripted.seed().unwrap_or(DEFAULT_SEED);
+    let mut engine =
+        Engine::load(source("S1"), Some("Continue"), Some("1"), seed).expect("engine load");
+    engine.set_scripted_input(scripted);
+    let mut frame = 0u64;
+    for &(target, expected) in S1_CONTINUE_IDLE {
+        while frame < target {
+            engine.run_frame().expect("frame");
+            frame += 1;
+        }
+        assert_eq!(
+            framebuffer_hash(&engine),
+            expected,
+            "S1/Continue idle frame {target} must match the reference harness"
+        );
+    }
+    assert_eq!(
+        engine.stage_info(),
+        ("Title", "1"),
+        "the idle countdown must reset to the first GameConfig entry"
+    );
+    assert_eq!(
+        (engine.state.stage.active_list, engine.state.stage.list_pos),
+        (0, 0),
+        "ENGINE_RESETGAME resets the active list and position"
+    );
+}
+
+/// The credits demo walk: `CreditsControl` loads `Zone01` (211), reloads `Credits` (831) and
+/// starts `Zone02` Act 2 (1043), matching the `--scene Credits` reference window. The final
+/// assertion proves the credits script's `LoadStage` calls reached the regular category.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn s1_credits_idle_framebuffer_matches_reference() {
+    let scripted = scripted_input("zone01_idle.input");
+    let seed = scripted.seed().unwrap_or(DEFAULT_SEED);
+    let mut engine =
+        Engine::load(source("S1"), Some("Credits"), Some("1"), seed).expect("engine load");
+    engine.set_scripted_input(scripted);
+    let mut frame = 0u64;
+    for &(target, expected) in S1_CREDITS_IDLE {
+        while frame < target {
+            engine.run_frame().expect("frame");
+            frame += 1;
+        }
+        assert_eq!(
+            framebuffer_hash(&engine),
+            expected,
+            "S1/Credits idle frame {target} must match the reference harness"
+        );
+    }
+    assert_eq!(
+        engine.stage_info(),
+        ("Zone02", "2"),
+        "the credits demo must walk on to Zone02 Act 2"
+    );
+    assert_eq!(
+        engine.state.stage.active_list, 1,
+        "the credits script selects the regular category"
+    );
+}
+
 /// Ports `SetupTextMenu`/`AddTextMenuEntry`/`DrawTextMenu`; the level-select cursor, row
 /// highlights, right alignment and `DrawTextMenu`'s selection handling all feed the framebuffer.
 /// Also proves the op arms report through `record_op` rather than the stub histogram.
@@ -1009,8 +1255,9 @@ fn s2_br8zone09_act3_600_frames_regression() {
 
 /// S1 `Continue` idle: the scripted countdown expires without input, `ContinueSetup` writes
 /// `engine.state = 8` (`ENGINE_RESETGAME`) on standalone and the engine must reset to the first
-/// GameConfig entry. No reference-harness window exists for this flow yet, so this is a
-/// completion guard rather than a framebuffer pin.
+/// GameConfig entry. `s1_continue_idle_framebuffer_matches_reference` pins the same window
+/// against the reference harness; this longer guard keeps the reset independent of the pinned
+/// frame set and reports the exact reset frame.
 #[test]
 #[ignore = "requires assets; flow guard without a reference pin yet"]
 fn s1_continue_idle_resets_to_the_first_game_config_entry() {
