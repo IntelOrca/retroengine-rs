@@ -358,8 +358,11 @@ impl AudioState {
     /// A file-backed play resets `music.volume` to full, exactly like upstream
     /// `AudioLegacy.cpp:49` (`musicVolume = 100` on every `PlayMusic` branch that has a track
     /// file). Scripts fade `music.volume` to `0` before switching tracks (`MusicEvent`), so
-    /// without this reset the next `PlayMusic` would start silent. An out-of-range track or one
-    /// without a file only stops the music (`StopChannel`), which upstream leaves the volume for.
+    /// without this reset the next `PlayMusic` would start silent. A track without a file only
+    /// stops the music (`StopChannel`) and leaves the volume: upstream's empty-file branch is
+    /// the only `PlayMusic` path that does not reset. An out-of-range track also stops here,
+    /// whereas upstream wraps it with `trackID & 0xF` and would reset that wrapped track; the
+    /// wrap is not modelled.
     pub fn play_music(&mut self, track: i32) -> bool {
         let Some(index) = usize::try_from(track)
             .ok()

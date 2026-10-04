@@ -725,6 +725,45 @@ mod tests {
     }
 
     #[test]
+    fn a_device_with_room_between_submissions_is_offered_before_the_backlog_trims() {
+        // Park the device queue and the backlog at their caps with a device that never drains,
+        // then simulate real-time playback draining exactly one tick between logic frames. The
+        // next submission fits in that room, so offering before trimming must not drop a frame:
+        // trimming first would discard the oldest tick even though the device could take it.
+        let (mut engine, state) = prebuffered_draining(0, 0, 0, 0);
+        let tick = tick_buffer();
+        let total_ticks = MAX_QUEUED_TICKS + MAX_BACKLOG_TICKS;
+        for _ in 0..total_ticks {
+            engine.submit(&tick).unwrap();
+        }
+        assert_eq!(engine.queued_frames(), MAX_QUEUED_TICKS * FRAMES_PER_TICK);
+        assert_eq!(engine.backlog_frames(), MAX_BACKLOG_TICKS * FRAMES_PER_TICK);
+        assert_eq!(engine.counters().dropped_frames, 0);
+
+        // The device drained one tick of room since the previous logic frame.
+        state.queued.set(state.queued.get() - FRAMES_PER_TICK);
+        engine.submit(&tick).unwrap();
+
+        let counters = engine.counters();
+        assert_eq!(
+            counters.dropped_frames, 0,
+            "the tick must flow into the device room instead of being trimmed"
+        );
+        assert_eq!(counters.resyncs, 0);
+        assert_eq!(
+            engine.queued_frames(),
+            MAX_QUEUED_TICKS * FRAMES_PER_TICK,
+            "the device queue refills to its high-water mark"
+        );
+        assert_eq!(
+            engine.backlog_frames(),
+            MAX_BACKLOG_TICKS * FRAMES_PER_TICK,
+            "the backlog stays at its cap"
+        );
+        assert_frame_conservation(&engine, ((total_ticks + 1) * FRAMES_PER_TICK) as u64);
+    }
+
+    #[test]
     fn partial_device_acceptance_retains_the_remainder_in_the_backlog() {
         // A device that accepts one frame per call but never queues: each tick moves one frame
         // and the rest stays in the bounded backlog (production far outruns it, so resyncs are

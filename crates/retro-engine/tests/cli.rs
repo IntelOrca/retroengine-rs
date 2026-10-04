@@ -23,6 +23,15 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// Parses the `N` from a `field: N` summary line a run printed, panicking with the full output
+/// when the line is missing or malformed.
+fn summary_count(text: &str, field: &str) -> u64 {
+    text.lines()
+        .find_map(|line| line.strip_prefix(field))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or_else(|| panic!("run summary must report {field:?}: {text}"))
+}
+
 fn temp_assets(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("retro-engine-it-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -225,9 +234,9 @@ fn run_bounded_with_env(
     }
 }
 
-/// A windowed run must create its window, present exactly `--frames` frames and exit 0,
-/// reporting the selected platform, video driver and audio device. The dummy window is never
-/// focused and never receives a close event, so the `--frames` cap alone must terminate it.
+/// A windowed run must create its window, run every logic frame and exit 0, reporting the
+/// selected platform, video driver and audio device. The dummy window is never focused and
+/// never receives a close event, so the `--frames` cap alone must terminate it.
 #[cfg(unix)]
 #[test]
 fn windowed_frames_run_exits_promptly() {
@@ -255,11 +264,7 @@ fn windowed_frames_run_exits_promptly() {
     );
     // Presentation may be dropped or repeated when a present blocks past a deadline; the
     // invariant is that at least the final frame is presented and no more than one per frame.
-    let presented: u64 = text
-        .lines()
-        .find_map(|line| line.strip_prefix("presented-frames: "))
-        .and_then(|value| value.trim().parse().ok())
-        .expect("windowed runs report presented-frames");
+    let presented = summary_count(&text, "presented-frames: ");
     assert!((1..=5).contains(&presented), "presented {presented}");
     assert!(text.contains("logic-rate: "), "{text}");
     assert!(text.contains("hash: "), "{text}");
@@ -429,7 +434,14 @@ fn windowed_scripted_input_with_frames_exits_promptly() {
     );
     let text = stdout(&output);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(text.contains("presented-frames: 5"), "{text}");
+    assert!(
+        text.contains("executed-frames: 5"),
+        "every logic frame must run: {text}"
+    );
+    // A present that blocks past a deadline drops or repeats a presentation, never a logic
+    // frame, so `presented-frames` is bounded by `executed-frames` but not pinned to it.
+    let presented = summary_count(&text, "presented-frames: ");
+    assert!((1..=5).contains(&presented), "presented {presented}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -480,7 +492,14 @@ fn windowed_audio_failure_is_reported_but_does_not_abort() {
     let text = stdout(&output);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(text.contains("audio: unavailable:"), "{text}");
-    assert!(text.contains("presented-frames: 2"), "{text}");
+    assert!(
+        text.contains("executed-frames: 2"),
+        "every logic frame must run: {text}"
+    );
+    // A missed presentation is legal under the pacing contract; the run must still present at
+    // least the final frame and never more than one per executed frame.
+    let presented = summary_count(&text, "presented-frames: ");
+    assert!((1..=2).contains(&presented), "presented {presented}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
