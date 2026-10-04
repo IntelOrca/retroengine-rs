@@ -347,8 +347,9 @@ Per-player injection is verified with `players_split.input` (column 1 RIGHT from
   (0; every M7 window) and `CAMERASTYLE_HLOCKED` (4; S1 PlayerObject spindash, pinned by
   `S1_ZONE01_SPINDASH`). `CAMERASTYLE_STATIC` (6) is assigned only under `USE_ORIGINS`/vs mode,
   and `CAMERASTYLE_EXTENDED`/`EXTENDED_OFFSET_L`/`EXTENDED_OFFSET_R` (1-3) and
-  `CAMERASTYLE_FIXED` (5) by no shipped S1/S2 script, so those four styles and the locked branch
-  have unit tests only, with no reference framebuffer pin.
+  `CAMERASTYLE_FIXED` (5) by no shipped S1/S2 script, so styles 1-3/5 are unit-tested only, while
+  the locked branch is also reference-pinned through the S1 death/respawn window
+  (`S1_ZONE01_RIGHT` frames 400/500).
 * Audio is the dummy SDL driver; the harness deliberately compares graphics + simulation state,
   not audio.
 * `run.sh` always regenerates `Settings.ini` with `devMenu=n`, `gameType=0`, `pixWidth=424`; use
