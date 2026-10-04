@@ -616,6 +616,87 @@ const S2_LSELECT_ACT1_IDLE: &[(u64, &str)] = &[
     ),
 ];
 
+/// Pinned `fb.blake3` values for `zone01_idle.input` on S1 `Special` Act 1 (idle, 600 frames).
+/// `SpecialSetup` runs `BoxCollisionTest(C_SOLID2, ...)` against the player every frame, so this
+/// window is a direct `BoxCollision2` regression; the final frame is the reference harness's
+/// `cfede829...92c976`.
+const S1_SPECIAL_ACT1_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        100,
+        "f535251667df463dd5bceb1ccbf23fd1ba3da217754059ba5480b06d09ed24b4",
+    ),
+    (
+        300,
+        "07a7e43097b4076a4b523ba9092c5d2e380e072405afe3d3b1e0c8c0191222c4",
+    ),
+    (
+        450,
+        "7d82c6c476718527980a3d04b5bab13c1f1e4a8d6d0717fec96b22f20ddfb822",
+    ),
+    (
+        599,
+        "cfede829d9a0e12f6cb2fff5c35962e83949c47ac458ce0865a3743fc892c976",
+    ),
+];
+
+/// Pinned `fb.blake3` values for `zone01_idle.input` on S1 `Mission_Zone02` Act 3 (idle, 600
+/// frames). The act places 13 `GlassPillar` entities; each runs
+/// `BoxCollisionTest(C_SOLID2, ...)` every frame, so the window pins `BoxCollision2` against
+/// the placed pillars.
+const S1_MISSION_ZONE02_ACT3_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        100,
+        "47786155f40903a34f7199bcabaf3805bc0dfe42b14a8afcfd2b9cceef01be5f",
+    ),
+    (
+        300,
+        "24b3cec66796c305d07866c57b6d6ed4e0ffe8a60cf9b57ce440ea9fec38a2f5",
+    ),
+    (
+        450,
+        "fe44c1b1c0d3f34b56293470da263b7c71a6ee246dd17d4914c8e7e4dc359e28",
+    ),
+    (
+        599,
+        "6287231b291fdb695137942de1ed03a25adce2c2448bf7528cf28913d372a657",
+    ),
+];
+
+/// Pinned `fb.blake3` values for `zone01_idle.input` on S2 `Zone07` (OOZ) Act 1 (idle, 600
+/// frames). The act places 11 `GasPlatform` entities, whose update calls
+/// `BoxCollisionTest(C_SOLID2, ...)` while the platform is not launching, covering the
+/// `C_SOLID2` path in the shipped S2 scripts.
+const S2_OOZ_GASPLATFORM_ACT1_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        100,
+        "f176ef1308ceafd5b7a7b50f72a3f10031f66b6dde017d54c588ec8a4fb47786",
+    ),
+    (
+        300,
+        "fa3f0f31fb33ad2a04ea1235094d0e30cd01b2a5cc7e11b0c67a21287b580617",
+    ),
+    (
+        450,
+        "9268950bdb630a37dc5c96285e3cd55da49c9ad8b99f860636a25c56dbb698c8",
+    ),
+    (
+        599,
+        "b9ff0f9c7d9e003b5e48294fef31cdcfc769776433b47b95e94ec9bb8fa18427",
+    ),
+];
+
 #[test]
 #[ignore = "requires assets; pins reference-harness framebuffer hashes"]
 fn zone01_idle_framebuffer_matches_reference() {
@@ -668,12 +749,12 @@ fn scripted_input(file: &str) -> retro_input::ScriptedInput {
     retro_input::ScriptedInput::from_str(&text).expect("scripted input")
 }
 
-/// Runs `input_file` for `pins` and asserts every pinned framebuffer hash. `scene` selects the
-/// starting scene (the Title START replay leaves it mid-run).
-fn check_scripted_pins(game: &str, scene: &str, input_file: &str, pins: &[(u64, &str)]) {
+/// Runs `input_file` for `pins` and asserts every pinned framebuffer hash. `scene`/`act` select
+/// the starting scene (the Title START replay leaves it mid-run).
+fn check_scripted_pins(game: &str, scene: &str, act: &str, input_file: &str, pins: &[(u64, &str)]) {
     let scripted = scripted_input(input_file);
     let seed = scripted.seed().unwrap_or(DEFAULT_SEED);
-    let mut engine = Engine::load(source(game), Some(scene), Some("1"), seed).expect("engine load");
+    let mut engine = Engine::load(source(game), Some(scene), Some(act), seed).expect("engine load");
     engine.set_scripted_input(scripted);
     let mut frame = 0u64;
     for &(target, expected) in pins {
@@ -693,7 +774,7 @@ fn check_scripted_pins(game: &str, scene: &str, input_file: &str, pins: &[(u64, 
 #[ignore = "requires assets; pins reference-harness framebuffer hashes"]
 fn zone01_right_framebuffer_matches_reference() {
     for (game, pins) in [("S1", S1_ZONE01_RIGHT), ("S2", S2_ZONE01_RIGHT)] {
-        check_scripted_pins(game, "Zone01", "zone01_right.input", pins);
+        check_scripted_pins(game, "Zone01", "1", "zone01_right.input", pins);
     }
 }
 
@@ -701,7 +782,7 @@ fn zone01_right_framebuffer_matches_reference() {
 #[ignore = "requires assets; pins reference-harness framebuffer hashes"]
 fn zone01_right400_framebuffer_matches_reference() {
     for (game, pins) in [("S1", S1_ZONE01_RIGHT400), ("S2", S2_ZONE01_RIGHT400)] {
-        check_scripted_pins(game, "Zone01", "zone01_right400.input", pins);
+        check_scripted_pins(game, "Zone01", "1", "zone01_right400.input", pins);
     }
 }
 
@@ -759,7 +840,7 @@ fn zone01_spindash_framebuffer_matches_reference() {
 #[ignore = "requires assets; pins reference-harness framebuffer hashes"]
 fn zone01_pause_framebuffer_matches_reference() {
     for (game, pins) in [("S1", S1_ZONE01_PAUSE), ("S2", S2_ZONE01_PAUSE)] {
-        check_scripted_pins(game, "Zone01", "zone01_pause.input", pins);
+        check_scripted_pins(game, "Zone01", "1", "zone01_pause.input", pins);
     }
 }
 
@@ -767,7 +848,7 @@ fn zone01_pause_framebuffer_matches_reference() {
 #[ignore = "requires assets; pins reference-harness framebuffer hashes"]
 fn title_start_framebuffer_matches_reference() {
     for (game, pins) in [("S1", S1_TITLE_START), ("S2", S2_TITLE_START)] {
-        check_scripted_pins(game, "Title", "title_start.input", pins);
+        check_scripted_pins(game, "Title", "1", "title_start.input", pins);
     }
 }
 
@@ -835,6 +916,48 @@ fn s2_special_act1_runs_past_the_text_message_divide_by_zero() {
     assert_eq!(
         engine.state.text_menus[0].row_count, 15,
         "MENU_1 holds the 15 special-stage messages"
+    );
+}
+
+/// S1 `Special` Act 1 idle: `SpecialSetup`'s `C_SOLID2` call is the scene's main player
+/// interaction, so this pins `BoxCollision2`'s floor/ceiling/wall resolution in real data.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn s1_special_act1_idle_framebuffer_matches_reference() {
+    check_scripted_pins(
+        "S1",
+        "Special",
+        "1",
+        "zone01_idle.input",
+        S1_SPECIAL_ACT1_IDLE,
+    );
+}
+
+/// S1 `Mission_Zone02` Act 3 idle: the 13 `GlassPillar` instances each call `C_SOLID2` per
+/// frame, so this covers `BoxCollision2` against a moving solid pillar.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn s1_mission_zone02_act3_idle_framebuffer_matches_reference() {
+    check_scripted_pins(
+        "S1",
+        "Mission_Zone02",
+        "3",
+        "zone01_idle.input",
+        S1_MISSION_ZONE02_ACT3_IDLE,
+    );
+}
+
+/// S2 `Zone07` (OOZ) Act 1 idle: the 11 `GasPlatform` instances call `C_SOLID2` in their update
+/// loop, covering the shipped S2 user of `BoxCollision2`.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn s2_ooz_gasplatform_act1_idle_framebuffer_matches_reference() {
+    check_scripted_pins(
+        "S2",
+        "Zone07",
+        "1",
+        "zone01_idle.input",
+        S2_OOZ_GASPLATFORM_ACT1_IDLE,
     );
 }
 
