@@ -89,6 +89,44 @@ const VAR_HPARALLAX_LAST: i32 = 214;
 const VAR_VPARALLAX_FIRST: i32 = 215;
 /// Last rev03 vertical parallax variable.
 const VAR_VPARALLAX_LAST: i32 = 217;
+/// First rev03 `scene3D` variable (`scene3D.vertexCount`).
+const VAR_SCENE3D_FIRST: i32 = 218;
+/// Last rev03 `scene3D` variable (`faceBuffer.color`).
+const VAR_SCENE3D_LAST: i32 = 234;
+/// `scene3D.vertexCount`.
+const VAR_SCENE3D_VERTEX_COUNT: i32 = 218;
+/// `scene3D.faceCount`.
+const VAR_SCENE3D_FACE_COUNT: i32 = 219;
+/// `scene3D.projectionX`.
+const VAR_SCENE3D_PROJECTION_X: i32 = 220;
+/// `scene3D.projectionY`.
+const VAR_SCENE3D_PROJECTION_Y: i32 = 221;
+/// `scene3D.fogColor`.
+const VAR_SCENE3D_FOG_COLOR: i32 = 222;
+/// `scene3D.fogStrength`.
+const VAR_SCENE3D_FOG_STRENGTH: i32 = 223;
+/// `scene3D.vertexBuffer[].x`.
+const VAR_VERTEX_BUFFER_X: i32 = 224;
+/// `scene3D.vertexBuffer[].y`.
+const VAR_VERTEX_BUFFER_Y: i32 = 225;
+/// `scene3D.vertexBuffer[].z`.
+const VAR_VERTEX_BUFFER_Z: i32 = 226;
+/// `scene3D.vertexBuffer[].u`.
+const VAR_VERTEX_BUFFER_U: i32 = 227;
+/// `scene3D.vertexBuffer[].v`.
+const VAR_VERTEX_BUFFER_V: i32 = 228;
+/// `scene3D.faceBuffer[].a`.
+const VAR_FACE_BUFFER_A: i32 = 229;
+/// `scene3D.faceBuffer[].b`.
+const VAR_FACE_BUFFER_B: i32 = 230;
+/// `scene3D.faceBuffer[].c`.
+const VAR_FACE_BUFFER_C: i32 = 231;
+/// `scene3D.faceBuffer[].d`.
+const VAR_FACE_BUFFER_D: i32 = 232;
+/// `scene3D.faceBuffer[].flag`.
+const VAR_FACE_BUFFER_FLAG: i32 = 233;
+/// `scene3D.faceBuffer[].color`.
+const VAR_FACE_BUFFER_COLOR: i32 = 234;
 /// `engine.state`.
 const VAR_ENGINE_STATE: i32 = 236;
 /// `engine.language`.
@@ -475,6 +513,102 @@ impl EngineHost<'_> {
             0 => table.parallax_factor[index] = value,
             1 => table.scroll_speed[index] = value,
             _ => table.scroll_pos[index] = value,
+        }
+    }
+
+    /// `scene3D.*` reads (ids 218..=234). The scalars read directly; the `vertexBuffer` /
+    /// `faceBuffer` fields are indexed at `ScriptLegacyv4.cpp:3850-3860`, where upstream does no
+    /// bounds check. The port deliberately bound-checks `array_index` (`0..0x1000` / `0..0x400`)
+    /// and returns 0 for out-of-range indices instead of reading out of bounds.
+    fn read_scene3d_var(&self, var: i32, array_index: i32) -> i32 {
+        let scene3d = &self.state.scene3d;
+        match var {
+            VAR_SCENE3D_VERTEX_COUNT => scene3d.vertex_count,
+            VAR_SCENE3D_FACE_COUNT => scene3d.face_count,
+            VAR_SCENE3D_PROJECTION_X => scene3d.projection_x,
+            VAR_SCENE3D_PROJECTION_Y => scene3d.projection_y,
+            VAR_SCENE3D_FOG_COLOR => scene3d.fog_color,
+            VAR_SCENE3D_FOG_STRENGTH => scene3d.fog_strength,
+            VAR_VERTEX_BUFFER_X..=VAR_VERTEX_BUFFER_V => {
+                let Ok(index) = usize::try_from(array_index) else {
+                    return 0;
+                };
+                let Some(vertex) = scene3d.vertex_buffer.get(index) else {
+                    return 0;
+                };
+                match var {
+                    VAR_VERTEX_BUFFER_X => vertex.x,
+                    VAR_VERTEX_BUFFER_Y => vertex.y,
+                    VAR_VERTEX_BUFFER_Z => vertex.z,
+                    VAR_VERTEX_BUFFER_U => vertex.u,
+                    _ => vertex.v,
+                }
+            }
+            VAR_FACE_BUFFER_A..=VAR_FACE_BUFFER_COLOR => {
+                let Ok(index) = usize::try_from(array_index) else {
+                    return 0;
+                };
+                let Some(face) = scene3d.face_buffer.get(index) else {
+                    return 0;
+                };
+                match var {
+                    VAR_FACE_BUFFER_A => face.a,
+                    VAR_FACE_BUFFER_B => face.b,
+                    VAR_FACE_BUFFER_C => face.c,
+                    VAR_FACE_BUFFER_D => face.d,
+                    VAR_FACE_BUFFER_FLAG => face.flag,
+                    _ => face.color as i32,
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    /// `scene3D.*` writes (ids 218..=234). Upstream indexes `vertexBuffer`/`faceBuffer` without a
+    /// bounds check (`ScriptLegacyv4.cpp:5983-5993`); the port deliberately ignores out-of-range
+    /// `array_index` values instead of writing out of bounds. `faceBuffer[].color` stores the
+    /// operand bit pattern.
+    fn write_scene3d_var(&mut self, var: i32, array_index: i32, value: i32) {
+        let scene3d = &mut self.state.scene3d;
+        match var {
+            VAR_SCENE3D_VERTEX_COUNT => scene3d.vertex_count = value,
+            VAR_SCENE3D_FACE_COUNT => scene3d.face_count = value,
+            VAR_SCENE3D_PROJECTION_X => scene3d.projection_x = value,
+            VAR_SCENE3D_PROJECTION_Y => scene3d.projection_y = value,
+            VAR_SCENE3D_FOG_COLOR => scene3d.fog_color = value,
+            VAR_SCENE3D_FOG_STRENGTH => scene3d.fog_strength = value,
+            VAR_VERTEX_BUFFER_X..=VAR_VERTEX_BUFFER_V => {
+                let Ok(index) = usize::try_from(array_index) else {
+                    return;
+                };
+                let Some(vertex) = scene3d.vertex_buffer.get_mut(index) else {
+                    return;
+                };
+                match var {
+                    VAR_VERTEX_BUFFER_X => vertex.x = value,
+                    VAR_VERTEX_BUFFER_Y => vertex.y = value,
+                    VAR_VERTEX_BUFFER_Z => vertex.z = value,
+                    VAR_VERTEX_BUFFER_U => vertex.u = value,
+                    _ => vertex.v = value,
+                }
+            }
+            VAR_FACE_BUFFER_A..=VAR_FACE_BUFFER_COLOR => {
+                let Ok(index) = usize::try_from(array_index) else {
+                    return;
+                };
+                let Some(face) = scene3d.face_buffer.get_mut(index) else {
+                    return;
+                };
+                match var {
+                    VAR_FACE_BUFFER_A => face.a = value,
+                    VAR_FACE_BUFFER_B => face.b = value,
+                    VAR_FACE_BUFFER_C => face.c = value,
+                    VAR_FACE_BUFFER_D => face.d = value,
+                    VAR_FACE_BUFFER_FLAG => face.flag = value,
+                    _ => face.color = value as u32,
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1417,18 +1551,63 @@ impl ScriptHost for EngineHost<'_> {
                     menu.edit_entry(&text, row_id, highlight);
                 }
             }
-            Op::Draw3DScene
-            | Op::SetIdentityMatrix
-            | Op::MatrixMultiply
-            | Op::MatrixTranslateXYZ
-            | Op::MatrixScaleXYZ
-            | Op::MatrixRotateX
-            | Op::MatrixRotateY
-            | Op::MatrixRotateZ
-            | Op::MatrixRotateXYZ
-            | Op::MatrixInverse
-            | Op::TransformVertices
-            | Op::SetScreenCount
+            Op::Draw3DScene => {
+                self.state.record_op("Draw3DScene");
+                let sheet = self.current_sheet_id();
+                self.state.draw_3d_scene(sheet);
+            }
+            Op::SetIdentityMatrix => {
+                self.state.record_op("SetIdentityMatrix");
+                self.state.scene3d.set_identity(operands[0]);
+            }
+            Op::MatrixMultiply => {
+                self.state.record_op("MatrixMultiply");
+                self.state.scene3d.multiply(operands[0], operands[1]);
+            }
+            Op::MatrixTranslateXYZ => {
+                self.state.record_op("MatrixTranslateXYZ");
+                self.state.scene3d.translate_xyz(
+                    operands[0],
+                    operands[1],
+                    operands[2],
+                    operands[3],
+                );
+            }
+            Op::MatrixScaleXYZ => {
+                self.state.record_op("MatrixScaleXYZ");
+                self.state
+                    .scene3d
+                    .scale_xyz(operands[0], operands[1], operands[2], operands[3]);
+            }
+            Op::MatrixRotateX => {
+                self.state.record_op("MatrixRotateX");
+                self.state.scene3d.rotate_x(operands[0], operands[1]);
+            }
+            Op::MatrixRotateY => {
+                self.state.record_op("MatrixRotateY");
+                self.state.scene3d.rotate_y(operands[0], operands[1]);
+            }
+            Op::MatrixRotateZ => {
+                self.state.record_op("MatrixRotateZ");
+                self.state.scene3d.rotate_z(operands[0], operands[1]);
+            }
+            Op::MatrixRotateXYZ => {
+                self.state.record_op("MatrixRotateXYZ");
+                self.state
+                    .scene3d
+                    .rotate_xyz(operands[0], operands[1], operands[2], operands[3]);
+            }
+            Op::MatrixInverse => {
+                self.state.record_op("MatrixInverse");
+                self.state.scene3d.inverse(operands[0]);
+            }
+            Op::TransformVertices => {
+                self.state.record_op("TransformVertices");
+                self.state
+                    .scene3d
+                    .transform_vertices(operands[0], operands[1], operands[2]);
+            }
+            Op::SetScreenCount
             | Op::SetScreenVertices
             | Op::GetInputDeviceID
             | Op::GetFilteredInputDeviceID
@@ -1520,6 +1699,8 @@ impl ScriptHost for EngineHost<'_> {
             self.read_tile_layer_var(var, array_index)
         } else if (VAR_HPARALLAX_FIRST..=VAR_VPARALLAX_LAST).contains(&var) {
             self.read_parallax_var(var, array_index)
+        } else if (VAR_SCENE3D_FIRST..=VAR_SCENE3D_LAST).contains(&var) {
+            self.read_scene3d_var(var, array_index)
         } else if var == VAR_ENGINE_STATE {
             self.state.game_mode
         } else if var == VAR_ENGINE_SFX_VOLUME {
@@ -1568,6 +1749,8 @@ impl ScriptHost for EngineHost<'_> {
             self.write_tile_layer_var(var, array_index, value);
         } else if (VAR_HPARALLAX_FIRST..=VAR_VPARALLAX_LAST).contains(&var) {
             self.write_parallax_var(var, array_index, value);
+        } else if (VAR_SCENE3D_FIRST..=VAR_SCENE3D_LAST).contains(&var) {
+            self.write_scene3d_var(var, array_index, value);
         } else if (VAR_CAMERA_FIRST..=VAR_CAMERA_LAST).contains(&var) {
             self.write_camera_var(var, array_index, value);
         } else if (VAR_KEYDOWN_FIRST..=VAR_KEYDOWN_LAST).contains(&var) {
@@ -3930,5 +4113,151 @@ mod tests {
         assert_eq!(framebuffer.get(2, 0), 0);
         assert_eq!(framebuffer.get(3, 0), 0xF800, "advance 3 puts B at x = 3");
         assert_eq!(framebuffer.get(4, 0), 0xF800);
+    }
+
+    #[test]
+    fn scene3d_scalars_and_buffers_round_trip() {
+        let mut state = test_state(false);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+
+        host.write_engine_var(VAR_SCENE3D_VERTEX_COUNT, 0, 1400, &mut vm_state)
+            .unwrap();
+        assert_eq!(host.state.scene3d.vertex_count, 1400);
+        assert_eq!(
+            host.read_engine_var(VAR_SCENE3D_VERTEX_COUNT, 0, &mut vm_state)
+                .unwrap(),
+            1400
+        );
+
+        host.write_engine_var(VAR_SCENE3D_PROJECTION_X, 0, 216, &mut vm_state)
+            .unwrap();
+        host.write_engine_var(VAR_SCENE3D_FOG_STRENGTH, 0, 0x50, &mut vm_state)
+            .unwrap();
+        assert_eq!(
+            host.read_engine_var(VAR_SCENE3D_PROJECTION_X, 0, &mut vm_state)
+                .unwrap(),
+            216
+        );
+        assert_eq!(
+            host.read_engine_var(VAR_SCENE3D_FOG_STRENGTH, 0, &mut vm_state)
+                .unwrap(),
+            0x50
+        );
+
+        // Halfpipe's scratch slots 4094/4095 live outside the used mesh range.
+        host.write_engine_var(VAR_VERTEX_BUFFER_X, 4094, 0x1234, &mut vm_state)
+            .unwrap();
+        host.write_engine_var(VAR_VERTEX_BUFFER_V, 4095, -77, &mut vm_state)
+            .unwrap();
+        assert_eq!(host.state.scene3d.vertex_buffer[4094].x, 0x1234);
+        assert_eq!(
+            host.read_engine_var(VAR_VERTEX_BUFFER_X, 4094, &mut vm_state)
+                .unwrap(),
+            0x1234
+        );
+        assert_eq!(
+            host.read_engine_var(VAR_VERTEX_BUFFER_V, 4095, &mut vm_state)
+                .unwrap(),
+            -77
+        );
+    }
+
+    #[test]
+    fn scene3d_var_out_of_range_indices_are_ignored() {
+        let mut state = test_state(false);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+
+        for index in [-1, 0x1000, i32::MAX] {
+            host.write_engine_var(VAR_VERTEX_BUFFER_X, index, 7, &mut vm_state)
+                .unwrap();
+            assert_eq!(
+                host.read_engine_var(VAR_VERTEX_BUFFER_X, index, &mut vm_state)
+                    .unwrap(),
+                0,
+                "vertex index {index} must be out of range"
+            );
+        }
+        assert_eq!(host.state.scene3d.vertex_buffer[0].x, 0);
+
+        for index in [-1, 0x400, i32::MAX] {
+            host.write_engine_var(VAR_FACE_BUFFER_A, index, 7, &mut vm_state)
+                .unwrap();
+            assert_eq!(
+                host.read_engine_var(VAR_FACE_BUFFER_A, index, &mut vm_state)
+                    .unwrap(),
+                0,
+                "face index {index} must be out of range"
+            );
+        }
+        assert_eq!(host.state.scene3d.face_buffer[0].a, 0);
+    }
+
+    #[test]
+    fn scene3d_face_color_keeps_the_operand_bit_pattern() {
+        let mut state = test_state(false);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+
+        host.write_engine_var(VAR_FACE_BUFFER_COLOR, 0x3FF, -1, &mut vm_state)
+            .unwrap();
+        assert_eq!(host.state.scene3d.face_buffer[0x3FF].color, u32::MAX);
+        assert_eq!(
+            host.read_engine_var(VAR_FACE_BUFFER_COLOR, 0x3FF, &mut vm_state)
+                .unwrap(),
+            -1
+        );
+
+        host.write_engine_var(VAR_FACE_BUFFER_FLAG, 0, 6, &mut vm_state)
+            .unwrap();
+        assert_eq!(host.state.scene3d.face_buffer[0].flag, 6);
+    }
+
+    #[test]
+    fn scene3d_matrix_op_arms_call_the_ported_methods() {
+        let mut state = test_state(false);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+
+        vm_state.operands[0] = retro_render::MAT_WORLD;
+        vm_state.operands[1] = 0x100;
+        vm_state.operands[2] = 0x200;
+        vm_state.operands[3] = 0x300;
+        host.engine_op(Op::MatrixTranslateXYZ, &mut vm_state)
+            .unwrap();
+        assert_eq!(
+            host.state.scene3d.mat_world.values[3],
+            [0x100, 0x200, 0x300, 0x100]
+        );
+        assert_eq!(host.state.op_histogram.get("MatrixTranslateXYZ"), Some(&1));
+        assert!(!host.state.stub_histogram.contains_key("MatrixTranslateXYZ"));
+
+        vm_state.operands[0] = retro_render::MAT_TEMP;
+        vm_state.operands[1] = 0x80;
+        host.engine_op(Op::MatrixRotateX, &mut vm_state).unwrap();
+        assert_eq!(host.state.scene3d.mat_temp.values[1][2], 0x100);
+
+        host.state.scene3d.vertex_count = 1;
+        host.state.scene3d.vertex_buffer[0] = retro_render::Vertex {
+            x: 0x80,
+            y: 0,
+            z: 0,
+            u: 3,
+            v: 4,
+        };
+        vm_state.operands[0] = retro_render::MAT_TEMP;
+        vm_state.operands[1] = 0;
+        vm_state.operands[2] = 1;
+        host.engine_op(Op::TransformVertices, &mut vm_state)
+            .unwrap();
+        assert_eq!(host.state.scene3d.vertex_buffer[0].x, 0x80);
+        assert_eq!(host.state.scene3d.vertex_buffer[0].u, 3, "u/v untouched");
+        assert!(!host.state.stub_histogram.contains_key("TransformVertices"));
+
+        // M9b ported `Draw3DScene`; no 3D op is stubbed any more.
+        host.engine_op(Op::Draw3DScene, &mut vm_state).unwrap();
+        assert!(!host.state.stub_histogram.contains_key("Draw3DScene"));
+        assert_eq!(host.state.op_histogram.get("Draw3DScene"), Some(&1));
     }
 }

@@ -29,6 +29,7 @@ system SDL2, no `pkg-config`):
 | C reference vs Rust, S1/S2 `Zone01` hold-RIGHT (`zone01_right.input`) | **600/600 identical** |
 | C reference vs Rust, S1/S2 `Zone01` RIGHT held from frame 400 (`zone01_right400.input`) | **600/600 identical** |
 | C reference vs Rust, S1/S2 `Title` -> `Zone01` START (A held from frame 800, `title_start.input`) | **1200/1200 identical** |
+| S2 `Special` act 1-8, 600 frames `--scene3d` (2026-10-04) | 600 records/act, all `scene3D` blocks present; act 1 rerun byte-identical (`diff_records.py`: no divergence) |
 
 ## Requirements
 
@@ -48,7 +49,9 @@ REF_HARNESS_BUILD=/tmp/opencode/refbuild tools/ref-harness/build.sh
 ```
 
 The script writes `$REF_HARNESS_BUILD/env.sh` (binary + helper paths) used by `run.sh`. It is
-re-runnable: it resets the engine checkout, re-applies `patches/*.patch` and rebuilds.
+re-runnable: it resets the engine checkout, re-applies `patches/*.patch` and rebuilds. On hosts
+with little RAM, export `CMAKE_BUILD_PARALLEL_LEVEL=2`; `build.sh` maps it onto `ninja -j` (ninja
+itself only honours the variable through `cmake --build`).
 
 ## Run a scene
 
@@ -72,6 +75,9 @@ tools/ref-harness/run.sh --game S1 --boot --frames 1600 \
 `--input-trace` logs the per-player masks to stderr each tick. `--text-menus` adds the legacy
 `gameMenu` state to each record, and `--screens` adds per-screen framebuffer hashes when
 `videoSettings.screenCount > 1` (dormant for standalone S1/S2, which use one screen).
+`--scene3d` adds the legacy v4 3D state (matrices, projection/fog and full vertex/face buffer
+digests) to every record; it is off by default and the record stream is byte-identical without
+it.
 
 Outputs under `--out` (default `tools/ref-harness/out/<game>-<scene>-<act>`, gitignored):
 
@@ -226,6 +232,22 @@ START path overwrites `stage.activeList`/`listPos` in `Start.txt` before calling
 * With `REF_HARNESS_SCREENS=1` and `videoSettings.screenCount > 1`, each record also carries
   `"screens":[{"w":..,"h":..,"blake3":".."}, ...]`, one hashed visible framebuffer per active
   screen (each with its own `size`/`pitch`); `fb` remains `screens[0]`. `run.sh --screens`.
+* With `REF_HARNESS_SCENE3D=1` each v4 record also carries a `scene3D` object with the legacy 3D
+  state (`run.sh --scene3d`):
+
+  ```json
+  "scene3D":{"vertexCount":1400,"faceCount":740,"projectionX":216,"projectionY":216,
+    "fogColor":0,"fogStrength":80,
+    "matWorld":[16 ints],"matView":[16 ints],"matTemp":[16 ints],
+    "vertexHash":"<blake3>","faceHash":"<blake3>"}
+  ```
+
+  Matrices are row-major `int32` (`values[4][4]`). `vertexHash` is BLAKE3 of the full
+  `Legacy::v4::vertexBuffer` (`0x1000` vertices) and `faceHash` of the full `faceBuffer`
+  (`0x400` faces), each serialized as tightly packed little-endian `i32` fields
+  (`x,y,z,u,v` per vertex; `a,b,c,d,color,flag` per face — `color` is its `u32` bit pattern).
+  The digests cover the whole buffers, not just the `vertexCount`/`faceCount` used range, because
+  the shipped scripts read and write scratch slots past the cursors.
 * `cameras` are `Legacy::cameras[0..1]`; `scroll`/`shake`/`lag` are the legacy camera globals.
 * Names/strings are JSON-escaped.
 
@@ -234,8 +256,9 @@ Environment variables honoured by the binary (normally set by `run.sh`):
 `REF_HARNESS_PPM_DIR`, `REF_HARNESS_PPM_FRAMES`, `REF_HARNESS_PPM_EVERY`, `REF_HARNESS_ENT_VALUES`,
 `REF_HARNESS_RECORD_INPUT` (adds the `input` object; `0`/unset = off), `REF_HARNESS_INPUT_TRACE`
 (stderr line per tick with the injected `p1..p4`/`any` masks), `REF_HARNESS_TEXT_MENUS` (adds the
-`textMenus` array) and `REF_HARNESS_SCREENS` (adds the `screens` array when
-`videoSettings.screenCount > 1`).
+`textMenus` array), `REF_HARNESS_SCREENS` (adds the `screens` array when
+`videoSettings.screenCount > 1`) and `REF_HARNESS_SCENE3D` (adds the `scene3D` object; `0`/unset =
+off).
 
 ## Diffing
 
@@ -280,6 +303,7 @@ same BLAKE3 as `fb.blake3`. It reports the first divergent frame, and
 | `0003-reference-harness.patch` | Adds `RSDKv5/refharness.{hpp,cpp}` and hooks: deterministic RNG seed (`Math.cpp`), scripted input injection (`Input.cpp`), no frame-skip/no wall clock + software-renderer fallback + presentation skip (`SDL2RenderDevice.cpp`), frame recording and frame-limit exit (`RetroEngine.cpp`). |
 | `0004-reject-lr-buttons.patch` | Rejects `L`/`R` button names and mask bits in the input script parser; rev03 `ControllerState` has no L/R fields, so they could only be silently ignored. |
 | `0005-per-player-input.patch` | Parses all four per-player button columns and injects them into `controller[CONT_P1..CONT_P4]` (with `CONT_ANY` = OR of all players); adds the optional `input`, `textMenus` and `screens` record blocks plus the per-tick mask trace (`REF_HARNESS_RECORD_INPUT`, `REF_HARNESS_TEXT_MENUS`, `REF_HARNESS_SCREENS`, `REF_HARNESS_INPUT_TRACE`). |
+| `0006-scene3d-record.patch` | Adds the optional `scene3D` record block (`REF_HARNESS_SCENE3D`): the legacy v4 `vertexCount`/`faceCount`/`projectionX`/`projectionY`/`fogColor`/`fogStrength` scalars, the persisted `matWorld`/`matView`/`matTemp` matrices and BLAKE3 digests of the full `0x1000` vertex / `0x400` face buffers as little-endian `i32`. Purely additive: without the env var the records are byte-identical. |
 
 The harness only activates when a `REF_HARNESS_*` variable is set; without it the binary behaves
 like the upstream decompilation.
@@ -337,6 +361,37 @@ Per-player injection is verified with `players_split.input` (column 1 RIGHT from
 `LEFT|B` from line 50) and `--record-input`: record 10 has `input.ctrl=[8,8,0,0,0]` (P1 RIGHT;
 `CONT_ANY` = OR) and record 50 has `input.ctrl=[44,8,36,0,0]` (P2 `LEFT|B` = 36, `CONT_ANY` = 44).
 
+## M9 reference windows (patch 0006)
+
+The S2 `Special` halfpipe acts are the M9 3D windows. Captured with patches 0001–0006 and
+`zone01_idle.input` (seed `1592594996`), 600 frames each, `--scene3d`; records and PPM keyframes
+under `/tmp/opencode/m9-harness/{records,ppm}/special-{1..8}/` (scratch, not committed):
+
+```sh
+export REF_HARNESS_BUILD=/tmp/opencode/m9-harness/refbuild
+export CMAKE_BUILD_PARALLEL_LEVEL=2          # honoured by build.sh for the SDL2/engine builds
+tools/ref-harness/build.sh
+for a in 1 2 3 4 5 6 7 8; do
+  tools/ref-harness/run.sh --game S2 --scene Special --act $a --frames 600 \
+    --input tools/ref-harness/testdata/zone01_idle.input --scene3d \
+    --out /tmp/opencode/m9-harness/records/special-$a --ppm 100,300,599
+done
+# determinism: same input twice, byte-identical records (the scene3D block is compared too)
+tools/ref-harness/run.sh --game S2 --scene Special --act 1 --frames 600 \
+  --input tools/ref-harness/testdata/zone01_idle.input --scene3d \
+  --out /tmp/opencode/m9-harness/records/special-1-rerun
+python3 tools/ref-harness/diff_records.py \
+  /tmp/opencode/m9-harness/records/special-1/records.jsonl \
+  /tmp/opencode/m9-harness/records/special-1-rerun/records.jsonl
+```
+
+At `STAGEMODE_LOAD` (record 0) every act reports `vertexCount=1400`, `faceCount=740`,
+`projectionX=projectionY=216`, `fogColor=0`, `fogStrength=0x50` (the `Halfpipe` tube mesh);
+`matWorld`/`matView`/`matTemp` start zeroed and persist across frames. Pin frames for the Rust
+port are `0, 100, 300, 321, 599` (`321` is the old divide-by-zero boundary). The `--scene3d`
+digests cover the full buffers, so a divergence localizes to the matrices (`matWorld`/`matView`/
+`matTemp`), the cursors/scalars or a specific buffer before falling back to PPM pixel diffs.
+
 ## Limitations
 
 * Only the RSDKv5U rev-3 **legacy v4** path is exercised; the v3/v5 scene paths are untested.
@@ -361,3 +416,10 @@ Per-player injection is verified with `players_split.input` (column 1 RIGHT from
   `crates/retro-parity` gains a JSONL emitter matching this format, `diff_records.py` will work
   C↔Rust unchanged: scripted input is now indexed by absolute tick, so record `N` consumes line
   `N` and `--offset 0` aligns the streams.
+* The M9 rasterizer intentionally diverges from upstream where upstream reads out of bounds:
+  texture samples outside the sheet return index 0 (transparent) instead of reading the shared
+  `graphicData` pool (`retro-render/src/faces.rs:14`), and out-of-range `vertexCount`/
+  `faceCount`/vertex/face indices are skipped instead of corrupting memory
+  (`retro-render/src/scene3d.rs`, `retro-engine/src/draw3d.rs`). Neither produced a divergence in
+  the S2 `Special` act 1-8 600-frame windows (8 x 600 frames framebuffer-identical); the
+  out-of-sheet path is not instrumented, so "never sampled" is not proven.

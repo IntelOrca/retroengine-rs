@@ -799,6 +799,200 @@ const S2_LSELECT_ACT1_IDLE: &[(u64, &str)] = &[
     ),
 ];
 
+/// Pinned `fb.blake3` values for `zone01_idle.input` on S2 `Special` Act 1 (idle, 600 frames).
+/// The halfpipe is revealed by the frame-4 fade-in, so these pins cover the first visible
+/// frame, the ring field and the frame-321 message boundary.
+const S2_SPECIAL_ACT1_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        100,
+        "7e181c89f9ebb295ac7e6ff5d5e1e4d90c1532630a59cdb5960b351d6ad30862",
+    ),
+    (
+        300,
+        "60da4fbf11085f5113985850a43a7ab9bca8dbdef091dd8001770a14cf8e34fb",
+    ),
+    (
+        321,
+        "0a4b066fe736da0271e06466c8f7e793be818f6583c3c7a61e0e9f127f9ebaad",
+    ),
+    (
+        599,
+        "a7bd926f52064adb5e473f75eaca5bd19e682560b1987e07cb496375f893264a",
+    ),
+];
+
+/// Pinned `fb.blake3` values for S2 `Special` Act 2 idle, 600 frames.
+const S2_SPECIAL_ACT2_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        100,
+        "79ebda87081474e4ed416e9c92a97c1fb87567fc3d54d936460db7c5444e4874",
+    ),
+    (
+        300,
+        "cb5f6c8ff89c93813e04b3f9318df7306a1031ce01084605c4c668fa04101fce",
+    ),
+    (
+        321,
+        "9d44d15b8c3eeeb4573c4461dd47cc521e9dc72678e2fef179c7aa205ad9233f",
+    ),
+    (
+        599,
+        "5710835ba81d206d1921cb0109fdb37f2a482fea6b05afbe3cbcc4feb6b09516",
+    ),
+];
+
+/// Pinned `fb.blake3` values for S2 `Special` Act 3 idle, 600 frames.
+const S2_SPECIAL_ACT3_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        100,
+        "bcf58e6be72bb2f1c3756e72327b88b5ce0d9dd7b8338b666caf323f1e0b047b",
+    ),
+    (
+        300,
+        "39131bc5c1324e8a87c3fc9c2638dc3db4f6ab9c0cd9d70e571c1905167f4ce7",
+    ),
+    (
+        321,
+        "f68cc77baaf901eec55f77c68c43f9a384e43cb1e7b86fec966621f7584beda4",
+    ),
+    (
+        599,
+        "0575a459473f295baa789d7b4d71fa626bebe8dddb871329880155f535c18a9f",
+    ),
+];
+
+/// Pinned `fb.blake3` values for S2 `Special` Act 4 idle, 600 frames.
+const S2_SPECIAL_ACT4_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        100,
+        "efbd65db076a51e4846517966f862f963daa4acf47efe2f5346addb968264241",
+    ),
+    (
+        300,
+        "58959e571885d2c524a50c5d21a1bc87c797419be5d1fc1e0e2acfd000b98c52",
+    ),
+    (
+        321,
+        "117595959953b7d4808dfed2604e0ecb4103e40c969556f4bf73d42c041adc2f",
+    ),
+    (
+        599,
+        "7a2ae927cc97611f0b3537c37664ea112dded11e62a5f651a9a5840a47f68cda",
+    ),
+];
+
+/// Pinned `fb.blake3` values for S2 `Special` Act 5 idle, 600 frames.
+const S2_SPECIAL_ACT5_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        100,
+        "11882f2674794260c2e3c4f3faa8717527af84c1a1cdf40c1c67b0fd84ad8364",
+    ),
+    (
+        300,
+        "c3a023141b8d0ef609c62a0ed0c7300c0718f27131a8a8c94211e2ac9b314a30",
+    ),
+    (
+        321,
+        "a464de2eb0794f105b09d0202e856e26a88b140eb9bf1a093b7ff684b8c60925",
+    ),
+    (
+        599,
+        "e83c33c55c7f33521ac8edc4597f0e33252d86b0fe80eaf3788bf04899482c0d",
+    ),
+];
+
+/// Pinned `fb.blake3` values for S2 `Special` Act 6 idle, 600 frames.
+const S2_SPECIAL_ACT6_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        100,
+        "49bd9fcf28e8ab1059aff3d3702c6f7a885409a26437fb50f846dc2919edde1b",
+    ),
+    (
+        300,
+        "a56276c49a152e9933e57afe59b5bd5f0667de53861b155402b1d6d1ebb7ec93",
+    ),
+    (
+        321,
+        "6ea6f9becbcac21d8c5d40c279ac61dbc8a300fb07c3317d5802093bf506a300",
+    ),
+    (
+        599,
+        "1531c0d705a931a20c1977030a697fbb239890420e7bcc1e6915ac1df40cb2eb",
+    ),
+];
+
+/// Pinned `fb.blake3` values for S2 `Special` Act 7 idle, 600 frames.
+const S2_SPECIAL_ACT7_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        100,
+        "bb21ca69089068a5438a0f89856eb036c224baed99b1e239b5a3c02a88f4a901",
+    ),
+    (
+        300,
+        "ab373f4e6327d9c96dfa51954f0d22a840bd69361d8278a35ebbf9b47b647f51",
+    ),
+    (
+        321,
+        "257021fb5668a9f2f9c9cf2070e6e26c1a058471f47bdec4882accbf2e7006fd",
+    ),
+    (
+        599,
+        "85e9da320e8f06703741ffc5b8521c22f152a41a792deae7eada118ae3d58606",
+    ),
+];
+
+/// Pinned `fb.blake3` values for S2 `Special` Act 8 idle, 600 frames.
+const S2_SPECIAL_ACT8_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        100,
+        "102dab0392e6ff8cdb18596bf3edcf1ed0c836fa22481f760a20b70dec314f67",
+    ),
+    (
+        300,
+        "ef4ea459289d2bae68bb5bcdc107ceb02e9e902bb7dcd45b3ffb53d5fbe899bb",
+    ),
+    (
+        321,
+        "a6a9ff45a970d45ed33d0dbf5b894a08bfde31d553d1f834f72c7296ee30d039",
+    ),
+    (
+        599,
+        "f37b72477353f1e0c67cdf1d85d142a09af4550004a27cff26d51afba79bb462",
+    ),
+];
+
 /// Pinned `fb.blake3` values for `zone01_idle.input` on S1 `Special` Act 1 (idle, 600 frames).
 /// `SpecialSetup` runs `BoxCollisionTest(C_SOLID2, ...)` against the player every frame, so this
 /// window is a direct `BoxCollision2` regression; the final frame is the reference harness's
@@ -1201,6 +1395,154 @@ fn s2_special_act1_runs_past_the_text_message_divide_by_zero() {
         engine.state.text_menus[0].row_count, 15,
         "MENU_1 holds the 15 special-stage messages"
     );
+}
+
+/// M9 wiring: `Special`'s `Halfpipe` startup builds the persistent tube mesh
+/// (`vertexCount = 1400`, `faceCount = 740`) and sets the projection/fog scalars. After 600
+/// idle frames every matrix/transform op and `Draw3DScene` must be ported with no 3D stubs left.
+#[test]
+#[ignore = "requires assets; M9 WP1 scene3D wiring"]
+fn s2_special_act1_scene3d_wiring() {
+    let mut engine = Engine::load(source("S2"), Some("Special"), Some("1"), DEFAULT_SEED)
+        .expect("S2/Special must load");
+    let scene3d = &engine.state.scene3d;
+    assert_eq!(scene3d.vertex_count, 1400, "Halfpipe startup vertex cursor");
+    assert_eq!(scene3d.face_count, 740, "Halfpipe startup face cursor");
+    assert_eq!(scene3d.projection_x, 216);
+    assert_eq!(scene3d.projection_y, 216);
+    assert_eq!(scene3d.fog_strength, 0x50);
+
+    engine
+        .run_frames(600, false)
+        .expect("S2/Special must run 600 frames");
+
+    let matrix_ops = [
+        "SetIdentityMatrix",
+        "MatrixMultiply",
+        "MatrixTranslateXYZ",
+        "MatrixScaleXYZ",
+        "MatrixRotateX",
+        "MatrixRotateY",
+        "MatrixRotateZ",
+        "MatrixRotateXYZ",
+        "MatrixInverse",
+        "TransformVertices",
+    ];
+    for op in matrix_ops {
+        assert!(
+            !engine.stub_histogram().contains_key(op),
+            "{op} must be ported by M9a"
+        );
+    }
+    // The shipped Special acts exercise these six.
+    for op in [
+        "Draw3DScene",
+        "MatrixInverse",
+        "MatrixMultiply",
+        "MatrixRotateXYZ",
+        "MatrixTranslateXYZ",
+        "TransformVertices",
+    ] {
+        assert!(
+            engine.op_histogram().contains_key(op),
+            "{op} must appear in the op histogram"
+        );
+    }
+    // M9b ported `Draw3DScene`: no 3D op may remain in the stub histogram.
+    let stubbed_3d: Vec<&str> = engine
+        .stub_histogram()
+        .keys()
+        .filter(|name| matrix_ops.contains(&name.as_str()) || name.as_str() == "Draw3DScene")
+        .map(String::as_str)
+        .collect();
+    assert!(stubbed_3d.is_empty(), "unexpected 3D stubs: {stubbed_3d:?}");
+}
+
+/// M9 WP2 smoke: all eight `Special` acts run 600 idle frames with the rasterizer live, no 3D
+/// op is stubbed, the halfpipe is visible at frame 599 and Act 1 is bit-identical across runs.
+/// Exact reference parity is pinned by [`s2_special_acts_framebuffers_match_reference`].
+#[test]
+#[ignore = "requires assets; release-only; M9 rasterizer smoke"]
+fn s2_special_acts_3d_smoke() {
+    let ops_3d = [
+        "Draw3DScene",
+        "SetIdentityMatrix",
+        "MatrixMultiply",
+        "MatrixTranslateXYZ",
+        "MatrixScaleXYZ",
+        "MatrixRotateX",
+        "MatrixRotateY",
+        "MatrixRotateZ",
+        "MatrixRotateXYZ",
+        "MatrixInverse",
+        "TransformVertices",
+    ];
+    for act in 1..=8 {
+        let act = act.to_string();
+        let mut engine = Engine::load(
+            source("S2"),
+            Some("Special"),
+            Some(act.as_str()),
+            DEFAULT_SEED,
+        )
+        .expect("S2/Special must load");
+        engine
+            .run_frames(600, false)
+            .expect("600-frame run must succeed");
+        for op in ops_3d {
+            assert!(
+                !engine.stub_histogram().contains_key(op),
+                "Act {act} still stubs {op}"
+            );
+        }
+        assert!(
+            engine
+                .op_histogram()
+                .get("Draw3DScene")
+                .copied()
+                .unwrap_or(0)
+                >= 600,
+            "Act {act} must draw 3D every frame"
+        );
+        if act == "1" {
+            let ratio = engine.state.render.framebuffer.non_black_ratio();
+            eprintln!("S2 Special Act 1 frame 599 non-black ratio: {ratio}");
+            assert!(
+                ratio > 0.05,
+                "frame 599 should show the halfpipe, non-black ratio {ratio}"
+            );
+        }
+    }
+
+    // Act 1 determinism: `state_hash` covers the framebuffer and the full scene3D buffers.
+    let mut first = Engine::load(source("S2"), Some("Special"), Some("1"), DEFAULT_SEED)
+        .expect("S2/Special must load");
+    first.run_frames(600, false).expect("600-frame run");
+    let expected = first.state_hash();
+    let mut second = Engine::load(source("S2"), Some("Special"), Some("1"), DEFAULT_SEED)
+        .expect("S2/Special must load");
+    second.run_frames(600, false).expect("600-frame run");
+    assert_eq!(second.state_hash(), expected, "Act 1 must be deterministic");
+}
+
+/// S2 `Special` Acts 1-8 idle: the full 3D pipeline (matrices, sort, `TEXTURED_C`,
+/// `TEXTURED_C_BLEND`, `FADED` and `3DSPRITE`) must match the reference harness at frame 0
+/// (black fade-in), 100, 300, 321 and 599.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn s2_special_acts_framebuffers_match_reference() {
+    for (act, pins) in [
+        ("1", S2_SPECIAL_ACT1_IDLE),
+        ("2", S2_SPECIAL_ACT2_IDLE),
+        ("3", S2_SPECIAL_ACT3_IDLE),
+        ("4", S2_SPECIAL_ACT4_IDLE),
+        ("5", S2_SPECIAL_ACT5_IDLE),
+        ("6", S2_SPECIAL_ACT6_IDLE),
+        ("7", S2_SPECIAL_ACT7_IDLE),
+        ("8", S2_SPECIAL_ACT8_IDLE),
+    ] {
+        check_scripted_pins("S2", "Special", act, "zone01_idle.input", pins);
+    }
 }
 
 /// S1 `Special` Act 1 idle: `SpecialSetup`'s `C_SOLID2` call is the scene's main player

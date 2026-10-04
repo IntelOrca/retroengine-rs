@@ -11,7 +11,7 @@ use retro_format_v4::{
     AnimationFile, Backgrounds, GameConfig, Hitbox, Scene, StageConfig, TileSheet16,
 };
 use retro_io::DataSource;
-use retro_render::{ACTIVE_PALETTE, RenderState, Surface};
+use retro_render::{ACTIVE_PALETTE, RenderState, Scene3DState, Surface};
 use retro_scene::{
     Camera, EntityStore, MathTables, OBJECT_COUNT, ObjectRegistry, SceneCollision, Screen,
     StageState, TYPEGROUP_COUNT, TypeGroupList,
@@ -348,6 +348,8 @@ pub struct EngineState {
     pub type_groups: Vec<TypeGroupList>,
     /// Draw lists per layer.
     pub draw_lists: Vec<Vec<i32>>,
+    /// Legacy v4 `scene3D` globals (matrices, vertex/face buffers, projection and fog).
+    pub scene3d: Scene3DState,
     /// `objectEntityPos`: the entity slot whose event is executing.
     pub object_entity_pos: usize,
     /// `OBJECT_BORDER_X1..Y4`-derived update bounds.
@@ -512,6 +514,7 @@ impl EngineState {
             process_flags: vec![false; retro_scene::ENTITY_COUNT],
             type_groups: vec![TypeGroupList::default(); TYPEGROUP_COUNT],
             draw_lists: vec![Vec::new(); retro_scene::DRAWLAYER_COUNT],
+            scene3d: Scene3DState::new(),
             object_entity_pos: 0,
             object_borders: [0x80, 424 + 0x80, 0x20, 424 + 0x20],
             input: InputState::default(),
