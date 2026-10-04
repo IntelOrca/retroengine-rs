@@ -1103,6 +1103,10 @@ impl ScriptHost for EngineHost<'_> {
                 if let Some(list) = usize::try_from(operands[0])
                     .ok()
                     .and_then(|index| self.state.draw_lists.get_mut(index))
+                    // Upstream stores refs in a fixed `entityRefs[ENTITY_COUNT]` array
+                    // (`Drawing.hpp:17`); ignore appends past it rather than growing without
+                    // bound.
+                    && list.len() < retro_scene::ENTITY_COUNT
                 {
                     list.push(operands[1]);
                 }
