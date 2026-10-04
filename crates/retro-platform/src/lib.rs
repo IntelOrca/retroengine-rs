@@ -6,6 +6,7 @@ pub mod error;
 pub mod headless;
 #[cfg(feature = "sdl3")]
 pub mod sdl3;
+pub mod signals;
 pub mod storage;
 
 pub use error::PlatformError;

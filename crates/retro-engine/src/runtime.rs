@@ -90,6 +90,40 @@ pub struct RunOutcome {
     pub audio_hashes: Vec<(u64, String)>,
 }
 
+/// Frame budget for a run: a concrete count or no limit at all.
+///
+/// [`Engine::run_frames`] always takes a concrete count so deterministic tests stay bounded;
+/// hosts that can be stopped by something else (a closing window, a quit signal) use this enum
+/// to distinguish "run `N` frames" from "run until stopped".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameLimit {
+    /// Stop after exactly this many frames.
+    Bounded(u64),
+    /// Never stop from a frame count; run until the window closes or a quit signal arrives.
+    Unbounded,
+}
+
+impl FrameLimit {
+    /// Converts the CLI `--frames` convention: `0` (also the default) means [`Self::Unbounded`].
+    #[must_use]
+    pub const fn from_frames(frames: u64) -> Self {
+        if frames == 0 {
+            Self::Unbounded
+        } else {
+            Self::Bounded(frames)
+        }
+    }
+
+    /// Whether a run that has executed `executed` frames should stop.
+    #[must_use]
+    pub const fn reached(self, executed: u64) -> bool {
+        match self {
+            Self::Bounded(limit) => executed >= limit,
+            Self::Unbounded => false,
+        }
+    }
+}
+
 impl Engine {
     /// Loads and instantiates the requested scene with in-memory user data.
     ///
@@ -819,6 +853,10 @@ impl Engine {
     }
 
     /// Runs `frames` frames, optionally hashing every frame.
+    ///
+    /// This is the bounded, deterministic path used by tests; it always stops after a concrete
+    /// count. Unbounded runs are driven by [`FrameLimit`] plus an external stop check (window
+    /// close or quit signal) in the CLI loop.
     pub fn run_frames(
         &mut self,
         frames: u64,

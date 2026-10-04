@@ -1,10 +1,12 @@
 //! Command line interface for the headless engine.
 //!
 //! The runtime loads settings/configs/scripts/scenes, runs startup and 60 Hz update/draw events
-//! for `--frames` frames and prints a BLAKE3 hash of the canonical engine state (which includes
-//! the software framebuffer). `--dump-frames DIR` writes the presented RGB565 framebuffer to
-//! `frame_%04d.png` headlessly; without `--headless` the same frames are presented through the
-//! SDL3 backend at 60 Hz.
+//! until stopped and prints a BLAKE3 hash of the canonical engine state (which includes the
+//! software framebuffer). Runs are unbounded by default: windowed runs stop when the window
+//! closes, headless runs when SIGINT/SIGTERM arrives; an explicit `--frames N` caps either mode
+//! after `N` frames (`--frames 0` keeps the unbounded default). `--dump-frames DIR` writes the
+//! presented RGB565 framebuffer to `frame_%04d.png` headlessly; without `--headless` the same
+//! frames are presented through the SDL3 backend at 60 Hz.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,13 +21,8 @@ use retro_platform::{AudioDesc, BackendKind, FsStorage, Storage, WindowDesc};
 
 use crate::EngineError;
 use crate::loader;
-use crate::runtime::Engine;
+use crate::runtime::{Engine, FrameLimit};
 use crate::save::{seed_memory_storage, seed_storage_from_source};
-
-/// Default headless frame count used when `--frames` is omitted or `0`.
-///
-/// Windowed runs without an explicit `--frames` run until the window closes instead.
-pub const DEFAULT_FRAMES: u64 = 600;
 
 /// Command line arguments for the engine binary.
 #[derive(Debug, Parser)]
@@ -35,7 +32,8 @@ pub const DEFAULT_FRAMES: u64 = 600;
     about = "Retro Engine (RSDK v4 legacy) reimplementation",
     long_about = "Runs an unpacked Sonic 1 or Sonic 2 (RSDK v4 legacy) asset folder.\n\
         Headless mode is deterministic and prints a BLAKE3 state hash; without --headless \
-        the game opens in an SDL3 window and runs until the window closes.",
+        the game opens in an SDL3 window and runs until the window closes. Headless runs \
+        until SIGINT/SIGTERM by default; --frames N caps either mode after N frames.",
     after_help = "EXAMPLES:\n  \
         retroengine C:\\games\\S1 --headless --frames 600\n  \
         retroengine C:\\games\\S1 --scene GHZ --act 1\n  \
@@ -59,8 +57,8 @@ pub struct Args {
     /// Run without a window using the deterministic headless backend
     #[arg(long)]
     pub headless: bool,
-    /// Number of frames to run; 0 means the 600-frame default headlessly and "until the
-    /// window closes" in windowed mode
+    /// Number of frames to run before exiting; 0 (the default) means run until quit: the
+    /// window closes, or headlessly SIGINT/SIGTERM arrives
     #[arg(long, default_value_t = 0)]
     pub frames: u64,
     /// List categories, scenes and available `Act*.bin` files, then exit
@@ -323,6 +321,10 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     if args.list || args.list_json {
         return list(args);
     }
+    // Headless runs have no window or SDL event pump, so Ctrl-C/SIGTERM would otherwise kill the
+    // process without flushing saves or printing the run summary. SDL installs equivalent
+    // handlers for windowed runs and turns the signals into quit events.
+    let quit_signals = args.headless && retro_platform::signals::install();
     let assets = resolve_assets(&args.assets_dir)?;
     let source: Arc<dyn DataSource> = Arc::new(DirSource::new(&assets.root)?);
     let seed = args.seed.unwrap_or(crate::rng::DEFAULT_SEED);
@@ -363,20 +365,12 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     println!("profile: {}", engine.settings().profile.name());
     println!("platform: {}", engine.settings().platform.name());
     println!("backend: {}", backend_for(args).name());
-    // Headless runs default to 600 deterministic frames; windowed runs without an explicit
-    // limit keep going until the user closes the window.
-    let frame_limit = if args.frames == 0 {
-        if args.headless {
-            Some(DEFAULT_FRAMES)
-        } else {
-            None
-        }
-    } else {
-        Some(args.frames)
-    };
+    // Runs are unbounded unless the user asked for a concrete frame count.
+    let frame_limit = FrameLimit::from_frames(args.frames);
     match frame_limit {
-        Some(frames) => println!("frames: {frames}"),
-        None => println!("frames: until the window closes"),
+        FrameLimit::Bounded(frames) => println!("frames: {frames}"),
+        FrameLimit::Unbounded if args.headless => println!("frames: until quit (Ctrl-C/SIGTERM)"),
+        FrameLimit::Unbounded => println!("frames: until the window closes"),
     }
     println!("seed: {seed}");
     if !args.headless && args.input.is_none() && !engine.input.has_keyboard_bindings() {
@@ -460,10 +454,13 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     let mut present_buffer = Vec::new();
     let mut presented = 0u64;
     let mut executed = 0u64;
+    let mut stopped_by_signal = false;
     loop {
-        if let Some(limit) = frame_limit
-            && executed >= limit
-        {
+        if frame_limit.reached(executed) {
+            break;
+        }
+        if quit_signals && retro_platform::signals::requested() {
+            stopped_by_signal = true;
             break;
         }
         executed += 1;
@@ -505,6 +502,10 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     if !engine.flush_save() {
         eprintln!("warning: could not persist save RAM");
     }
+    if stopped_by_signal {
+        println!("quit: signal");
+    }
+    println!("executed-frames: {executed}");
     if !args.hash_every_frame {
         let hash = engine.state_hash();
         println!("hash: {hash}");
@@ -645,6 +646,23 @@ mod tests {
         assert!(!desc.border);
         assert!(desc.exclusive_fullscreen);
         assert!(!desc.vsync);
+    }
+
+    #[test]
+    fn frames_zero_and_the_default_are_unbounded() {
+        // Omitted `--frames` parses as 0, which must mean "run until quit", not a hidden cap.
+        let args = Args::try_parse_from(["retro-engine", "/tmp/assets"]).unwrap();
+        assert_eq!(args.frames, 0);
+        assert_eq!(FrameLimit::from_frames(args.frames), FrameLimit::Unbounded);
+        assert_eq!(FrameLimit::from_frames(0), FrameLimit::Unbounded);
+        assert_eq!(FrameLimit::from_frames(1), FrameLimit::Bounded(1));
+        assert_eq!(FrameLimit::from_frames(600), FrameLimit::Bounded(600));
+
+        assert!(!FrameLimit::Unbounded.reached(0));
+        assert!(!FrameLimit::Unbounded.reached(u64::MAX));
+        assert!(!FrameLimit::Bounded(5).reached(4));
+        assert!(FrameLimit::Bounded(5).reached(5));
+        assert!(FrameLimit::Bounded(5).reached(6));
     }
 
     #[test]

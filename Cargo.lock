@@ -476,6 +476,7 @@ version = "0.1.0"
 name = "retro-platform"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "retro-format-v4",
  "retro-input",
  "sdl3",
