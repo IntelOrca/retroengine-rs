@@ -143,6 +143,41 @@ button continuously (idle/hold-RIGHT) but shifts every press edge by one tick.
 * `zone01_pause.input` – idle through frame 199, then START held (pause)
 * `players_split.input` – column 1 RIGHT from line 10, column 2 `LEFT|B` from line 50 (injection
   verification; use with `--record-input`)
+* `zone01_spindash.input` – S1 `Zone01`: DOWN (crouch) from line 220, `DOWN|A` charge presses on
+  270/273/276 and release on line 290 (needs the save override below)
+
+### Spindash save seeding
+
+`PlayerObject`'s startup reads `saveRAM[35]` (`options.spindash`), which the shipped
+`S1/SGame.bin` leaves `0` (with the option off, a charge press jumps instead). The reference
+window and `zone01_spindash_framebuffer_matches_reference` in
+`crates/retro-engine/tests/assets.rs` (via `spindash_storage()`) both seed word 35 to `1`; the
+test patches the little-endian `i32` at byte offset `35 * 4`. Point `run.sh` at a shadow assets
+root that symlinks the real `Data/` and serves only the patched save (the real assets are never
+written):
+
+```sh
+SHADOW=/tmp/opencode/refrun/s1-spindash-assets
+mkdir -p "$SHADOW/S1"
+ln -s /home/ted/projects/assets/S1/Data "$SHADOW/S1/Data"
+cp /home/ted/projects/assets/S1/SGame.bin "$SHADOW/S1/SGame.bin"
+python3 - "$SHADOW/S1/SGame.bin" <<'PY'
+import struct, sys
+path = sys.argv[1]
+data = bytearray(open(path, "rb").read())
+struct.pack_into("<i", data, 35 * 4, 1)  # options.spindash = 1
+open(path, "wb").write(data)
+PY
+
+tools/ref-harness/run.sh --game S1 --scene Zone01 --act 1 --frames 360 \
+    --input tools/ref-harness/testdata/zone01_spindash.input \
+    --assets-root "$SHADOW" \
+    --out /tmp/opencode/refrun/s1-spindash
+```
+
+`run.sh` copies `SGame.bin` into its scratch dir and symlinks only `Data/`, so the shadow root and
+the real asset tree both stay read-only. The resulting records reproduce every
+`S1_ZONE01_SPINDASH` pin (frames 0, 269, 290, 291, 295, 300, 304, 305, 320, 359).
 
 ## Record stream format (`records.jsonl`)
 
@@ -307,10 +342,13 @@ Per-player injection is verified with `players_split.input` (column 1 RIGHT from
 * Only the RSDKv5U rev-3 **legacy v4** path is exercised; the v3/v5 scene paths are untested.
 * Video playback, mod loader and shader paths are disabled in the harness build. S1/S2 have no
   video assets, so the stub matches the shipped data.
-* Camera styles other than `CAMERASTYLE_FOLLOW` (0) are dormant in the Rust port: upstream's
-  `HandleCameras` also dispatches `EXTENDED`/`EXTENDED_OFFSET_L`/`EXTENDED_OFFSET_R`/`HLOCKED`/
-  `FIXED`/`STATIC` and falls back to `SetPlayerLockedScreenPosition` when `cameraEnabled != 1`.
-  The verified scenes use style 0 only; a scene that switches styles will diverge.
+* Camera styles 0-6 and the `camera.enabled != 1` locked branch are ported (M8,
+  `crates/retro-engine/src/camera.rs`). Shipped S1/S2 data only exercises `CAMERASTYLE_FOLLOW`
+  (0; every M7 window) and `CAMERASTYLE_HLOCKED` (4; S1 PlayerObject spindash, pinned by
+  `S1_ZONE01_SPINDASH`). `CAMERASTYLE_STATIC` (6) is assigned only under `USE_ORIGINS`/vs mode,
+  and `CAMERASTYLE_EXTENDED`/`EXTENDED_OFFSET_L`/`EXTENDED_OFFSET_R` (1-3) and
+  `CAMERASTYLE_FIXED` (5) by no shipped S1/S2 script, so those four styles and the locked branch
+  have unit tests only, with no reference framebuffer pin.
 * Audio is the dummy SDL driver; the harness deliberately compares graphics + simulation state,
   not audio.
 * `run.sh` always regenerates `Settings.ini` with `devMenu=n`, `gameType=0`, `pixWidth=424`; use
