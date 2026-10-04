@@ -30,8 +30,15 @@ pub const TILE_LAYER_STRIDE: usize = 0x100;
 pub const TILE_LAYER_HEIGHT: usize = 0x100;
 /// Number of parallax entries (`PARALLAX_COUNT`).
 pub const PARALLAX_COUNT: usize = 0x100;
-/// `ENGINE_MAINGAME`, the only engine mode modelled by M3.
+/// `ENGINE_MAINGAME`: the engine runs `ProcessStage`.
 pub const ENGINE_MAINGAME: i32 = 1;
+/// `ENGINE_WAIT`: upstream does nothing for the frame (used while video playback owns the loop).
+pub const ENGINE_WAIT: i32 = 3;
+/// `ENGINE_INITPAUSE`: scripts set this via `engine.state`; upstream resets to
+/// `ENGINE_MAINGAME` and skips the frame's stage processing/draw.
+pub const ENGINE_INITPAUSE: i32 = 5;
+/// `ENGINE_EXITPAUSE`: like [`ENGINE_INITPAUSE`], upstream only resets the mode.
+pub const ENGINE_EXITPAUSE: i32 = 6;
 /// `STAGEMODE_LOAD`: the scene-load tick (`LoadStageFiles`), handled by the deferred load path.
 pub const STAGEMODE_LOAD: i32 = 0;
 /// `STAGEMODE_NORMAL`: the stage mode `ProcessStage` enters after finishing `STAGEMODE_LOAD`.
@@ -352,6 +359,9 @@ pub struct EngineState {
     /// Set by `LoadStage`; the runtime applies the scene switch at the start of the next frame,
     /// mirroring upstream's `stageMode = STAGEMODE_LOAD` handoff.
     pub load_stage_requested: bool,
+    /// `gameMode`: dispatched by `Legacy::v4::ProcessEngine`; scripts write it through
+    /// `engine.state` (`VAR_ENGINESTATE`).
+    pub game_mode: i32,
 }
 
 impl EngineState {
@@ -489,6 +499,7 @@ impl EngineState {
             op_histogram: BTreeMap::new(),
             stub_histogram: BTreeMap::new(),
             load_stage_requested: false,
+            game_mode: ENGINE_MAINGAME,
         }
     }
 
