@@ -2,7 +2,7 @@
 //!
 //! This is the M3 port of the `ProcessScript` engine switches in `RSDKv4/Script.cpp` plus the
 //! collision routines in `RSDKv4/Collision.cpp` (RSDKModding/RSDKv4-Decompilation @ a7f5195).
-//! Ops that only affect menus or 3D are deterministic stubs: they record themselves in
+//! Ops that only affect 3D are deterministic stubs: they record themselves in
 //! [`EngineState::stub_histogram`] and never touch entity or scene state.
 //!
 //! M5 wires the audio and save operations for real: `SetMusicTrack`/`PlayMusic`/`StopMusic`/
@@ -20,10 +20,9 @@
 //! * `stage.deformationData0..3` are script-visible views of
 //!   [`retro_render::RenderState::deform_data`]; `SetLayerDeformation` fills them and the tile
 //!   layer renderers sample them.
-//! * The legacy v4 text system (`LoadFontFile`/`LoadTextFile`/`GetTextInfo`/`DrawText`) and the
-//!   title/HUD number and act-name draws are ported for rev00..rev03; the menu ops
-//!   (`DrawMenu`, `SetupMenu`, ...) are wired to [`crate::menu::TextMenu`] methods whose bodies
-//!   land with M8 WP2 and are still counted as stubs until then.
+//! * The legacy v4 text system (`LoadFontFile`/`LoadTextFile`/`GetTextInfo`/`DrawText`), the
+//!   title/HUD number and act-name draws and the text menus (`DrawMenu`, `SetupMenu`,
+//!   `AddMenuEntry`, `EditMenuEntry`) are ported for rev00..rev03.
 //! * `LoadStage` records a deferred scene-load request; the runtime applies it at the start of
 //!   the next frame, matching `FUNC_LOADSTAGE` + `ProcessStage`'s `STAGEMODE_LOAD`.
 
@@ -1373,8 +1372,9 @@ impl ScriptHost for EngineHost<'_> {
                 self.state.record_stub(stub_name(op));
             }
             Op::DrawMenu => {
-                // M8 WP2 fills `TextMenu::draw`; until then the op stays counted as a stub.
-                self.state.record_stub(stub_name(op));
+                // `textMenuSurfaceNo = scriptInfo->spriteSheetID; DrawTextMenu(...)`
+                // (`ScriptLegacyv4.cpp:4385-4388`).
+                self.state.record_op("DrawMenu");
                 let menu_index = usize::try_from(operands[0]).unwrap_or(usize::MAX);
                 let sheet = self.current_sheet_id();
                 self.state.text_menu_surface_no = sheet;
@@ -1383,8 +1383,8 @@ impl ScriptHost for EngineHost<'_> {
                 }
             }
             Op::SetupMenu => {
-                // M8 WP2 fills `TextMenu::setup`.
-                self.state.record_stub(stub_name(op));
+                // `SetupTextMenu` + `selectionCount`/`alignment` (`ScriptLegacyv4.cpp:4660-4666`).
+                self.state.record_op("SetupMenu");
                 let menu_index = usize::try_from(operands[0]).unwrap_or(usize::MAX);
                 let (row_count, selection_count, alignment) =
                     (operands[1], operands[2], operands[3]);
@@ -1393,8 +1393,9 @@ impl ScriptHost for EngineHost<'_> {
                 }
             }
             Op::AddMenuEntry => {
-                // M8 WP2 fills `TextMenu::add_entry`.
-                self.state.record_stub(stub_name(op));
+                // The script highlight is overwritten by `AddTextMenuEntry`
+                // (`ScriptLegacyv4.cpp:4667-4672`).
+                self.state.record_op("AddMenuEntry");
                 let text = state.script_text.clone();
                 let menu_index = usize::try_from(operands[0]).unwrap_or(usize::MAX);
                 let highlight = operands[2];
@@ -1403,8 +1404,9 @@ impl ScriptHost for EngineHost<'_> {
                 }
             }
             Op::EditMenuEntry => {
-                // M8 WP2 fills `TextMenu::edit_entry`.
-                self.state.record_stub(stub_name(op));
+                // `EditTextMenuEntry` then `entryHighlight[rowID] = highlight`
+                // (`ScriptLegacyv4.cpp:4673-4678`).
+                self.state.record_op("EditMenuEntry");
                 let text = state.script_text.clone();
                 let menu_index = usize::try_from(operands[0]).unwrap_or(usize::MAX);
                 let (row_id, highlight) = (operands[2], operands[3]);
@@ -1501,9 +1503,16 @@ impl ScriptHost for EngineHost<'_> {
         } else if (VAR_KEYPRESS_FIRST..=VAR_KEYPRESS_LAST).contains(&var) {
             i32::from(array_index <= 1 && self.state.input_press.press(var).unwrap_or(false))
         } else if var == VAR_MENU1 {
-            self.state.menu1_selection
+            // `menu1.selection` is `gameMenu[0].selection1` (`ScriptLegacyv4.cpp:3824`).
+            self.state
+                .text_menus
+                .first()
+                .map_or(0, |menu| menu.selection1)
         } else if var == VAR_MENU2 {
-            self.state.menu2_selection
+            self.state
+                .text_menus
+                .get(1)
+                .map_or(0, |menu| menu.selection1)
         } else if (VAR_TILELAYER_FIRST..=VAR_TILELAYER_LAST).contains(&var) {
             self.read_tile_layer_var(var, array_index)
         } else if (VAR_HPARALLAX_FIRST..=VAR_VPARALLAX_LAST).contains(&var) {
@@ -1571,6 +1580,18 @@ impl ScriptHost for EngineHost<'_> {
         } else if var == VAR_SAVE_RAM {
             // `saveRAM[arrayVal] = value`; persistence happens on `WriteSaveRAM`.
             self.state.save.write_word(array_index, value);
+        } else if var == VAR_MENU1 || var == VAR_MENU2 {
+            // `gameMenu[0/1].selection1 = value` (`ScriptLegacyv4.cpp:5951-5952`); the summary
+            // fields keep the value in the state hash and across full scene loads.
+            let (menu_index, summary) = if var == VAR_MENU1 {
+                (0, &mut self.state.menu1_selection)
+            } else {
+                (1, &mut self.state.menu2_selection)
+            };
+            *summary = value;
+            if let Some(menu) = self.state.text_menus.get_mut(menu_index) {
+                menu.selection1 = value;
+            }
         } else if var == VAR_MUSIC_VOLUME {
             // `SetMusicVolume` (`Audio.cpp:240`); `music.position` stays read-only.
             self.state.audio.set_music_volume_level(value);
@@ -3587,6 +3608,68 @@ mod tests {
         host.engine_op(Op::DrawText, &mut vm_state).unwrap();
         assert_eq!(host.state.render.framebuffer.get(0, 0), 0xF800);
         assert_eq!(host.state.render.framebuffer.get(0, 4), 0xF800);
+    }
+
+    #[test]
+    fn menu_ops_build_and_draw_a_text_menu() {
+        let mut state = sprite_state(1);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        vm_state.operands[0] = 0; // MENU_1
+        vm_state.operands[1] = 0; // rowCount
+        vm_state.operands[2] = 3; // selectionCount
+        vm_state.operands[3] = 1; // alignment
+        host.engine_op(Op::SetupMenu, &mut vm_state).unwrap();
+        for text in ["AB", "CD"] {
+            vm_state.script_text = text.to_owned();
+            vm_state.operands[0] = 0;
+            vm_state.operands[2] = 128; // the overwritten highlight operand
+            host.engine_op(Op::AddMenuEntry, &mut vm_state).unwrap();
+        }
+        assert_eq!(host.state.text_menus[0].row_count, 2);
+        assert_eq!(host.state.text_menus[0].entry_size, vec![2, 2]);
+        assert_eq!(host.state.text_menus[0].entry_highlight, vec![0, 0]);
+        assert_eq!(host.state.text_menus[0].text_data, vec![65, 66, 67, 68]);
+
+        vm_state.operands[0] = 0;
+        vm_state.operands[1] = 4;
+        vm_state.operands[2] = 8;
+        host.engine_op(Op::DrawMenu, &mut vm_state).unwrap();
+        assert_eq!(host.state.text_menu_surface_no, 0);
+
+        vm_state.script_text = "ZX".to_owned();
+        vm_state.operands[0] = 0;
+        vm_state.operands[2] = 0; // row
+        vm_state.operands[3] = 128; // highlight
+        host.engine_op(Op::EditMenuEntry, &mut vm_state).unwrap();
+        assert_eq!(host.state.text_menus[0].entry_size[0], 2);
+        assert_eq!(host.state.text_menus[0].entry_highlight[0], 128);
+
+        for op in ["SetupMenu", "AddMenuEntry", "DrawMenu", "EditMenuEntry"] {
+            assert!(
+                host.state.op_histogram.get(op).copied().unwrap_or(0) >= 1,
+                "{op} recorded"
+            );
+            assert!(
+                !host.state.stub_histogram.contains_key(op),
+                "{op} is implemented, not a stub"
+            );
+        }
+    }
+
+    #[test]
+    fn menu_selection_variables_map_to_the_text_menu() {
+        let mut state = test_state(false);
+        let mut host = EngineHost { state: &mut state };
+        let mut vm_state = VmState::default();
+        // `menu1.selection` (198) and `menu2.selection` (199) are `gameMenu[0/1].selection1`.
+        for (var, menu_index) in [(VAR_MENU1, 0), (VAR_MENU2, 1)] {
+            host.write_engine_var(var, 0, 7, &mut vm_state).unwrap();
+            assert_eq!(host.state.text_menus[menu_index].selection1, 7);
+            assert_eq!(host.read_engine_var(var, 0, &mut vm_state).unwrap(), 7);
+        }
+        assert_eq!(host.state.menu1_selection, 7);
+        assert_eq!(host.state.menu2_selection, 7);
     }
 
     #[test]
