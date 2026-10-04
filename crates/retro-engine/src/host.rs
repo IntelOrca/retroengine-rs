@@ -89,6 +89,64 @@ const VAR_HPARALLAX_LAST: i32 = 214;
 const VAR_VPARALLAX_FIRST: i32 = 215;
 /// Last rev03 vertical parallax variable.
 const VAR_VPARALLAX_LAST: i32 = 217;
+/// First rev03 `scene3D` variable (`scene3D.vertexCount`).
+const VAR_SCENE3D_FIRST: i32 = 218;
+/// Last rev03 `scene3D` variable (`faceBuffer.color`).
+const VAR_SCENE3D_LAST: i32 = 234;
+/// `scene3D.vertexCount`.
+const VAR_SCENE3D_VERTEX_COUNT: i32 = 218;
+/// `scene3D.faceCount`.
+const VAR_SCENE3D_FACE_COUNT: i32 = 219;
+/// `scene3D.projectionX`.
+const VAR_SCENE3D_PROJECTION_X: i32 = 220;
+/// `scene3D.projectionY`.
+const VAR_SCENE3D_PROJECTION_Y: i32 = 221;
+/// `scene3D.fogColor`.
+const VAR_SCENE3D_FOG_COLOR: i32 = 222;
+/// `scene3D.fogStrength`.
+const VAR_SCENE3D_FOG_STRENGTH: i32 = 223;
+/// `scene3D.vertexBuffer[].x`.
+const VAR_VERTEX_BUFFER_X: i32 = 224;
+/// `scene3D.vertexBuffer[].y`.
+const VAR_VERTEX_BUFFER_Y: i32 = 225;
+/// `scene3D.vertexBuffer[].z`.
+const VAR_VERTEX_BUFFER_Z: i32 = 226;
+/// `scene3D.vertexBuffer[].u`.
+const VAR_VERTEX_BUFFER_U: i32 = 227;
+/// `scene3D.vertexBuffer[].v`.
+const VAR_VERTEX_BUFFER_V: i32 = 228;
+/// `scene3D.faceBuffer[].a`.
+const VAR_FACE_BUFFER_A: i32 = 229;
+/// `scene3D.faceBuffer[].b`.
+const VAR_FACE_BUFFER_B: i32 = 230;
+/// `scene3D.faceBuffer[].c`.
+const VAR_FACE_BUFFER_C: i32 = 231;
+/// `scene3D.faceBuffer[].d`.
+const VAR_FACE_BUFFER_D: i32 = 232;
+/// `scene3D.faceBuffer[].flag`.
+const VAR_FACE_BUFFER_FLAG: i32 = 233;
+/// `scene3D.faceBuffer[].color`.
+const VAR_FACE_BUFFER_COLOR: i32 = 234;
+/// Every rev03 `scene3D` variable id in order; kept alive for M9a's dispatcher.
+const VAR_SCENE3D_IDS: [i32; 17] = [
+    VAR_SCENE3D_VERTEX_COUNT,
+    VAR_SCENE3D_FACE_COUNT,
+    VAR_SCENE3D_PROJECTION_X,
+    VAR_SCENE3D_PROJECTION_Y,
+    VAR_SCENE3D_FOG_COLOR,
+    VAR_SCENE3D_FOG_STRENGTH,
+    VAR_VERTEX_BUFFER_X,
+    VAR_VERTEX_BUFFER_Y,
+    VAR_VERTEX_BUFFER_Z,
+    VAR_VERTEX_BUFFER_U,
+    VAR_VERTEX_BUFFER_V,
+    VAR_FACE_BUFFER_A,
+    VAR_FACE_BUFFER_B,
+    VAR_FACE_BUFFER_C,
+    VAR_FACE_BUFFER_D,
+    VAR_FACE_BUFFER_FLAG,
+    VAR_FACE_BUFFER_COLOR,
+];
 /// `engine.state`.
 const VAR_ENGINE_STATE: i32 = 236;
 /// `engine.language`.
@@ -476,6 +534,20 @@ impl EngineHost<'_> {
             1 => table.scroll_speed[index] = value,
             _ => table.scroll_pos[index] = value,
         }
+    }
+
+    /// `scene3D.*` reads (ids 218..=234). M9a routes these to [`EngineState::scene3d`] with
+    /// `array_index` bounds checks (`0..0x1000` for vertices, `0..0x400` for faces); this
+    /// skeleton returns 0 like the previous fallthrough.
+    fn read_scene3d_var(&self, var: i32, array_index: i32) -> i32 {
+        let _ = (var, array_index, VAR_SCENE3D_IDS);
+        0
+    }
+
+    /// `scene3D.*` writes (ids 218..=234). M9a routes these to [`EngineState::scene3d`] with
+    /// the same bounds checks; out-of-range writes are ignored.
+    fn write_scene3d_var(&mut self, var: i32, array_index: i32, value: i32) {
+        let _ = (var, array_index, value, VAR_SCENE3D_IDS);
     }
 
     fn read_camera_var(&self, var: i32, array_index: i32) -> i32 {
@@ -1417,18 +1489,76 @@ impl ScriptHost for EngineHost<'_> {
                     menu.edit_entry(&text, row_id, highlight);
                 }
             }
-            Op::Draw3DScene
-            | Op::SetIdentityMatrix
-            | Op::MatrixMultiply
-            | Op::MatrixTranslateXYZ
-            | Op::MatrixScaleXYZ
-            | Op::MatrixRotateX
-            | Op::MatrixRotateY
-            | Op::MatrixRotateZ
-            | Op::MatrixRotateXYZ
-            | Op::MatrixInverse
-            | Op::TransformVertices
-            | Op::SetScreenCount
+            // 3D op arms route to the frozen interfaces; the bodies are inert until M9a/M9b
+            // fill them, so every arm keeps `record_stub` (and its histogram) unchanged.
+            Op::Draw3DScene => {
+                // M9b: flip to `record_op("Draw3DScene")` and implement the actual draw pass.
+                self.state.record_stub(stub_name(op));
+                let sheet = self.current_sheet_id();
+                self.state.draw_3d_scene(sheet);
+            }
+            Op::SetIdentityMatrix => {
+                // M9a: flip to `record_op("SetIdentityMatrix")`.
+                self.state.record_stub(stub_name(op));
+                self.state.scene3d.set_identity(operands[0]);
+            }
+            Op::MatrixMultiply => {
+                // M9a: flip to `record_op("MatrixMultiply")`.
+                self.state.record_stub(stub_name(op));
+                self.state.scene3d.multiply(operands[0], operands[1]);
+            }
+            Op::MatrixTranslateXYZ => {
+                // M9a: flip to `record_op("MatrixTranslateXYZ")`.
+                self.state.record_stub(stub_name(op));
+                self.state.scene3d.translate_xyz(
+                    operands[0],
+                    operands[1],
+                    operands[2],
+                    operands[3],
+                );
+            }
+            Op::MatrixScaleXYZ => {
+                // M9a: flip to `record_op("MatrixScaleXYZ")`.
+                self.state.record_stub(stub_name(op));
+                self.state
+                    .scene3d
+                    .scale_xyz(operands[0], operands[1], operands[2], operands[3]);
+            }
+            Op::MatrixRotateX => {
+                // M9a: flip to `record_op("MatrixRotateX")`.
+                self.state.record_stub(stub_name(op));
+                self.state.scene3d.rotate_x(operands[0], operands[1]);
+            }
+            Op::MatrixRotateY => {
+                // M9a: flip to `record_op("MatrixRotateY")`.
+                self.state.record_stub(stub_name(op));
+                self.state.scene3d.rotate_y(operands[0], operands[1]);
+            }
+            Op::MatrixRotateZ => {
+                // M9a: flip to `record_op("MatrixRotateZ")`.
+                self.state.record_stub(stub_name(op));
+                self.state.scene3d.rotate_z(operands[0], operands[1]);
+            }
+            Op::MatrixRotateXYZ => {
+                // M9a: flip to `record_op("MatrixRotateXYZ")`.
+                self.state.record_stub(stub_name(op));
+                self.state
+                    .scene3d
+                    .rotate_xyz(operands[0], operands[1], operands[2], operands[3]);
+            }
+            Op::MatrixInverse => {
+                // M9a: flip to `record_op("MatrixInverse")`.
+                self.state.record_stub(stub_name(op));
+                self.state.scene3d.inverse(operands[0]);
+            }
+            Op::TransformVertices => {
+                // M9a: flip to `record_op("TransformVertices")`.
+                self.state.record_stub(stub_name(op));
+                self.state
+                    .scene3d
+                    .transform_vertices(operands[0], operands[1], operands[2]);
+            }
+            Op::SetScreenCount
             | Op::SetScreenVertices
             | Op::GetInputDeviceID
             | Op::GetFilteredInputDeviceID
@@ -1520,6 +1650,8 @@ impl ScriptHost for EngineHost<'_> {
             self.read_tile_layer_var(var, array_index)
         } else if (VAR_HPARALLAX_FIRST..=VAR_VPARALLAX_LAST).contains(&var) {
             self.read_parallax_var(var, array_index)
+        } else if (VAR_SCENE3D_FIRST..=VAR_SCENE3D_LAST).contains(&var) {
+            self.read_scene3d_var(var, array_index)
         } else if var == VAR_ENGINE_STATE {
             self.state.game_mode
         } else if var == VAR_ENGINE_SFX_VOLUME {
@@ -1568,6 +1700,8 @@ impl ScriptHost for EngineHost<'_> {
             self.write_tile_layer_var(var, array_index, value);
         } else if (VAR_HPARALLAX_FIRST..=VAR_VPARALLAX_LAST).contains(&var) {
             self.write_parallax_var(var, array_index, value);
+        } else if (VAR_SCENE3D_FIRST..=VAR_SCENE3D_LAST).contains(&var) {
+            self.write_scene3d_var(var, array_index, value);
         } else if (VAR_CAMERA_FIRST..=VAR_CAMERA_LAST).contains(&var) {
             self.write_camera_var(var, array_index, value);
         } else if (VAR_KEYDOWN_FIRST..=VAR_KEYDOWN_LAST).contains(&var) {

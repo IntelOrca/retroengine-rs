@@ -280,6 +280,10 @@ impl Engine {
 
     /// Runs startup events for every registered object type, in object-list order.
     pub fn run_startup(&mut self) -> Result<(), EngineError> {
+        // `STAGEMODE_LOAD` resets the 3D mesh cursors only; matrices, buffers and projection
+        // persist across loads (`SceneLegacyv4.cpp:51-52`).
+        self.state.scene3d.vertex_count = 0;
+        self.state.scene3d.face_count = 0;
         // `ProcessStartupObjects` rewinds the script frame lists and animation data and resets
         // every object's sheet/animation before the setup pass.
         for frames in &mut self.state.object_frames {

@@ -7,14 +7,17 @@
 #![forbid(unsafe_code)]
 
 pub mod draw;
+pub mod faces;
 pub mod framebuffer;
 pub mod layers;
 pub mod lookup;
 pub mod palette;
+pub mod scene3d;
 pub mod state;
 pub mod surface;
 
 pub use draw::{Canvas, FLIP_NONE, FLIP_X, FLIP_XY, FLIP_Y};
+pub use faces::FaceLines;
 pub use framebuffer::{Framebuffer, rgb565_to_rgb888, rgb888_to_rgb565};
 pub use layers::{
     ChunkEntry, LAYER_3DFLOOR, LAYER_3DSKY, LAYER_HSCROLL, LAYER_NOSCROLL, LAYER_VSCROLL,
@@ -22,6 +25,12 @@ pub use layers::{
 };
 pub use lookup::LookupTables;
 pub use palette::{ACTIVE_PALETTE, PALETTE_BANKS, PALETTE_COLORS, PaletteState};
+pub use scene3d::{
+    DrawListEntry3D, FACE_BUFFER_SIZE, FACE_FLAG_3DSPRITE, FACE_FLAG_COLORED_2D,
+    FACE_FLAG_COLORED_3D, FACE_FLAG_FADED, FACE_FLAG_TEXTURED_2D, FACE_FLAG_TEXTURED_3D,
+    FACE_FLAG_TEXTURED_C, FACE_FLAG_TEXTURED_C_BLEND, Face, MAT_TEMP, MAT_VIEW, MAT_WORLD, Matrix,
+    Scene3DState, VERTEX_BUFFER_SIZE, Vertex,
+};
 pub use state::{
     DEFORM_COUNT, DEFORM_STORE, RenderState, SURFACE_COUNT, TileSet, new_layers, new_parallax,
 };

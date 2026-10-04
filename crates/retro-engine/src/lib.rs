@@ -5,6 +5,7 @@
 pub mod audio;
 pub mod camera;
 pub mod cli;
+pub mod draw3d;
 pub mod error;
 pub mod host;
 pub mod input;
