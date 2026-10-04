@@ -256,6 +256,76 @@ fn windowed_frames_run_exits_promptly() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A headless run with no explicit frame cap must not stop on a hidden 600-frame default: it
+/// keeps running past 600 frames and exits cleanly on SIGTERM, printing the normal summary.
+#[cfg(unix)]
+#[test]
+fn headless_unbounded_run_exits_cleanly_on_signal() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let root = temp_assets("headless-unbounded");
+    write_assets(&root);
+
+    for frames_args in [Vec::<&str>::new(), vec!["--frames", "0"]] {
+        let mut child = Command::new(bin())
+            .arg(&root)
+            .arg("--headless")
+            .arg("--mute")
+            .args(&frames_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn retroengine");
+
+        // The synthetic asset load is near-instant, so the run is still going after this sleep.
+        std::thread::sleep(Duration::from_secs(2));
+        let killed = Command::new("kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .status()
+            .expect("send SIGTERM");
+        assert!(killed.success(), "kill -TERM failed");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if child.try_wait().expect("try_wait").is_some() {
+                break;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("headless run did not exit after SIGTERM (args: {frames_args:?})");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let output = child.wait_with_output().expect("wait_with_output");
+        let text = stdout(&output);
+        assert!(
+            output.status.success(),
+            "{frames_args:?}: {}",
+            stderr(&output)
+        );
+        assert!(
+            text.contains("frames: until quit (Ctrl-C/SIGTERM)"),
+            "{text}"
+        );
+        assert!(text.contains("quit: signal"), "{text}");
+        assert!(text.contains("hash: "), "{text}");
+        let executed: u64 = text
+            .lines()
+            .find_map(|line| line.strip_prefix("executed-frames: "))
+            .and_then(|value| value.trim().parse().ok())
+            .expect("summary must report executed-frames");
+        assert!(
+            executed > 600,
+            "headless default must not stop at 600 frames (ran {executed})"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A windowed scripted replay with a frame cap must exit on its own (no quit signal needed),
 /// proving the SDL event pump and the audio path do not block the frame loop.
 #[cfg(unix)]
