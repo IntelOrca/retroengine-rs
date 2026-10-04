@@ -1791,8 +1791,6 @@ impl EngineHost<'_> {
                 })
             }
             C_SOLID2 => {
-                // M8 WP4 replaces `box_collision2`'s temporary delegation with the real
-                // `BoxCollision2` port.
                 self.state.record_op("BoxCollisionTest");
                 self.with_collision_entities(|collision, entities, objects, animations| {
                     let hitbox = |_slot: usize, entity: &retro_scene::Entity| {
@@ -3110,21 +3108,36 @@ mod tests {
     }
 
     #[test]
-    fn box_collision2_delegates_to_box_collision_until_wp4() {
+    fn box_collision2_resolves_a_floor_hit_through_the_host() {
         let mut state = test_state(true);
         state
             .entities
-            .reset_object_entity(0, 1, 0, 64 << 16, 64 << 16);
+            .reset_object_entity(0, 1, 0, 100 << 16, 100 << 16);
         state
             .entities
-            .reset_object_entity(1, 2, 0, 80 << 16, 64 << 16);
+            .reset_object_entity(1, 2, 0, 100 << 16, 86 << 16);
         let mut host = EngineHost { state: &mut state };
         let mut vm_state = VmState::default();
         vm_state.operands[0] = C_SOLID2;
         vm_state.operands[1] = 0;
+        vm_state.operands[2] = -8;
+        vm_state.operands[3] = -8;
+        vm_state.operands[4] = 8;
+        vm_state.operands[5] = 8;
         vm_state.operands[6] = 1;
+        vm_state.operands[7] = -8;
+        vm_state.operands[8] = -8;
+        vm_state.operands[9] = 8;
+        vm_state.operands[10] = 8;
         host.engine_op(Op::BoxCollisionTest, &mut vm_state).unwrap();
-        assert_eq!(vm_state.check_result, 0);
+        assert_eq!(vm_state.check_result, 1);
+        let other = host.state.entities.get(1).unwrap();
+        assert_eq!(other.ypos, 84 << 16);
+        assert_eq!(
+            other.floor_sensors,
+            [1, 1, 1, 0, 0],
+            "the real BoxCollision2 writes only three floor sensors; the old delegation wrote five"
+        );
         assert_eq!(host.state.op_histogram.get("BoxCollisionTest"), Some(&1));
         assert!(!host.state.stub_histogram.contains_key("BoxCollision2"));
     }
