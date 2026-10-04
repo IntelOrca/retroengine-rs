@@ -176,6 +176,35 @@ impl AudioState {
         &self.captured
     }
 
+    /// Flow-control counters of the attached device, or `None` when no device is attached.
+    #[must_use]
+    pub fn audio_counters(&self) -> Option<retro_audio::AudioCounters> {
+        self.device.as_ref().map(AudioEngine::counters)
+    }
+
+    /// One-line `audio:` flow-control report for the attached device, or `None` without one.
+    ///
+    /// Reports the totals that diagnose playback gaps: device-accepted audio, audio dropped by a
+    /// backlog resync, resyncs, underruns, and the deepest device queue and backlog seen. This is
+    /// how a windowed run shows whether the logic loop outran (drops) or fell behind (underruns)
+    /// the device; the numbers never affect mixing or the PCM hash.
+    #[must_use]
+    pub fn audio_diagnostics(&self) -> Option<String> {
+        let counters = self.audio_counters()?;
+        let seconds = |frames: u64| frames as f64 / f64::from(SAMPLE_RATE);
+        let millis = |frames: usize| frames as f64 * 1000.0 / f64::from(SAMPLE_RATE);
+        Some(format!(
+            "submitted {:.2} s, dropped {:.2} s in {} resync(s), {} underrun(s), \
+             peak queue {:.0} ms, peak backlog {:.0} ms",
+            seconds(counters.submitted_frames),
+            seconds(counters.dropped_frames),
+            counters.resyncs,
+            counters.underruns,
+            millis(counters.max_queued_frames),
+            millis(counters.max_backlog_frames),
+        ))
+    }
+
     /// The hash of the most recent [`AudioState::tick`].
     #[must_use]
     pub const fn last_hash(&self) -> [u8; 32] {
@@ -367,9 +396,10 @@ impl AudioState {
     ///
     /// With a device attached the mixed samples are submitted through [`AudioEngine`] unless
     /// muted; the submitted buffer is exactly the hashed buffer, so device playback, `--mute`
-    /// and headless runs all agree. Submission is best-effort: a short or zero acceptance (a
-    /// full device queue) drops only device output and never changes the hash. The device is
-    /// detached only when submission returns a real error.
+    /// and headless runs all agree. A prebuffered engine retains ticks the device cannot accept
+    /// yet, so a full queue never drops a mixed tick; only a sustained overrun resyncs (counted
+    /// in [`AudioState::audio_counters`]). The device is detached only when submission returns a
+    /// real error.
     pub fn tick(&mut self) -> [u8; 32] {
         self.scratch.resize(FRAMES_PER_TICK * CHANNELS, 0.0);
         // Always mix on the single engine mixer; the device (when attached and unmuted) receives
@@ -974,6 +1004,16 @@ mod tests {
             attached.captured_pcm(),
             "the device receives the hashed samples unchanged"
         );
+        // This probe drains at one third of real time, so the engine must have resynced rather
+        // than silently skipping: the gap is counted and reported.
+        let counters = attached.audio_counters().expect("device attached");
+        assert!(counters.resyncs > 0, "a slow device must resync");
+        assert!(
+            counters.dropped_frames > 0,
+            "resyncs must count the frames they trimmed"
+        );
+        let report = attached.audio_diagnostics().expect("device attached");
+        assert!(report.contains("dropped "), "{report}");
     }
 
     #[test]

@@ -3,8 +3,9 @@
 //! The mixer keeps upstream's structure: SFX are converted to interleaved stereo 16-bit
 //! samples at 44.1 kHz when loaded, sixteen voice channels are allocated by scanning for a
 //! free or same-sound channel, and every mixed frame is accumulated in `i32`, clamped to
-//! `i16` and emitted as `f32`. Music streams are decoded up front and stepped through with
-//! a fixed-point source cursor so looping matches `ov_pcm_seek(loopPoint)`.
+//! `i16` and emitted as `f32`. Music streams are decoded on demand by [`crate::stream`] with a
+//! bounded lookahead ring and stepped through with a fixed-point source cursor, so looping
+//! matches `ov_pcm_seek(loopPoint)` without holding the whole track.
 //!
 //! # Deliberate deviations from upstream
 //!
@@ -22,6 +23,7 @@
 use blake3::Hasher;
 
 use crate::decode;
+use crate::stream::VorbisStream;
 use crate::{AudioError, CHANNELS, MAX_VOLUME, SAMPLE_RATE, SFX_CHANNEL_COUNT, SFX_COUNT};
 
 /// Identifies a loaded sound effect.
@@ -52,57 +54,35 @@ struct Voice {
     looping: bool,
 }
 
-/// A decoded music stream in its source layout.
+/// A music stream decoded on demand with a bounded lookahead ring.
 struct StreamEntry {
-    samples: Vec<i16>,
+    decoder: VorbisStream,
     channels: usize,
     sample_rate: u32,
-    frames: usize,
     step: u64,
 }
 
 impl StreamEntry {
-    fn new(decoded: decode::DecodedAudio) -> Self {
-        let frames = decoded.frames();
-        let step = (u64::from(decoded.sample_rate) << 32) / u64::from(SAMPLE_RATE);
+    fn new(decoder: VorbisStream) -> Self {
+        let channels = decoder.channels();
+        let sample_rate = decoder.sample_rate();
+        let step = (u64::from(sample_rate) << 32) / u64::from(SAMPLE_RATE);
         Self {
-            samples: decoded.samples,
-            channels: decoded.channels,
-            sample_rate: decoded.sample_rate,
-            frames,
+            decoder,
+            channels,
+            sample_rate,
             step,
         }
     }
 
+    /// Number of source PCM frames (granule-accurate).
+    fn frames(&self) -> usize {
+        self.decoder.frames()
+    }
+
     /// Linearly interpolates the stereo frame at a fixed-point source position.
-    fn frame_at(&self, position: u64) -> (i32, i32) {
-        if self.frames == 0 {
-            return (0, 0);
-        }
-        let frame = (position >> 32) as usize;
-        if frame >= self.frames {
-            return (0, 0);
-        }
-        let fraction = position & 0xFFFF_FFFF;
-        let next = (frame + 1).min(self.frames - 1);
-        let lerp = |a: i16, b: i16| -> i32 {
-            let weight = ((1u64 << 32) - fraction) as i64;
-            let value = i64::from(a) * weight + i64::from(b) * fraction as i64;
-            (value >> 32) as i32
-        };
-        let left = lerp(
-            self.samples[frame * self.channels],
-            self.samples[next * self.channels],
-        );
-        let right = if self.channels == 1 {
-            left
-        } else {
-            lerp(
-                self.samples[frame * self.channels + 1],
-                self.samples[next * self.channels + 1],
-            )
-        };
-        (left, right)
+    fn frame_at(&mut self, position: u64) -> (i32, i32) {
+        self.decoder.frame_at(position)
     }
 }
 
@@ -269,16 +249,19 @@ impl Mixer {
         }
     }
 
-    /// Decodes and stores an Ogg Vorbis music stream (`LoadMusic` upstream).
+    /// Loads an Ogg Vorbis music stream (`LoadMusic` upstream).
+    ///
+    /// Only the headers and Ogg page table are read here; audio packets are decoded on demand
+    /// with a bounded lookahead ring, so load time and memory do not scale with track length.
     pub fn load_stream(&mut self, bytes: Vec<u8>) -> Result<StreamId, AudioError> {
         if !bytes.starts_with(b"OggS") {
             return Err(AudioError::Unsupported(
                 "music streams must be Ogg Vorbis".to_owned(),
             ));
         }
-        let decoded = decode::decode(&bytes)?;
+        let decoder = VorbisStream::new(bytes)?;
         let id = StreamId(self.streams.len());
-        self.streams.push(StreamEntry::new(decoded));
+        self.streams.push(StreamEntry::new(decoder));
         Ok(id)
     }
 
@@ -292,13 +275,14 @@ impl Mixer {
         let Some(stream) = self.streams.get(id.0) else {
             return;
         };
-        let loop_point = if loop_point >= 0 && stream.frames > 0 {
-            Some((loop_point as usize).min(stream.frames - 1))
+        let frames = stream.frames();
+        let loop_point = if loop_point >= 0 && frames > 0 {
+            Some((loop_point as usize).min(frames - 1))
         } else {
             None
         };
         self.current_stream = Some(id.0);
-        self.stream_playing = stream.frames > 0;
+        self.stream_playing = frames > 0;
         self.stream_paused = false;
         self.stream_position = 0;
         self.stream_loop = loop_point;
@@ -368,7 +352,7 @@ impl Mixer {
     /// Number of source frames in a loaded stream.
     #[must_use]
     pub fn stream_frames(&self, id: StreamId) -> Option<usize> {
-        self.streams.get(id.0).map(|entry| entry.frames)
+        self.streams.get(id.0).map(StreamEntry::frames)
     }
 
     /// Source sample rate of a loaded stream.
@@ -440,15 +424,16 @@ impl Mixer {
         let Some(index) = self.current_stream else {
             return;
         };
-        let Some(stream) = self.streams.get(index) else {
+        let Some(stream) = self.streams.get_mut(index) else {
             self.stream_playing = false;
             return;
         };
-        if stream.frames == 0 {
+        let frames = stream.frames();
+        if frames == 0 {
             self.stream_playing = false;
             return;
         }
-        if (self.stream_position >> 32) as usize >= stream.frames {
+        if (self.stream_position >> 32) as usize >= frames {
             match self.stream_loop {
                 Some(loop_point) => self.stream_position = (loop_point as u64) << 32,
                 None => {
@@ -539,6 +524,7 @@ fn hash_samples(samples: &[f32]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FRAMES_PER_TICK;
     use crate::wav::build_wav;
 
     const TONE: &[u8] = include_bytes!("../tests/fixtures/tone.ogg");
@@ -977,5 +963,394 @@ mod tests {
         assert_eq!(mixer.sfx_volume(), 100);
         mixer.set_stream_volume(f32::NAN);
         assert_eq!(mixer.stream_volume(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming decode equivalence (whole-track reference vs on-demand ring)
+    // -----------------------------------------------------------------------
+
+    const TONE_MONO: &[u8] = include_bytes!("../tests/fixtures/tone_mono.ogg");
+
+    /// The whole-buffer interpolation the pre-streaming `StreamEntry` implemented.
+    fn reference_frame(
+        samples: &[i16],
+        channels: usize,
+        position: u64,
+        frames: usize,
+    ) -> (i32, i32) {
+        if frames == 0 {
+            return (0, 0);
+        }
+        let frame = (position >> 32) as usize;
+        if frame >= frames {
+            return (0, 0);
+        }
+        let fraction = position & 0xFFFF_FFFF;
+        let next = (frame + 1).min(frames - 1);
+        let lerp = |a: i16, b: i16| -> i32 {
+            let weight = ((1u64 << 32) - fraction) as i64;
+            let value = i64::from(a) * weight + i64::from(b) * fraction as i64;
+            (value >> 32) as i32
+        };
+        let left = lerp(samples[frame * channels], samples[next * channels]);
+        let right = if channels == 1 {
+            left
+        } else {
+            lerp(samples[frame * channels + 1], samples[next * channels + 1])
+        };
+        (left, right)
+    }
+
+    /// Mixes `frames` frames of the whole-buffer reference stream into `out`.
+    fn reference_mix(
+        decoded: &crate::decode::DecodedAudio,
+        position: &mut u64,
+        loop_point: Option<usize>,
+        out: &mut [f32],
+        frames: usize,
+    ) {
+        let total = decoded.frames();
+        let step = (u64::from(decoded.sample_rate) << 32) / u64::from(SAMPLE_RATE);
+        let mut playing = true;
+        for frame in out[..frames * CHANNELS].as_chunks_mut::<CHANNELS>().0 {
+            if !playing {
+                frame[0] = 0.0;
+                frame[1] = 0.0;
+                continue;
+            }
+            if (*position >> 32) as usize >= total {
+                match loop_point {
+                    Some(loop_point) => *position = (loop_point as u64) << 32,
+                    None => {
+                        playing = false;
+                        frame[0] = 0.0;
+                        frame[1] = 0.0;
+                        continue;
+                    }
+                }
+            }
+            let (left, right) =
+                reference_frame(&decoded.samples, decoded.channels, *position, total);
+            frame[0] = left as f32 / 32768.0;
+            frame[1] = right as f32 / 32768.0;
+            *position += step;
+        }
+    }
+
+    /// Runs the streaming mixer and the whole-buffer reference over the same playback and compares
+    /// every mixed frame.
+    fn assert_stream_matches_reference(
+        bytes: &[u8],
+        loop_point: Option<i32>,
+        output_frames: usize,
+        label: &str,
+    ) {
+        let decoded = crate::vorbis::decode_vorbis(bytes).unwrap();
+        let mut mixer = Mixer::new();
+        let id = mixer.load_stream(bytes.to_vec()).unwrap();
+        assert_eq!(
+            mixer.stream_frames(id),
+            Some(decoded.frames()),
+            "{label}: stream length"
+        );
+        mixer.play_stream(id, loop_point.unwrap_or(-1));
+
+        let mut position = 0u64;
+        let mut out = vec![0.0f32; FRAMES_PER_TICK * CHANNELS];
+        let mut expected = vec![0.0f32; FRAMES_PER_TICK * CHANNELS];
+        let mut remaining = output_frames;
+        while remaining > 0 {
+            let frames = remaining.min(FRAMES_PER_TICK);
+            expected.fill(0.0);
+            reference_mix(
+                &decoded,
+                &mut position,
+                loop_point.map(|point| point as usize),
+                &mut expected,
+                frames,
+            );
+            mixer.mix_frame(&mut out, frames);
+            let count = frames * CHANNELS;
+            if out[..count] != expected[..count] {
+                let index = out[..count]
+                    .iter()
+                    .zip(&expected[..count])
+                    .position(|(got, want)| got != want)
+                    .expect("slices differ");
+                panic!(
+                    "{label}: mixed frame {} sample {} differs: got {} want {}",
+                    output_frames - remaining + index / CHANNELS,
+                    index,
+                    out[index],
+                    expected[index]
+                );
+            }
+            remaining -= frames;
+        }
+    }
+
+    #[test]
+    fn streaming_decode_matches_whole_decode_at_every_position() {
+        for (bytes, channels) in [(TONE, 2usize), (TONE_MONO, 1usize)] {
+            let decoded = crate::vorbis::decode_vorbis(bytes).unwrap();
+            assert_eq!(decoded.channels, channels);
+            let frames = decoded.frames();
+            let mut mixer = Mixer::new();
+            let id = mixer.load_stream(bytes.to_vec()).unwrap();
+            assert_eq!(mixer.stream_frames(id), Some(frames));
+            for frame in 0..frames {
+                let position = (frame as u64) << 32;
+                let got = mixer.streams[id.0].frame_at(position);
+                let want = reference_frame(&decoded.samples, channels, position, frames);
+                assert_eq!(got, want, "frame {frame}");
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_decode_matches_whole_decode_when_looping() {
+        let frames = crate::vorbis::decode_vorbis(TONE).unwrap().frames();
+        for loop_point in [0i32, 1, 100, 700, frames as i32 - 1] {
+            assert_stream_matches_reference(
+                TONE,
+                Some(loop_point),
+                frames * 3 + 17,
+                &format!("loop {loop_point}"),
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_decode_matches_whole_decode_without_looping() {
+        let frames = crate::vorbis::decode_vorbis(TONE).unwrap().frames();
+        assert_stream_matches_reference(TONE, None, frames + 200, "once");
+    }
+
+    #[test]
+    fn streaming_decode_buffers_are_bounded() {
+        let mut mixer = Mixer::new();
+        let id = mixer.load_stream(TONE.to_vec()).unwrap();
+        mixer.play_stream(id, 0);
+        let mut out = vec![0.0f32; FRAMES_PER_TICK * CHANNELS];
+        for _ in 0..64 {
+            mixer.mix_frame(&mut out, FRAMES_PER_TICK);
+            assert!(
+                mixer.streams[id.0].decoder.buffered_frames() <= crate::stream::STREAM_RING_FRAMES,
+                "decoded buffer above the ring size"
+            );
+        }
+    }
+
+    /// Frames a raw packet decode produces, before granule truncation.
+    fn raw_decoded_frames(bytes: &[u8]) -> usize {
+        let mut reader =
+            lewton::inside_ogg::OggStreamReader::new(std::io::Cursor::new(bytes)).unwrap();
+        let channels = usize::from(reader.ident_hdr.audio_channels);
+        let mut frames = 0;
+        while let Some(packet) = reader.read_dec_packet_itl().unwrap() {
+            frames += packet.len() / channels;
+        }
+        frames
+    }
+
+    #[test]
+    fn streaming_decode_applies_the_final_granule_truncation() {
+        // Vorbis pads the final packet, so the raw decode produces more frames than the last page
+        // granule allows. The streaming length must use the same clamp as the whole decode, and
+        // the padded tail must never be reachable by interpolation.
+        for bytes in [TONE, TONE_MONO] {
+            let decoded = crate::vorbis::decode_vorbis(bytes).unwrap();
+            let frames = decoded.frames();
+            let raw_frames = raw_decoded_frames(bytes);
+            assert!(
+                frames < raw_frames,
+                "fixture must exercise final-block padding ({frames} of {raw_frames})"
+            );
+
+            let mut mixer = Mixer::new();
+            let id = mixer.load_stream(bytes.to_vec()).unwrap();
+            assert_eq!(
+                mixer.stream_frames(id),
+                Some(frames),
+                "streaming length must match the granule clamp"
+            );
+            let last = ((frames - 1) as u64) << 32;
+            assert_eq!(
+                mixer.streams[id.0].frame_at(last),
+                reference_frame(&decoded.samples, decoded.channels, last, frames),
+                "last valid frame must match the whole decode"
+            );
+            assert_eq!(
+                mixer.streams[id.0].frame_at((frames as u64) << 32),
+                (0, 0),
+                "the padded tail is past the granule"
+            );
+        }
+    }
+
+    #[test]
+    fn looping_does_not_grow_the_anchor_table() {
+        let mut mixer = Mixer::new();
+        let id = mixer.load_stream(TONE.to_vec()).unwrap();
+        let frames = mixer.stream_frames(id).unwrap();
+        mixer.play_stream(id, 0);
+        let mut out = vec![0.0f32; FRAMES_PER_TICK * CHANNELS];
+
+        // One full pass records an anchor at every page boundary.
+        for _ in 0..frames.div_ceil(FRAMES_PER_TICK) {
+            mixer.mix_frame(&mut out, FRAMES_PER_TICK);
+        }
+        let anchors = mixer.streams[id.0].decoder.anchor_count();
+        assert!(anchors > 0, "a page-anchored stream must record anchors");
+
+        // Three more loops re-decode the same pages; already-recorded granules must be reused.
+        for _ in 0..(frames * 3).div_ceil(FRAMES_PER_TICK) {
+            mixer.mix_frame(&mut out, FRAMES_PER_TICK);
+        }
+        assert_eq!(
+            mixer.streams[id.0].decoder.anchor_count(),
+            anchors,
+            "anchors are keyed by page granule and must not grow per loop"
+        );
+    }
+
+    #[test]
+    fn streaming_decode_matches_whole_decode_for_dense_loop_points() {
+        // Sweep loop points across both restart paths (from-zero discard and page-anchor seek)
+        // and compare every mixed frame with the whole-buffer reference.
+        let frames = crate::vorbis::decode_vorbis(TONE).unwrap().frames();
+        let mut loop_point = 1i32;
+        while loop_point < frames as i32 {
+            assert_stream_matches_reference(
+                TONE,
+                Some(loop_point),
+                frames + 64,
+                &format!("loop {loop_point}"),
+            );
+            loop_point += 137;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Asset-gated streaming equivalence (ignored by default; run with --ignored)
+    // -----------------------------------------------------------------------
+
+    fn assets_root() -> Option<std::path::PathBuf> {
+        let root = std::env::var_os("RETRO_ASSETS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/home/ted/projects/assets"));
+        root.is_dir().then_some(root)
+    }
+
+    fn collect_ogg(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_ogg(&path, out);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("ogg"))
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the S1/S2 asset folders (RETRO_ASSETS or /home/ted/projects/assets)"]
+    fn streaming_matches_whole_decode_for_every_music_stream() {
+        let Some(root) = assets_root() else {
+            eprintln!("assets not found; skipping");
+            return;
+        };
+        let mut files = Vec::new();
+        for game in ["S1", "S2"] {
+            collect_ogg(&root.join(game).join("Data").join("Music"), &mut files);
+        }
+        files.sort();
+        assert!(!files.is_empty());
+        let mut checked = 0usize;
+        for path in &files {
+            let bytes = std::fs::read(path).unwrap();
+            let decoded = crate::vorbis::decode_vorbis(&bytes).unwrap();
+            let frames = decoded.frames();
+            assert_stream_matches_reference(&bytes, None, frames + 32, &path.display().to_string());
+
+            // Restarting at synthetic loop points (all after at least one page boundary) exercises
+            // the page-anchor seek path against the whole-buffer reference.
+            for loop_point in [1, frames / 4, frames / 2, frames - 2] {
+                let loop_point = loop_point.max(1).min(frames - 1);
+                assert_stream_matches_reference(
+                    &bytes,
+                    Some(loop_point as i32),
+                    frames + frames / 2,
+                    &format!("{} loop {loop_point}", path.display()),
+                );
+            }
+            checked += 1;
+        }
+        println!("checked {checked} streams");
+    }
+
+    #[test]
+    #[ignore = "requires the S1/S2 asset folders (RETRO_ASSETS or /home/ted/projects/assets)"]
+    fn streaming_decode_memory_does_not_scale_with_track_length() {
+        let Some(root) = assets_root() else {
+            eprintln!("assets not found; skipping");
+            return;
+        };
+        let mut files = Vec::new();
+        collect_ogg(&root.join("S2").join("Data").join("Music"), &mut files);
+        let path = files
+            .into_iter()
+            .max_by_key(|path| std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0))
+            .expect("S2 music");
+        let bytes = std::fs::read(&path).unwrap();
+        let compressed_bytes = bytes.len();
+        let mut mixer = Mixer::new();
+        let id = mixer.load_stream(bytes).unwrap();
+        let frames = mixer.stream_frames(id).unwrap();
+        assert!(
+            frames > crate::stream::STREAM_RING_FRAMES * 100,
+            "{} is too short to prove bounded memory ({frames} frames)",
+            path.display()
+        );
+        mixer.play_stream(id, 0);
+
+        // Mix the whole track without ever holding more than the fixed ring: if the decoder
+        // buffered the track (as the old whole-track load did), resident state would be
+        // `frames * channels * 2` bytes rather than a constant.
+        let mut out = vec![0.0f32; FRAMES_PER_TICK * CHANNELS];
+        let mut max_ring = 0usize;
+        let mut max_state = 0usize;
+        let mut mixed = 0usize;
+        while mixed < frames {
+            let count = (frames - mixed).min(FRAMES_PER_TICK);
+            mixer.mix_frame(&mut out, count);
+            mixed += count;
+            let decoder = &mixer.streams[id.0].decoder;
+            max_ring = max_ring.max(decoder.buffered_frames());
+            max_state = max_state.max(decoder.decoded_state_bytes());
+        }
+        assert!(
+            max_ring <= crate::stream::STREAM_RING_FRAMES,
+            "decoded buffer scales with track length (peak {max_ring} frames)"
+        );
+        let ring_bytes = crate::stream::STREAM_RING_FRAMES * CHANNELS * std::mem::size_of::<i16>();
+        assert!(
+            max_state < ring_bytes * 4,
+            "decoded state {max_state} B must stay near the {ring_bytes} B ring"
+        );
+        println!(
+            "{}: {} B compressed, mixed {mixed} frames ({:.1} s) with peak ring {max_ring} frames \
+             and {max_state} B decoded state (whole-track PCM would be {} B)",
+            path.display(),
+            compressed_bytes,
+            frames as f64 / f64::from(SAMPLE_RATE),
+            frames * CHANNELS * std::mem::size_of::<i16>(),
+        );
     }
 }

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
-use retro_audio::{AudioEngine, MAX_QUEUED_TICKS, PREBUFFER_TICKS, SAMPLE_RATE};
+use retro_audio::{AudioEngine, MAX_BACKLOG_TICKS, MAX_QUEUED_TICKS, PREBUFFER_TICKS, SAMPLE_RATE};
 use retro_format_v4::GameConfig;
 use retro_input::ScriptedInput;
 use retro_io::{DataSource, DirSource};
@@ -411,7 +411,8 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
                         Ok(audio) => {
                             println!(
                                 "audio: {SAMPLE_RATE} Hz stereo f32 ({description}, \
-                                 {PREBUFFER_TICKS}-tick prebuffer, {MAX_QUEUED_TICKS}-tick cap)"
+                                 {PREBUFFER_TICKS}-tick prebuffer, {MAX_QUEUED_TICKS}-tick queue, \
+                                 {MAX_BACKLOG_TICKS}-tick backlog)"
                             );
                             engine.set_audio_device(audio);
                         }
@@ -500,6 +501,12 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         if args.audio_hash {
             println!("{frame},{}", engine.audio_hash());
         }
+    }
+
+    // Device flow-control totals: dropped ticks (overrun resyncs) and underruns are the audible
+    // gaps the frame loop cannot show, so they are always reported for windowed runs.
+    if let Some(report) = engine.audio_diagnostics() {
+        println!("audio: {report}");
     }
 
     if !engine.flush_save() {
