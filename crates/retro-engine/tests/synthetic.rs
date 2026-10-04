@@ -143,6 +143,46 @@ fn synthetic_scene_runs_sixty_frames_deterministically() {
     assert_eq!(outcome.frame_hashes, replay.frame_hashes);
 }
 
+/// `engine.state = 5` (`ENGINE_INITPAUSE`) makes upstream skip exactly one stage frame and reset
+/// the mode; the port used to process the frame normally, which shifted the shared ring animation
+/// (and the reference framebuffer) by one frame.
+#[test]
+fn init_pause_skips_exactly_one_stage_frame() {
+    let mut engine = Engine::load(source(), None, None, DEFAULT_SEED).unwrap();
+    engine.run_frame().unwrap();
+    let slot = retro_scene::SCENE_ENTITY_START;
+    let before = engine
+        .state
+        .entities
+        .get(slot)
+        .expect("scene entity")
+        .values[0];
+
+    engine.state.game_mode = retro_engine::state::ENGINE_INITPAUSE;
+    engine.run_frame().unwrap();
+    assert_eq!(
+        engine.state.game_mode,
+        retro_engine::state::ENGINE_MAINGAME,
+        "the pause mode resets after one frame"
+    );
+    let skipped = engine
+        .state
+        .entities
+        .get(slot)
+        .expect("scene entity")
+        .values[0];
+    assert_eq!(skipped, before, "the skipped frame runs no object updates");
+
+    engine.run_frame().unwrap();
+    let resumed = engine
+        .state
+        .entities
+        .get(slot)
+        .expect("scene entity")
+        .values[0];
+    assert_eq!(resumed, before + 1, "the next frame updates normally again");
+}
+
 #[test]
 fn different_seed_changes_the_state_hash() {
     let mut first = Engine::load(source(), None, None, 1).unwrap();
