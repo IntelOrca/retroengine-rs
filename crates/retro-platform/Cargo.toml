@@ -16,6 +16,9 @@ sdl3 = ["dep:sdl3", "dep:sdl3-sys"]
 [dependencies]
 retro-input.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 retro-format-v4.workspace = true
 
