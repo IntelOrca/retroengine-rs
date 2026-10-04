@@ -46,14 +46,16 @@ cargo build --release
 ## Running
 
 ```sh
-../target/release/retroengine /path/to/assets/S1                # windowed until the window closes
-../target/release/retroengine /path/to/assets/S1 --headless     # 600 deterministic frames
+../target/release/retroengine /path/to/assets/S1                    # windowed until the window closes
+../target/release/retroengine /path/to/assets/S1 --headless         # headless until Ctrl-C
+../target/release/retroengine /path/to/assets/S1 --headless --frames 600 # 600 deterministic frames
 ```
 
 `<ASSETS_DIR>` must be an unpacked RSDK asset folder containing `Data/Game/GameConfig.bin`
 (a Sonic 1 `S1` or Sonic 2 `S2` folder). Without `--headless` the game opens in an SDL3 window
-and runs until the window closes; `--frames N` caps either mode, and headless runs without
-`--frames` default to 600 frames. `--list` prints the scene table without loading a stage.
+and runs until the window closes; with `--headless` it runs until `SIGINT`/`SIGTERM` (Ctrl-C).
+`--frames N` caps either mode after `N` frames; `--frames 0` (also the default) means no cap.
+`--list` prints the scene table without loading a stage.
 
 On this Linux server the source-built SDL3 only has the dummy/offscreen video drivers (no
 X11/Wayland development packages are installed), so windowed mode cannot show a window here.
@@ -97,6 +99,7 @@ device or an unusual driver is visible in the log without aborting the run.
 
 If the window appears unresponsive, rerun with `--frames N`: the frame loop exits after `N` frames
 even when the window is never focused or receives no close event, so the session cannot hang.
+Headless runs stop cleanly on Ctrl-C/SIGTERM and print the normal summary before exiting.
 Include the `platform:`/`audio:`/`video:` startup lines when reporting the problem.
 
 Full verification:
