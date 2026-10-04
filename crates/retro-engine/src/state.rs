@@ -30,15 +30,29 @@ pub const TILE_LAYER_STRIDE: usize = 0x100;
 pub const TILE_LAYER_HEIGHT: usize = 0x100;
 /// Number of parallax entries (`PARALLAX_COUNT`).
 pub const PARALLAX_COUNT: usize = 0x100;
+/// `ENGINE_DEVMENU`: upstream's dev menu owns the frame (`RetroEngineLegacy.hpp:10-15`); not
+/// modelled.
+pub const ENGINE_DEVMENU: i32 = 0;
 /// `ENGINE_MAINGAME`: the engine runs `ProcessStage`.
 pub const ENGINE_MAINGAME: i32 = 1;
+/// `ENGINE_INITDEVMENU`: upstream loads the game config and first stage
+/// (`RetroEnginev4.cpp:258-262`); not modelled.
+pub const ENGINE_INITDEVMENU: i32 = 2;
 /// `ENGINE_WAIT`: upstream does nothing for the frame (used while video playback owns the loop).
 pub const ENGINE_WAIT: i32 = 3;
+/// `ENGINE_SCRIPTERROR`: upstream draws the script-error screen (`RetroEnginev4.cpp:268-294`);
+/// not modelled.
+pub const ENGINE_SCRIPTERROR: i32 = 4;
 /// `ENGINE_INITPAUSE`: scripts set this via `engine.state`; upstream resets to
 /// `ENGINE_MAINGAME` and skips the frame's stage processing/draw.
 pub const ENGINE_INITPAUSE: i32 = 5;
 /// `ENGINE_EXITPAUSE`: like [`ENGINE_INITPAUSE`], upstream only resets the mode.
 pub const ENGINE_EXITPAUSE: i32 = 6;
+/// `ENGINE_ENDGAME`: resets to the first GameConfig entry and requests `STAGEMODE_LOAD`
+/// (`RetroEnginev4.cpp:300-305`).
+pub const ENGINE_ENDGAME: i32 = 7;
+/// `ENGINE_RESETGAME`: shares [`ENGINE_ENDGAME`]'s case in `RetroEnginev4.cpp:300-305`.
+pub const ENGINE_RESETGAME: i32 = 8;
 /// `STAGEMODE_LOAD`: the scene-load tick (`LoadStageFiles`), handled by the deferred load path.
 pub const STAGEMODE_LOAD: i32 = 0;
 /// `STAGEMODE_NORMAL`: the stage mode `ProcessStage` enters after finishing `STAGEMODE_LOAD`.
@@ -82,6 +96,10 @@ pub struct FontCharacter {
 }
 
 /// One legacy v4 text menu (`TextMenu`), storing rows of character ids.
+///
+/// Field set and types mirror `Storage/Legacy/TextLegacy.hpp:11-40`; the fixed C arrays are
+/// `Vec`s here. `entry_highlight` stays parallel with `entry_start`/`entry_size` and holds the
+/// upstream `uint8` value (`0`/`128` are the shipped highlight masks).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct TextMenu {
     /// Character ids per row, concatenated (`textData`).
@@ -90,10 +108,26 @@ pub struct TextMenu {
     pub entry_start: Vec<i32>,
     /// Character count of each row.
     pub entry_size: Vec<i32>,
+    /// Per-row highlight flag (`entryHighlight`).
+    pub entry_highlight: Vec<u8>,
     /// Current write position.
     pub text_data_pos: usize,
+    /// First selected row (`selection1`).
+    pub selection1: i32,
+    /// Second selected row (`selection2`); `-1` when unset.
+    pub selection2: i32,
     /// Number of rows.
     pub row_count: i32,
+    /// Visible row count (`visibleRowCount`); zero means "draw every row".
+    pub visible_row_count: i32,
+    /// First visible row (`visibleRowOffset`).
+    pub visible_row_offset: i32,
+    /// `MENU_ALIGN_*` value (`alignment`).
+    pub alignment: i32,
+    /// Number of selections drawn (`selectionCount`).
+    pub selection_count: i32,
+    /// Menu timer (`timer`), upstream `int8`.
+    pub timer: i8,
 }
 
 impl TextMenu {
@@ -101,10 +135,12 @@ impl TextMenu {
         self.text_data.clear();
         self.entry_start.clear();
         self.entry_size.clear();
+        self.entry_highlight.clear();
         self.text_data_pos = 0;
         self.row_count = 0;
         self.entry_start.push(0);
         self.entry_size.push(0);
+        self.entry_highlight.push(0);
     }
 
     fn new_row(&mut self) {
@@ -114,6 +150,7 @@ impl TextMenu {
         }
         self.entry_start.push(self.text_data_pos as i32);
         self.entry_size.push(0);
+        self.entry_highlight.push(0);
     }
 
     fn push_char(&mut self, value: u16) {

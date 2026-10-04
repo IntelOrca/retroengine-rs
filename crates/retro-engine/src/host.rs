@@ -12,16 +12,18 @@
 //!
 //! Known gaps (documented, deterministic):
 //!
-//! * `BoxCollision2` (upstream's "barely used in S2" variant) and the 3D matrix/vertex ops are
-//!   explicit stubs (see [`EngineState::stub_histogram`]); `TouchCollision`, `BoxCollision`,
+//! * `BoxCollision2` is wired through `SceneCollision::box_collision2`, which currently delegates
+//!   to `BoxCollision` until M8 WP4 lands the exact port; the 3D matrix/vertex ops are explicit
+//!   stubs (see [`EngineState::stub_histogram`]); `TouchCollision`, `BoxCollision`,
 //!   `PlatformCollision`, `Get16x16TileInfo`, `Set16x16TileInfo` and `Copy16x16Tile` are fully
 //!   ported.
 //! * `stage.deformationData0..3` are script-visible views of
 //!   [`retro_render::RenderState::deform_data`]; `SetLayerDeformation` fills them and the tile
 //!   layer renderers sample them.
 //! * The legacy v4 text system (`LoadFontFile`/`LoadTextFile`/`GetTextInfo`/`DrawText`) and the
-//!   title/HUD number and act-name draws are ported for rev00..rev03; the newer menu ops
-//!   (`DrawMenu`, `SetupMenu`, ...) remain stubs.
+//!   title/HUD number and act-name draws are ported for rev00..rev03; the menu ops
+//!   (`DrawMenu`, `SetupMenu`, ...) are wired to [`crate::menu::TextMenu`] methods whose bodies
+//!   land with M8 WP2 and are still counted as stubs until then.
 //! * `LoadStage` records a deferred scene-load request; the runtime applies it at the start of
 //!   the next frame, matching `FUNC_LOADSTAGE` + `ProcessStage`'s `STAGEMODE_LOAD`.
 
@@ -1370,11 +1372,47 @@ impl ScriptHost for EngineHost<'_> {
             Op::Print => {
                 self.state.record_stub(stub_name(op));
             }
-            Op::DrawMenu
-            | Op::Draw3DScene
-            | Op::SetupMenu
-            | Op::AddMenuEntry
-            | Op::EditMenuEntry
+            Op::DrawMenu => {
+                // M8 WP2 fills `TextMenu::draw`; until then the op stays counted as a stub.
+                self.state.record_stub(stub_name(op));
+                let menu_index = usize::try_from(operands[0]).unwrap_or(usize::MAX);
+                let sheet = self.current_sheet_id();
+                self.state.text_menu_surface_no = sheet;
+                if let Some(menu) = self.state.text_menus.get_mut(menu_index) {
+                    menu.draw(&mut self.state.render, operands[1], operands[2], sheet);
+                }
+            }
+            Op::SetupMenu => {
+                // M8 WP2 fills `TextMenu::setup`.
+                self.state.record_stub(stub_name(op));
+                let menu_index = usize::try_from(operands[0]).unwrap_or(usize::MAX);
+                let (row_count, selection_count, alignment) =
+                    (operands[1], operands[2], operands[3]);
+                if let Some(menu) = self.state.text_menus.get_mut(menu_index) {
+                    menu.setup(row_count, selection_count, alignment);
+                }
+            }
+            Op::AddMenuEntry => {
+                // M8 WP2 fills `TextMenu::add_entry`.
+                self.state.record_stub(stub_name(op));
+                let text = state.script_text.clone();
+                let menu_index = usize::try_from(operands[0]).unwrap_or(usize::MAX);
+                let highlight = operands[2];
+                if let Some(menu) = self.state.text_menus.get_mut(menu_index) {
+                    menu.add_entry(&text, highlight);
+                }
+            }
+            Op::EditMenuEntry => {
+                // M8 WP2 fills `TextMenu::edit_entry`.
+                self.state.record_stub(stub_name(op));
+                let text = state.script_text.clone();
+                let menu_index = usize::try_from(operands[0]).unwrap_or(usize::MAX);
+                let (row_id, highlight) = (operands[2], operands[3]);
+                if let Some(menu) = self.state.text_menus.get_mut(menu_index) {
+                    menu.edit_entry(&text, row_id, highlight);
+                }
+            }
+            Op::Draw3DScene
             | Op::SetIdentityMatrix
             | Op::MatrixMultiply
             | Op::MatrixTranslateXYZ
@@ -1753,10 +1791,28 @@ impl EngineHost<'_> {
                 })
             }
             C_SOLID2 => {
-                // `BoxCollision2` is a separate ~300-line routine that upstream itself notes
-                // is "barely used in S2"; it is an explicit M3 stub.
-                self.state.record_stub("BoxCollision2");
-                0
+                // M8 WP4 replaces `box_collision2`'s temporary delegation with the real
+                // `BoxCollision2` port.
+                self.state.record_op("BoxCollisionTest");
+                self.with_collision_entities(|collision, entities, objects, animations| {
+                    let hitbox = |_slot: usize, entity: &retro_scene::Entity| {
+                        crate::state::hitbox_from(objects, animations, entity)
+                    };
+                    collision.box_collision2(
+                        entities,
+                        this_slot,
+                        operands[2],
+                        operands[3],
+                        operands[4],
+                        operands[5],
+                        other_slot,
+                        operands[7],
+                        operands[8],
+                        operands[9],
+                        operands[10],
+                        &hitbox,
+                    )
+                })
             }
             _ => 0,
         }
@@ -3054,7 +3110,7 @@ mod tests {
     }
 
     #[test]
-    fn box_collision2_is_reported_as_an_explicit_stub() {
+    fn box_collision2_delegates_to_box_collision_until_wp4() {
         let mut state = test_state(true);
         state
             .entities
@@ -3069,8 +3125,8 @@ mod tests {
         vm_state.operands[6] = 1;
         host.engine_op(Op::BoxCollisionTest, &mut vm_state).unwrap();
         assert_eq!(vm_state.check_result, 0);
-        assert_eq!(host.state.stub_histogram.get("BoxCollision2"), Some(&1));
-        assert!(!host.state.op_histogram.contains_key("BoxCollisionTest"));
+        assert_eq!(host.state.op_histogram.get("BoxCollisionTest"), Some(&1));
+        assert!(!host.state.stub_histogram.contains_key("BoxCollision2"));
     }
 
     #[test]

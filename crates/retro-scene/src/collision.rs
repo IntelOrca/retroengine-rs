@@ -1803,6 +1803,45 @@ impl SceneCollision {
         }
     }
 
+    /// `BoxCollision2`: the alternate solid interaction selected by `C_SOLID2`.
+    ///
+    /// Upstream's routine (`CollisionLegacyv4.cpp:2644-2946`) has the same argument list and
+    /// `scriptEng.checkResult` mapping as [`SceneCollision::box_collision`] (`0`/`1`/`2`/`3`/`4`)
+    /// but uses its own sensor probes. This temporary body delegates to `box_collision` so the
+    /// host call site and tests compile; the real port lands with M8 WP4.
+    // M8 WP4 replaces this
+    #[allow(clippy::too_many_arguments)]
+    pub fn box_collision2(
+        &self,
+        store: &mut EntityStore,
+        this_slot: usize,
+        this_left: i32,
+        this_top: i32,
+        this_right: i32,
+        this_bottom: i32,
+        other_slot: usize,
+        other_left: i32,
+        other_top: i32,
+        other_right: i32,
+        other_bottom: i32,
+        resolve_hitbox: &dyn Fn(usize, &Entity) -> Hitbox,
+    ) -> i32 {
+        self.box_collision(
+            store,
+            this_slot,
+            this_left,
+            this_top,
+            this_right,
+            this_bottom,
+            other_slot,
+            other_left,
+            other_top,
+            other_right,
+            other_bottom,
+            resolve_hitbox,
+        )
+    }
+
     /// `PlatformCollision`: one-way solid-top interaction used by moving platforms.
     ///
     /// Ported from `PlatformCollision` in `RSDKv4/Collision.cpp`; returns upstream's
