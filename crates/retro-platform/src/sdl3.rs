@@ -984,17 +984,20 @@ const FRAME_PERIOD: Duration = Duration::from_micros(1_000_000 / TARGET_FPS);
 /// Wall-clock driven fixed-step clock.
 ///
 /// The clock paces the windowed loop to real time: frame `n` is due `n` periods after the
-/// schedule origin. It deliberately does **not** replay missed time as a catch-up burst. If the
-/// loop falls at least one full frame behind the schedule (engine load, a long present, the
-/// process being suspended), the origin is rebased forward so the current frame is due now and
-/// the missed frames are dropped. Audio production therefore cannot outrun real time after a
-/// hitch: the logic loop never mixes several ticks back to back to make up lost time.
+/// schedule origin. Presentation never gates logic: the caller asks [`Clock::frames_due`] how
+/// many 60 Hz deadlines have passed and advances every one of them (up to a bounded catch-up)
+/// before presenting. A present that blocks past one or more deadlines (vsync on a slow or
+/// high-refresh display, a busy driver) therefore delays *presentation*, never audio mixing,
+/// and the missed ticks are produced on the next loop iteration instead of being lost.
 ///
-/// VSync (`SDL_SetRenderVSync`) additionally blocks presentation to the display refresh; the
-/// wall-clock schedule is the primary pacing and keeps the loop at 60 Hz even with vsync off.
+/// Only a stall longer than the catch-up bound (engine load, a long present burst, the process
+/// being suspended) rebases the schedule forward and drops the surplus, so a hitch is never
+/// replayed as one long burst. VSync (`SDL_SetRenderVSync`) still throttles presentation where
+/// it can; the wall-clock schedule remains the source of truth.
 pub struct SystemClock {
     start: Instant,
-    /// Origin of the current pacing schedule; rebased when the loop falls a frame behind.
+    /// Origin of the current pacing schedule; rebased forward when more frames are due than the
+    /// catch-up bound allows.
     basis: Cell<Instant>,
     frame: u64,
 }
@@ -1012,11 +1015,32 @@ impl SystemClock {
     }
 }
 
-/// Returns `basis` rebased forward when `frame`'s deadline is more than one period in the past.
+/// Returns how many frames are due at `now` and the (possibly rebased) schedule origin.
+///
+/// Frame `frame + n` (`n >= 1`) is due `n` periods after `basis`; the returned count is the
+/// number of those deadlines that have passed, capped at `max_catchup`. When more than
+/// `max_catchup` frames are owed the origin is rebased forward so exactly `max_catchup` are
+/// reported: the surplus was missed while nothing could advance and is dropped rather than
+/// replayed as one long burst. Pure so the schedule policy is unit-testable.
+fn frames_due_at(basis: Instant, frame: u64, now: Instant, max_catchup: u64) -> (u64, Instant) {
+    let elapsed = now.saturating_duration_since(basis);
+    let periods = elapsed.as_micros() / FRAME_PERIOD.as_micros();
+    let due = periods.saturating_sub(u128::from(frame));
+    if due <= u128::from(max_catchup) {
+        (due as u64, basis)
+    } else {
+        let skip = due - u128::from(max_catchup);
+        let skipped = FRAME_PERIOD.saturating_mul(u32::try_from(skip).unwrap_or(u32::MAX));
+        (max_catchup, basis + skipped)
+    }
+}
+
+/// Returns `basis` rebased forward when the next frame's deadline is more than one period in
+/// the past.
 ///
 /// Pure so the resynchronization policy is unit-testable. Rebasing makes the missed time
 /// vanish: the returned origin reports `target` elapsed right now, so the caller sleeps for the
-/// current frame's remaining time (zero) and the next frame is a full period away.
+/// next frame's remaining time (zero) and the frame after that is a full period away.
 fn rebase_schedule(basis: Instant, target: Duration, now: Instant) -> Instant {
     let elapsed = now.saturating_duration_since(basis);
     if elapsed > target + FRAME_PERIOD {
@@ -1046,7 +1070,8 @@ impl Clock for SystemClock {
     }
 
     fn sleep_until_next_frame(&self) -> Result<(), PlatformError> {
-        let target = Duration::from_micros(self.frame * 1_000_000 / TARGET_FPS);
+        // `frame` frames are complete; sleep until frame `frame + 1` is due.
+        let target = Duration::from_micros((self.frame + 1) * 1_000_000 / TARGET_FPS);
         let basis = rebase_schedule(self.basis.get(), target, Instant::now());
         self.basis.set(basis);
         let elapsed = basis.elapsed();
@@ -1054,6 +1079,12 @@ impl Clock for SystemClock {
             std::thread::sleep(target - elapsed);
         }
         Ok(())
+    }
+
+    fn frames_due(&self, max_catchup: u64) -> u64 {
+        let (due, basis) = frames_due_at(self.basis.get(), self.frame, Instant::now(), max_catchup);
+        self.basis.set(basis);
+        due
     }
 }
 
@@ -1078,6 +1109,35 @@ mod tests {
         let now = basis + target + Duration::from_secs(2);
         let rebased = rebase_schedule(basis, target, now);
         assert_eq!(now.saturating_duration_since(rebased), target);
+    }
+
+    #[test]
+    fn frames_due_counts_passed_deadlines_and_never_replays_a_long_stall() {
+        let basis = Instant::now();
+
+        // Before the first deadline there is nothing to run; exactly at it, one frame is due.
+        assert_eq!(frames_due_at(basis, 0, basis + FRAME_PERIOD / 2, 6).0, 0);
+        assert_eq!(frames_due_at(basis, 0, basis + FRAME_PERIOD, 6).0, 1);
+        assert_eq!(
+            frames_due_at(basis, 0, basis + FRAME_PERIOD * 3 + FRAME_PERIOD / 2, 6).0,
+            3
+        );
+
+        // Deadlines already advanced are not reported again.
+        assert_eq!(frames_due_at(basis, 2, basis + FRAME_PERIOD * 3, 6).0, 1);
+
+        // A stall longer than the catch-up bound reports exactly the bound and rebases the
+        // origin so the surplus is dropped, not replayed: at the same instant the rebased
+        // schedule owes the bound and nothing more.
+        let now = basis + FRAME_PERIOD * 100;
+        let (due, rebased) = frames_due_at(basis, 0, now, 6);
+        assert_eq!(due, 6);
+        assert_eq!(frames_due_at(rebased, 0, now, 6).0, 6);
+        assert_eq!(now.saturating_duration_since(rebased), FRAME_PERIOD * 6);
+
+        // A zero bound never reports a frame and still rebases.
+        let (due, _) = frames_due_at(basis, 0, now, 0);
+        assert_eq!(due, 0);
     }
 
     #[test]

@@ -23,6 +23,15 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// Parses the `N` from a `field: N` summary line a run printed, panicking with the full output
+/// when the line is missing or malformed.
+fn summary_count(text: &str, field: &str) -> u64 {
+    text.lines()
+        .find_map(|line| line.strip_prefix(field))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or_else(|| panic!("run summary must report {field:?}: {text}"))
+}
+
 fn temp_assets(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("retro-engine-it-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -225,9 +234,9 @@ fn run_bounded_with_env(
     }
 }
 
-/// A windowed run must create its window, present exactly `--frames` frames and exit 0,
-/// reporting the selected platform, video driver and audio device. The dummy window is never
-/// focused and never receives a close event, so the `--frames` cap alone must terminate it.
+/// A windowed run must create its window, run every logic frame and exit 0, reporting the
+/// selected platform, video driver and audio device. The dummy window is never focused and
+/// never receives a close event, so the `--frames` cap alone must terminate it.
 #[cfg(unix)]
 #[test]
 fn windowed_frames_run_exits_promptly() {
@@ -249,7 +258,15 @@ fn windowed_frames_run_exits_promptly() {
     let text = stdout(&output);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(text.contains("platform: standalone"), "{text}");
-    assert!(text.contains("presented-frames: 5"), "{text}");
+    assert!(
+        text.contains("executed-frames: 5"),
+        "every logic frame must run: {text}"
+    );
+    // Presentation may be dropped or repeated when a present blocks past a deadline; the
+    // invariant is that at least the final frame is presented and no more than one per frame.
+    let presented = summary_count(&text, "presented-frames: ");
+    assert!((1..=5).contains(&presented), "presented {presented}");
+    assert!(text.contains("logic-rate: "), "{text}");
     assert!(text.contains("hash: "), "{text}");
     assert!(text.contains("audio: 44100 Hz stereo f32"), "{text}");
     assert!(
@@ -257,6 +274,62 @@ fn windowed_frames_run_exits_promptly() {
         "windowed runs must report audio flow-control diagnostics: {text}"
     );
     assert!(text.contains("video: dummy"), "{text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `--dump-audio` writes the exact mixed stream as a 32-bit float stereo WAV at the engine
+/// rate, sized from the frames the run actually mixed.
+#[test]
+fn dump_audio_writes_the_mixed_stream_as_a_float_wav() {
+    let root = temp_assets("dump-audio");
+    write_assets(&root);
+    let wav = root.join("audio.wav");
+    let output = run(&[
+        root.to_str().unwrap(),
+        "--headless",
+        "--frames",
+        "4",
+        "--mute",
+        "--dump-audio",
+        wav.to_str().unwrap(),
+    ]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(text.contains("dump audio:"), "{text}");
+
+    let bytes = std::fs::read(&wav).expect("dump-audio must write the WAV");
+    assert_eq!(&bytes[0..4], b"RIFF", "RIFF magic");
+    assert_eq!(&bytes[8..12], b"WAVE", "WAVE form");
+    assert_eq!(&bytes[12..16], b"fmt ", "fmt chunk");
+    assert_eq!(&bytes[36..40], b"data", "data chunk");
+    assert_eq!(
+        u16::from_le_bytes(bytes[20..22].try_into().unwrap()),
+        3,
+        "IEEE float format tag"
+    );
+    assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 2);
+    assert_eq!(
+        u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+        44_100,
+        "engine sample rate"
+    );
+    assert_eq!(u16::from_le_bytes(bytes[34..36].try_into().unwrap()), 32);
+    let data_bytes = u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize;
+    assert_eq!(
+        data_bytes,
+        4 * 735 * 2 * 4,
+        "4 ticks * 735 frames * 2ch * 4B"
+    );
+    assert_eq!(bytes.len(), 44 + data_bytes);
+    // The synthetic scene has no music or SFX, so the exact mixed stream is digital silence.
+    assert!(
+        bytes[44..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|sample| sample == &[0, 0, 0, 0]),
+        "an empty mix must dump as digital silence"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -361,7 +434,14 @@ fn windowed_scripted_input_with_frames_exits_promptly() {
     );
     let text = stdout(&output);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(text.contains("presented-frames: 5"), "{text}");
+    assert!(
+        text.contains("executed-frames: 5"),
+        "every logic frame must run: {text}"
+    );
+    // A present that blocks past a deadline drops or repeats a presentation, never a logic
+    // frame, so `presented-frames` is bounded by `executed-frames` but not pinned to it.
+    let presented = summary_count(&text, "presented-frames: ");
+    assert!((1..=5).contains(&presented), "presented {presented}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -412,7 +492,14 @@ fn windowed_audio_failure_is_reported_but_does_not_abort() {
     let text = stdout(&output);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(text.contains("audio: unavailable:"), "{text}");
-    assert!(text.contains("presented-frames: 2"), "{text}");
+    assert!(
+        text.contains("executed-frames: 2"),
+        "every logic frame must run: {text}"
+    );
+    // A missed presentation is legal under the pacing contract; the run must still present at
+    // least the final frame and never more than one per executed frame.
+    let presented = summary_count(&text, "presented-frames: ");
+    assert!((1..=2).contains(&presented), "presented {presented}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

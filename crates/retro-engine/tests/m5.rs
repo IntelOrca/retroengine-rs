@@ -369,6 +369,147 @@ fn audio_ops_mix_a_deterministic_pcm_hash_and_mute_is_hash_neutral() {
     assert_eq!(first.stub_histogram().get("PlaySfx"), None);
 }
 
+/// Two distinct valid Ogg Vorbis tracks, shared with the `retro-audio` fixtures.
+const TONE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../retro-audio/tests/fixtures/tone.ogg"
+));
+const TONE_MONO: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../retro-audio/tests/fixtures/tone_mono.ogg"
+));
+
+/// The shipped `Data/Scripts/Global/MusicEvent.txt` sequence: a 50-frame `music.volume -= 2`
+/// fade followed by `PlayMusic`, first for `MUSICEVENT_FADETOBOSS_ACTION` and then
+/// `MUSICEVENT_FADETOSTAGE_ACTION`. The fade runs `AudioLegacy.cpp`'s scripted
+/// `SetMusicVolume`; upstream's `PlayMusic` follows it with a hard `musicVolume = 100`.
+const MUSIC_EVENT_SOURCE: &str = "\
+event ObjectStartup\n\
+    SetMusicTrack(\"stage.ogg\", 0, true)\n\
+    SetMusicTrack(\"boss.ogg\", 1, true)\n\
+    PlayMusic(0)\n\
+end event\n\
+event ObjectUpdate\n\
+    object.value1++\n\
+    if object.value1 <= 50\n\
+        music.volume -= 2\n\
+    else\n\
+        if object.value1 == 51\n\
+            PlayMusic(1)\n\
+        else\n\
+            if object.value1 <= 101\n\
+                music.volume -= 2\n\
+            end if\n\
+            if object.value1 == 102\n\
+                PlayMusic(0)\n\
+            end if\n\
+        end if\n\
+    end if\n\
+end event\n";
+
+/// The same track switch timing with the fades removed, so the play ticks can be compared
+/// against a run whose mix was never attenuated.
+const MUSIC_EVENT_REFERENCE_SOURCE: &str = "\
+event ObjectStartup\n\
+    SetMusicTrack(\"stage.ogg\", 0, true)\n\
+    SetMusicTrack(\"boss.ogg\", 1, true)\n\
+end event\n\
+event ObjectUpdate\n\
+    object.value1++\n\
+    if object.value1 == 51\n\
+        PlayMusic(1)\n\
+    else\n\
+        if object.value1 == 102\n\
+            PlayMusic(0)\n\
+        end if\n\
+    end if\n\
+end event\n";
+
+fn music_memory_source(script: &str) -> Arc<dyn retro_io::DataSource> {
+    let mut memory = memory_source();
+    memory.insert("Data/Scripts/M5/Mover.txt", script);
+    memory.insert("Data/Music/stage.ogg", TONE.to_vec());
+    memory.insert("Data/Music/boss.ogg", TONE_MONO.to_vec());
+    Arc::new(memory)
+}
+
+#[test]
+fn boss_music_event_fades_keep_the_next_play_audible() {
+    let mut engine = Engine::load(
+        music_memory_source(MUSIC_EVENT_SOURCE),
+        None,
+        None,
+        DEFAULT_SEED,
+    )
+    .unwrap();
+    engine.state.audio.set_capture(true);
+
+    // 50 scripted fade frames (`music.volume -= 2`): silence, exactly like the boss trigger.
+    engine.run_frames(50, false).unwrap();
+    assert_eq!(engine.state.audio.music_volume(), 0, "the fade reaches 0");
+    assert_eq!(engine.state.audio.mixer().stream_volume(), 0);
+
+    // `MUSICEVENT_FADETOBOSS_ACTION`: PlayMusic(TRACK_BOSS) resets and the boss track is audible.
+    engine.state.audio.set_capture(false);
+    engine.state.audio.set_capture(true);
+    let boss = engine.run_frames(1, false).unwrap();
+    assert_eq!(
+        engine.state.audio.music_volume(),
+        100,
+        "PlayMusic resets music.volume"
+    );
+    assert!(
+        engine
+            .state
+            .audio
+            .captured_pcm()
+            .iter()
+            .any(|sample| *sample != 0.0),
+        "the boss track must be audible after the fade"
+    );
+
+    // `MUSICEVENT_FADETOSTAGE_ACTION`: fade again, then PlayMusic(TRACK_STAGE).
+    engine.state.audio.set_capture(false);
+    engine.run_frames(50, false).unwrap();
+    assert_eq!(
+        engine.state.audio.music_volume(),
+        0,
+        "the defeat fade reaches 0"
+    );
+    engine.state.audio.set_capture(true);
+    let stage = engine.run_frames(1, false).unwrap();
+    assert_eq!(engine.state.audio.music_volume(), 100);
+    assert!(
+        engine
+            .state
+            .audio
+            .captured_pcm()
+            .iter()
+            .any(|sample| *sample != 0.0),
+        "the level track must be audible again after the boss"
+    );
+
+    // Both switch ticks must be byte-identical to a run that never faded.
+    let mut reference = Engine::load(
+        music_memory_source(MUSIC_EVENT_REFERENCE_SOURCE),
+        None,
+        None,
+        DEFAULT_SEED,
+    )
+    .unwrap();
+    reference.run_frames(50, false).unwrap();
+    let reference_boss = reference.run_frames(1, false).unwrap();
+    let reference_stage = reference.run_frames(51, false).unwrap();
+    assert_eq!(
+        boss.audio_hashes[0], reference_boss.audio_hashes[0],
+        "the boss switch must mix exactly like an unfaded play"
+    );
+    assert_eq!(
+        stage.audio_hashes[0], reference_stage.audio_hashes[50],
+        "the level switch (tick 102) must mix exactly like an unfaded play"
+    );
+}
+
 #[test]
 fn save_ops_round_trip_through_in_memory_storage() {
     let mut engine = Engine::load_with(

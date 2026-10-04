@@ -565,6 +565,26 @@ fn draw_events_run_after_updates_in_slot_order() {
     assert_eq!(engine.op_histogram().get("DrawRect"), None);
 }
 
+/// Regression guard for S2 `Zone08` (HPZ) Act 1: `HPZSetup`'s draw event appends its own entity
+/// to the list being drawn. Upstream snapshots the list size before the pass
+/// (`Drawing.cpp:997-1007`), so those appends must not be visited by the current pass; walking the
+/// live length re-ran the draw event forever. If this test hangs, the live-length bug is back.
+#[test]
+fn appends_during_draw_do_not_extend_the_current_pass() {
+    let mut engine = Engine::load(
+        draw_source("    AddDrawListEntityRef(3, object.entityPos)\n"),
+        None,
+        None,
+        DEFAULT_SEED,
+    )
+    .unwrap();
+    engine.run_frame().unwrap();
+    // The pass saw the two refs built by the update pass (slots 32 and 33) and each draw
+    // appended itself, but the appended refs stay unvisited during this pass. They are dropped
+    // when the next frame's update pass clears the list.
+    assert_eq!(engine.state.draw_lists[3], vec![32, 33, 32, 33]);
+}
+
 #[test]
 fn dimming_is_presentation_only_and_never_enters_the_hash() {
     // Draw something so the framebuffer comparison is meaningful.

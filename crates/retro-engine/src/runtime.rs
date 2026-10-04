@@ -843,17 +843,24 @@ impl Engine {
 
     /// `DrawObjectList`: runs `ObjectDraw` for every entity in `layer`'s draw list.
     ///
-    /// The list is walked by live index, exactly like upstream's `for (i < listSize)` loop, so a
-    /// draw event that appends to (or clears) the same list affects the current pass.
+    /// The list size is captured before the pass, exactly like upstream's
+    /// `int size = drawListEntries[Layer].listSize; for (i < size)` (`Drawing.cpp:997-1007`), so
+    /// refs appended by a draw event are not visited by the current pass. Walking the live length
+    /// instead let `HPZSetup`'s `ObjectDraw` (which appends its own entity to layer 2) re-append
+    /// itself forever, hanging S2 Zone08 Act 1.
     fn draw_object_list(&mut self, layer: usize) -> Result<(), EngineError> {
+        let size = self.state.draw_lists.get(layer).map_or(0, Vec::len);
         let mut index = 0usize;
-        while let Some(slot) = self
-            .state
-            .draw_lists
-            .get(layer)
-            .and_then(|list| list.get(index))
-            .copied()
-        {
+        while index < size {
+            let Some(slot) = self
+                .state
+                .draw_lists
+                .get(layer)
+                .and_then(|list| list.get(index))
+                .copied()
+            else {
+                break;
+            };
             index += 1;
             self.state.object_entity_pos = usize::try_from(slot).unwrap_or(0);
             let Some(entity) = self

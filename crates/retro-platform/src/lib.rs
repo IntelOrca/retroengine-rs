@@ -361,6 +361,17 @@ pub trait Clock {
     fn advance_frame(&mut self);
     /// Blocks until the next frame is due.
     fn sleep_until_next_frame(&self) -> Result<(), PlatformError>;
+    /// Number of engine frames whose wall-clock deadline has passed and that have not been
+    /// advanced yet, capped at `max_catchup`.
+    ///
+    /// The windowed loop runs one logic frame per due tick, so presentation (which may block
+    /// on vsync or a slow driver) can never reduce mixing below [`TARGET_FPS`]. Backends
+    /// without a wall-clock schedule report one due frame per call; the caller is expected to
+    /// tick once per loop iteration for those.
+    fn frames_due(&self, max_catchup: u64) -> u64 {
+        let _ = max_catchup;
+        1
+    }
 }
 
 /// Returns the preferred per-user data directory for the engine.
