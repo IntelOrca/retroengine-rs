@@ -28,6 +28,16 @@ export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
 log() { printf '[ref-harness] %s\n' "$*" >&2; }
 
+# ninja ignores CMAKE_BUILD_PARALLEL_LEVEL (it is only honoured by `cmake --build`), so map it
+# onto `ninja -j` explicitly to keep memory bounded on small hosts.
+ninja_jobs() {
+    if [ -n "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]; then
+        ninja -j "$CMAKE_BUILD_PARALLEL_LEVEL" "$@"
+    else
+        ninja "$@"
+    fi
+}
+
 need() {
     command -v "$1" >/dev/null 2>&1 || {
         log "missing required tool: $1"
@@ -68,8 +78,8 @@ if [ ! -f "$PREFIX/lib/libSDL2.so" ]; then
         -DCMAKE_INSTALL_PREFIX="$PREFIX" \
         -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST=OFF -DSDL_TESTS=OFF \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-    ninja -C "$BUILD/sdl2-build"
-    ninja -C "$BUILD/sdl2-build" install
+    ninja_jobs -C "$BUILD/sdl2-build"
+    ninja_jobs -C "$BUILD/sdl2-build" install
 else
     log "SDL2 already installed in $PREFIX"
 fi
@@ -112,7 +122,7 @@ if command -v pkg-config >/dev/null 2>&1; then
 else
     cmake "${CMAKE_ARGS[@]}"
 fi
-ninja -C "$BUILD/rsdkv5-build"
+ninja_jobs -C "$BUILD/rsdkv5-build"
 
 # ---------------------------------------------------------------------------
 # 5. hash565 helper (hashes Rust --dump-frames PNGs in the same format)

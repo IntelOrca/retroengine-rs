@@ -1,0 +1,120 @@
+diff --git a/RSDKv5/refharness.cpp b/RSDKv5/refharness.cpp
+index 0360e1d..34cb955 100644
+--- a/RSDKv5/refharness.cpp
++++ b/RSDKv5/refharness.cpp
+@@ -13,6 +13,8 @@
+ //   REF_HARNESS_INPUT_TRACE   log the injected per-player masks to stderr each frame
+ //   REF_HARNESS_SCREENS       add a `screens` array when videoSettings.screenCount > 1
+ //   REF_HARNESS_TEXT_MENUS    add a `textMenus` array with the legacy menu state
++//   REF_HARNESS_SCENE3D       add a `scene3D` object in v4 records (scalars, matrices and
++//                             full vertex/face buffer digests; off by default)
+ //
+ // The JSONL record format is documented in tools/ref-harness/README.md.
+ 
+@@ -76,6 +78,7 @@ static bool recordInput  = false;
+ static bool inputTrace   = false;
+ static bool recordScreens   = false;
+ static bool recordTextMenus = false;
++static bool recordScene3D   = false;
+ 
+ static bool equalsIgnoreCase(const std::string &a, const char *b)
+ {
+@@ -284,13 +287,16 @@ bool Init()
+     const char *inputTraceEnv  = getenv("REF_HARNESS_INPUT_TRACE");
+     const char *screensEnv     = getenv("REF_HARNESS_SCREENS");
+     const char *textMenusEnv   = getenv("REF_HARNESS_TEXT_MENUS");
++    const char *scene3dEnv     = getenv("REF_HARNESS_SCENE3D");
+ 
+     entityValues    = entValuesEnv && *entValuesEnv && *entValuesEnv != '0';
+     recordInput     = recordInputEnv && *recordInputEnv && *recordInputEnv != '0';
+     inputTrace      = inputTraceEnv && *inputTraceEnv && *inputTraceEnv != '0';
+     recordScreens   = screensEnv && *screensEnv && *screensEnv != '0';
+     recordTextMenus = textMenusEnv && *textMenusEnv && *textMenusEnv != '0';
+-    active = dumpEnv || inputEnv || frames || seedEnv || ppmDirEnv || recordInputEnv || inputTraceEnv || screensEnv || textMenusEnv;
++    recordScene3D   = scene3dEnv && *scene3dEnv && *scene3dEnv != '0';
++    active = dumpEnv || inputEnv || frames || seedEnv || ppmDirEnv || recordInputEnv || inputTraceEnv || screensEnv || textMenusEnv
++             || scene3dEnv;
+     if (!active)
+         return false;
+ 
+@@ -510,6 +516,70 @@ static void writeTextMenus(FILE *file)
+     fputc(']', file);
+ }
+ 
++// The buffer digests below reinterpret the structs as i32 arrays, so the layouts must stay
++// tightly packed (integer fields only, no padding).
++static_assert(sizeof(Legacy::Vertex) == 5 * sizeof(int32), "Vertex layout changed");
++static_assert(sizeof(Legacy::Face) == 6 * sizeof(int32), "Face layout changed");
++static_assert(sizeof(Legacy::Matrix) == 16 * sizeof(int32), "Matrix layout changed");
++
++// BLAKE3 of `count` i32 values serialized little-endian, the canonical digest the Rust port can
++// reproduce (`faceBuffer.color` is a uint32 bit pattern and is hashed through the same cast).
++static void hashI32LE(const int32 *values, size_t count, char *out)
++{
++    static std::vector<unsigned char> scratch;
++    scratch.resize(count * 4);
++    for (size_t i = 0; i < count; ++i) {
++        uint32 value = (uint32)values[i];
++        scratch[i * 4 + 0] = (unsigned char)(value & 0xFF);
++        scratch[i * 4 + 1] = (unsigned char)((value >> 8) & 0xFF);
++        scratch[i * 4 + 2] = (unsigned char)((value >> 16) & 0xFF);
++        scratch[i * 4 + 3] = (unsigned char)((value >> 24) & 0xFF);
++    }
++
++    unsigned char digest[32];
++    blake3_hasher hasher;
++    blake3_hasher_init(&hasher);
++    blake3_hasher_update(&hasher, scratch.data(), scratch.size());
++    blake3_hasher_finalize(&hasher, digest, sizeof(digest));
++    static const char *hex = "0123456789abcdef";
++    for (int i = 0; i < 32; ++i) {
++        out[i * 2]     = hex[digest[i] >> 4];
++        out[i * 2 + 1] = hex[digest[i] & 0xF];
++    }
++    out[64] = 0;
++}
++
++static void writeMatrix(FILE *file, const Legacy::Matrix *matrix)
++{
++    fputc('[', file);
++    for (int i = 0; i < 16; ++i)
++        fprintf(file, "%s%d", i ? "," : "", matrix->values[i / 4][i % 4]);
++    fputc(']', file);
++}
++
++// Dumps the legacy v4 3D state (M9): the six scalars, the three persisted 4x4 matrices and
++// BLAKE3 digests of the full vertex/face buffers, so the 3D port can be diffed field by field
++// even when the framebuffer agrees.
++static void writeScene3D(FILE *file)
++{
++    char vertexDigest[65];
++    char faceDigest[65];
++    hashI32LE((const int32 *)Legacy::v4::vertexBuffer, (size_t)LEGACY_v4_VERTEXBUFFER_SIZE * 5, vertexDigest);
++    hashI32LE((const int32 *)Legacy::v4::faceBuffer, (size_t)LEGACY_v4_FACEBUFFER_SIZE * 6, faceDigest);
++
++    fprintf(file,
++            ",\"scene3D\":{\"vertexCount\":%d,\"faceCount\":%d,\"projectionX\":%d,\"projectionY\":%d,\"fogColor\":%d,"
++            "\"fogStrength\":%d,\"matWorld\":",
++            Legacy::vertexCount, Legacy::faceCount, Legacy::projectionX, Legacy::projectionY, Legacy::v4::fogColor,
++            Legacy::v4::fogStrength);
++    writeMatrix(file, &Legacy::matWorld);
++    fputs(",\"matView\":", file);
++    writeMatrix(file, &Legacy::matView);
++    fputs(",\"matTemp\":", file);
++    writeMatrix(file, &Legacy::matTemp);
++    fprintf(file, ",\"vertexHash\":\"%s\",\"faceHash\":\"%s\"}", vertexDigest, faceDigest);
++}
++
+ static void writeRecord(char *hash)
+ {
+     FILE *file = recordFile;
+@@ -563,6 +633,9 @@ static void writeRecord(char *hash)
+             writeEntity(file, slot, entity, entityValues);
+         }
+         fputs("]}", file);
++
++        if (recordScene3D)
++            writeScene3D(file);
+     }
+ 
+     if (recordTextMenus)

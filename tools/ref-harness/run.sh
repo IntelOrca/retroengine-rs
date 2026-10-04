@@ -5,7 +5,7 @@
 # Usage:
 #   run.sh --game S1 --scene Zone01 --act 1 --frames 600 [--input FILE] [--seed N] [--out DIR]
 #          [--ppm 60,120,599] [--ppm-every N] [--assets-root DIR] [--game-type 0|1]
-#          [--record-input] [--input-trace] [--screens] [--text-menus]
+#          [--record-input] [--input-trace] [--screens] [--text-menus] [--scene3d]
 #   run.sh --game S1 --boot --frames 1600 [--input FILE] [...]   # no stage/scene: real scene list
 #
 # Outputs (under --out, default tools/ref-harness/out/<game>-<scene>-<act> or <game>-boot):
@@ -37,6 +37,7 @@ RECORD_INPUT=0
 INPUT_TRACE=0
 SCREENS=0
 TEXT_MENUS=0
+SCENE3D=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -56,6 +57,7 @@ while [ $# -gt 0 ]; do
         --input-trace) INPUT_TRACE=1; shift ;;
         --screens) SCREENS=1; shift ;;
         --text-menus) TEXT_MENUS=1; shift ;;
+        --scene3d) SCENE3D=1; shift ;;
         -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -150,6 +152,7 @@ export REF_HARNESS_FRAMES="$FRAMES"
 [ "$INPUT_TRACE" -eq 1 ] && export REF_HARNESS_INPUT_TRACE=1
 [ "$SCREENS" -eq 1 ] && export REF_HARNESS_SCREENS=1
 [ "$TEXT_MENUS" -eq 1 ] && export REF_HARNESS_TEXT_MENUS=1
+[ "$SCENE3D" -eq 1 ] && export REF_HARNESS_SCENE3D=1
 if [ -n "$PPM" ] || [ -n "$PPM_EVERY" ]; then
     mkdir -p "$OUT/ppm"
     export REF_HARNESS_PPM_DIR="$OUT/ppm"
