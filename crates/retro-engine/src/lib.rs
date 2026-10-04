@@ -3,11 +3,13 @@
 #![forbid(unsafe_code)]
 
 pub mod audio;
+pub mod camera;
 pub mod cli;
 pub mod error;
 pub mod host;
 pub mod input;
 pub mod loader;
+pub mod menu;
 pub mod profile;
 pub mod rng;
 pub mod runtime;

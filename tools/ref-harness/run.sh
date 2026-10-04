@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Run the reference harness for one scene and write a canonical frame record stream.
+# Run the reference harness for one scene (or a full boot) and write a canonical frame record
+# stream.
 #
 # Usage:
 #   run.sh --game S1 --scene Zone01 --act 1 --frames 600 [--input FILE] [--seed N] [--out DIR]
 #          [--ppm 60,120,599] [--ppm-every N] [--assets-root DIR] [--game-type 0|1]
+#          [--record-input] [--input-trace] [--screens] [--text-menus]
+#   run.sh --game S1 --boot --frames 1600 [--input FILE] [...]   # no stage/scene: real scene list
 #
-# Outputs (under --out, default tools/ref-harness/out/<game>-<scene>-<act>):
+# Outputs (under --out, default tools/ref-harness/out/<game>-<scene>-<act> or <game>-boot):
 #   run/            scratch runtime directory (asset symlinks + Settings.ini + logs)
 #   records.jsonl   one JSON record per frame (format documented in README.md)
 #   ppm/            optional keyframe PPM dumps (frame_%04d.ppm)
@@ -29,6 +32,11 @@ PPM=""
 PPM_EVERY=""
 ASSETS_ROOT="${REF_HARNESS_ASSETS:-/home/ted/projects/assets}"
 GAME_TYPE=0
+BOOT=0
+RECORD_INPUT=0
+INPUT_TRACE=0
+SCREENS=0
+TEXT_MENUS=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -43,12 +51,22 @@ while [ $# -gt 0 ]; do
         --ppm-every) PPM_EVERY="$2"; shift 2 ;;
         --assets-root) ASSETS_ROOT="$2"; shift 2 ;;
         --game-type) GAME_TYPE="$2"; shift 2 ;;
+        --boot) BOOT=1; shift ;;
+        --record-input) RECORD_INPUT=1; shift ;;
+        --input-trace) INPUT_TRACE=1; shift ;;
+        --screens) SCREENS=1; shift ;;
+        --text-menus) TEXT_MENUS=1; shift ;;
         -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
-[ -n "$GAME" ] && [ -n "$SCENE" ] && [ -n "$ACT" ] || { echo "usage: run.sh --game S1 --scene Zone01 --act 1 [options]" >&2; exit 2; }
+[ -n "$GAME" ] || { echo "usage: run.sh --game S1 (--scene Zone01 --act 1 | --boot) [options]" >&2; exit 2; }
+if [ "$BOOT" -eq 1 ]; then
+    [ -z "$SCENE" ] && [ -z "$ACT" ] || { echo "--boot cannot be combined with --scene/--act" >&2; exit 2; }
+else
+    [ -n "$SCENE" ] && [ -n "$ACT" ] || { echo "usage: run.sh --game S1 --scene Zone01 --act 1 [options]" >&2; exit 2; }
+fi
 
 # The engine runs with the scratch directory as its working directory, so make paths absolute.
 if [ -n "$INPUT" ]; then
@@ -67,7 +85,11 @@ GAME_DIR="$ASSETS_ROOT/$GAME"
 [ -d "$GAME_DIR/Data" ] || { echo "[ref-harness] no assets at $GAME_DIR" >&2; exit 1; }
 
 if [ -z "$OUT" ]; then
-    OUT="$ROOT/out/$GAME-$SCENE-$ACT"
+    if [ "$BOOT" -eq 1 ]; then
+        OUT="$ROOT/out/$GAME-boot"
+    else
+        OUT="$ROOT/out/$GAME-$SCENE-$ACT"
+    fi
 fi
 SCRATCH="$OUT/run"
 rm -rf "$OUT"
@@ -124,6 +146,10 @@ export REF_HARNESS_DUMP="$OUT/records.jsonl"
 export REF_HARNESS_FRAMES="$FRAMES"
 [ -n "$INPUT" ] && export REF_HARNESS_INPUT="$INPUT"
 [ -n "$SEED" ] && export REF_HARNESS_SEED="$SEED"
+[ "$RECORD_INPUT" -eq 1 ] && export REF_HARNESS_RECORD_INPUT=1
+[ "$INPUT_TRACE" -eq 1 ] && export REF_HARNESS_INPUT_TRACE=1
+[ "$SCREENS" -eq 1 ] && export REF_HARNESS_SCREENS=1
+[ "$TEXT_MENUS" -eq 1 ] && export REF_HARNESS_TEXT_MENUS=1
 if [ -n "$PPM" ] || [ -n "$PPM_EVERY" ]; then
     mkdir -p "$OUT/ppm"
     export REF_HARNESS_PPM_DIR="$OUT/ppm"
@@ -133,7 +159,11 @@ fi
 
 (
     cd "$SCRATCH"
-    "$REF_HARNESS_BIN" "stage=$SCENE" "scene=$ACT"
+    if [ "$BOOT" -eq 1 ]; then
+        "$REF_HARNESS_BIN"
+    else
+        "$REF_HARNESS_BIN" "stage=$SCENE" "scene=$ACT"
+    fi
 ) > "$OUT/run.log" 2>&1
 status=$?
 if [ $status -ne 0 ]; then
@@ -143,7 +173,11 @@ fi
 
 frames=$(wc -l < "$OUT/records.jsonl")
 unique=$(python3 -c "import sys; print(len({l.split('\"blake3\":\"')[1][:64] for l in open(sys.argv[1])}))" "$OUT/records.jsonl" 2>/dev/null || echo "?")
-echo "[ref-harness] $GAME $SCENE act $ACT: $frames frames, $unique unique framebuffers"
+if [ "$BOOT" -eq 1 ]; then
+    echo "[ref-harness] $GAME boot: $frames frames, $unique unique framebuffers"
+else
+    echo "[ref-harness] $GAME $SCENE act $ACT: $frames frames, $unique unique framebuffers"
+fi
 echo "[ref-harness] records: $OUT/records.jsonl"
 if [ -d "$OUT/ppm" ]; then
     echo "[ref-harness] keyframes: $OUT/ppm"

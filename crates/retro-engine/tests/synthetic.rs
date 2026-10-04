@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use retro_engine::Engine;
 use retro_engine::rng::DEFAULT_SEED;
+use retro_engine::state::{ENGINE_ENDGAME, ENGINE_INITPAUSE, ENGINE_MAINGAME, ENGINE_RESETGAME};
 use retro_format_v4::gameconfig::PALETTE_COUNT;
 use retro_format_v4::scene::{
     ACTIVE_LAYER_COUNT, ENTITY_ATTRIB_DIRECTION, ENTITY_ATTRIB_DRAW_ORDER, ENTITY_ATTRIB_PRIORITY,
@@ -23,6 +24,18 @@ event ObjectUpdate\n\
     object.value0 += 1\n\
     object.value1 = object.value0\n\
     Rand(object.value2, 100)\n\
+    PlaySfx(0, 0)\n\
+end event\n\
+";
+
+/// Variant whose startup calls a host op, so tests can observe startup execution through the
+/// `PlaySfx` op histogram.
+const FLOW_OBJECT_SOURCE: &str = "\
+event ObjectStartup\n\
+    PlaySfx(0, 0)\n\
+end event\n\
+event ObjectUpdate\n\
+    object.value0 += 1\n\
     PlaySfx(0, 0)\n\
 end event\n\
 ";
@@ -94,14 +107,18 @@ fn scene_bytes() -> Vec<u8> {
     bytes
 }
 
-fn source() -> Arc<dyn retro_io::DataSource> {
+fn source_with_script(script: &str) -> Arc<dyn retro_io::DataSource> {
     let mut source = MemorySource::new();
     source.insert("Settings.ini", "[Game]\ngameType=1\ntxtScripts=n\n");
     source.insert("Data/Game/GameConfig.bin", game_config_bytes());
     source.insert("Data/Stages/Zone01/StageConfig.bin", stage_config_bytes());
     source.insert("Data/Stages/Zone01/Act1.bin", scene_bytes());
-    source.insert("Data/Scripts/Test/TestObject.txt", OBJECT_SOURCE);
+    source.insert("Data/Scripts/Test/TestObject.txt", script);
     Arc::new(source)
+}
+
+fn source() -> Arc<dyn retro_io::DataSource> {
+    source_with_script(OBJECT_SOURCE)
 }
 
 #[test]
@@ -158,11 +175,10 @@ fn init_pause_skips_exactly_one_stage_frame() {
         .expect("scene entity")
         .values[0];
 
-    engine.state.game_mode = retro_engine::state::ENGINE_INITPAUSE;
+    engine.state.game_mode = ENGINE_INITPAUSE;
     engine.run_frame().unwrap();
     assert_eq!(
-        engine.state.game_mode,
-        retro_engine::state::ENGINE_MAINGAME,
+        engine.state.game_mode, ENGINE_MAINGAME,
         "the pause mode resets after one frame"
     );
     let skipped = engine
@@ -181,6 +197,122 @@ fn init_pause_skips_exactly_one_stage_frame() {
         .expect("scene entity")
         .values[0];
     assert_eq!(resumed, before + 1, "the next frame updates normally again");
+}
+
+/// `ENGINE_ENDGAME`/`ENGINE_RESETGAME` reset the category and list position to the first
+/// GameConfig entry, request a `STAGEMODE_LOAD` tick and re-enter `ENGINE_MAINGAME`
+/// (`RetroEnginev4.cpp:300-305`). The reset tick itself runs neither startup nor updates; the
+/// following load tick rebuilds the scene, runs its startup and still skips the update pass.
+#[test]
+fn endgame_and_resetgame_reload_the_first_game_config_entry() {
+    let slot = retro_scene::SCENE_ENTITY_START;
+    for game_mode in [ENGINE_ENDGAME, ENGINE_RESETGAME] {
+        let mut engine = Engine::load(
+            source_with_script(FLOW_OBJECT_SOURCE),
+            None,
+            None,
+            DEFAULT_SEED,
+        )
+        .unwrap();
+        // The initial load ran the startup once.
+        assert_eq!(engine.op_histogram().get("PlaySfx"), Some(&1));
+
+        engine.run_frame().unwrap();
+        assert_eq!(engine.op_histogram().get("PlaySfx"), Some(&2));
+        let before = engine
+            .state
+            .entities
+            .get(slot)
+            .expect("scene entity")
+            .values[0];
+
+        // Pretend a script left the game on some later list position.
+        engine.state.stage.active_list = 3;
+        engine.state.stage.list_pos = 2;
+        engine.state.game_mode = game_mode;
+
+        // Reset tick: requests the first entry and runs no stage processing.
+        engine.run_frame().unwrap();
+        assert_eq!(engine.state.game_mode, ENGINE_MAINGAME);
+        assert_eq!(engine.state.stage.active_list, 0);
+        assert_eq!(engine.state.stage.list_pos, 0);
+        assert!(engine.state.load_stage_requested);
+        assert_eq!(
+            engine.op_histogram().get("PlaySfx"),
+            Some(&2),
+            "the reset tick runs neither startup nor update"
+        );
+        assert_eq!(
+            engine
+                .state
+                .entities
+                .get(slot)
+                .expect("scene entity")
+                .values[0],
+            before,
+            "the reset tick leaves entity state alone"
+        );
+
+        // Load tick: deferred load consumes the request and runs the scene startup.
+        engine.run_frame().unwrap();
+        assert!(!engine.state.load_stage_requested);
+        assert_eq!(
+            engine.op_histogram().get("PlaySfx"),
+            Some(&3),
+            "startup runs on the load tick"
+        );
+        assert_eq!(
+            engine
+                .state
+                .entities
+                .get(slot)
+                .expect("scene entity")
+                .values[0],
+            7,
+            "the scene entity is rebuilt from Act1.bin"
+        );
+
+        // Updates resume on the tick after the load.
+        engine.run_frame().unwrap();
+        assert_eq!(engine.op_histogram().get("PlaySfx"), Some(&4));
+        assert_eq!(
+            engine
+                .state
+                .entities
+                .get(slot)
+                .expect("scene entity")
+                .values[0],
+            8
+        );
+    }
+}
+
+/// A plain `ENGINE_MAINGAME` frame is unaffected by the new reset dispatch.
+#[test]
+fn maingame_frames_still_update_every_tick() {
+    let mut engine = Engine::load(
+        source_with_script(FLOW_OBJECT_SOURCE),
+        None,
+        None,
+        DEFAULT_SEED,
+    )
+    .unwrap();
+    assert_eq!(engine.state.game_mode, ENGINE_MAINGAME);
+    let slot = retro_scene::SCENE_ENTITY_START;
+    for expected in 1..=3 {
+        engine.run_frame().unwrap();
+        assert_eq!(engine.state.game_mode, ENGINE_MAINGAME);
+        assert!(!engine.state.load_stage_requested);
+        assert_eq!(
+            engine
+                .state
+                .entities
+                .get(slot)
+                .expect("scene entity")
+                .values[0],
+            7 + expected
+        );
+    }
 }
 
 #[test]

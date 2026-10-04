@@ -171,6 +171,8 @@ const S2_ZONE01_IDLE: &[(u64, &str)] = &[
 /// through frame 59, then RIGHT held). All 600 frames are pixel-identical; the pins include the
 /// spring launch (350), the S2 Monitor that the `ForEachAll` stack bug used to destroy (360),
 /// the S1 death trigger (376) and the first frame the frozen death update used to miss (377).
+/// S1's death sets `camera[0].enabled = false` (`PlayerObject.txt:1582`), so frames 376-555 run
+/// `SetPlayerLockedScreenPosition` (pins 400/500); 556 resumes the follow after respawn.
 const S1_ZONE01_RIGHT: &[(u64, &str)] = &[
     (
         0,
@@ -201,8 +203,20 @@ const S1_ZONE01_RIGHT: &[(u64, &str)] = &[
         "81cd82c671ceefafdcad0407d6cd75b9ad245223e9233b55d86d1493240e42c5",
     ),
     (
+        400,
+        "22d7cb5662beb35c229cee6f1bc6f02a28a2e0e572fe86ce29dd211c67ab957f",
+    ),
+    (
         450,
         "a8c13aa2185bfd190270f88a817589de00ced1c3270dc71a70af259c56778e24",
+    ),
+    (
+        500,
+        "4e3c60bc81c9ea24361c5b1759a9433eb10e9903edebf7438220ac5182cfa5c5",
+    ),
+    (
+        556,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
     ),
     (
         599,
@@ -286,6 +300,98 @@ const S2_ZONE01_RIGHT400: &[(u64, &str)] = &[
     (
         599,
         "de712689faecf9856e083a5dfb28fac6abb832d11b0d6635f8a246dd1b4c39eb",
+    ),
+];
+
+/// Pinned `fb.blake3` values for S2 `Zone03` (ARZ) Act 1 idle 600 frames (`zone01_idle.input`).
+/// The camera stays `CAMERASTYLE_FOLLOW` for the whole window: ARZ's `Water.txt:464` only
+/// writes `CAMERASTYLE_STATIC` under `USE_ORIGINS` + vs mode, and the standalone drowning path
+/// (`Water.txt:460`, `camera[0].enabled = false`) needs 1800 frames underwater that idle input
+/// never reaches. The window still pins the second camera's out-of-range `target == -1` early
+/// return and the ARZ tile/palette state.
+const S2_ARZ_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        60,
+        "bbd21b4d1a50717f804317784d525574e45bf8479714fad95b7b08bf1d4ef819",
+    ),
+    (
+        155,
+        "ce049c7ad23431200a39caaf0d4142c90bd588b67c04475229417dc8223e0805",
+    ),
+    (
+        240,
+        "b975203682371f3d6623a6a469b084621a88aa78bb0fe3f30f658c8897688787",
+    ),
+    (
+        300,
+        "f66e647a8b1aa324c7b33b2ffa3fc293e3e7e02ad1c3bdbd4de8eaacccc617fb",
+    ),
+    (
+        400,
+        "3a72059b08861f5f373bffb954976c989551eca5c4cfc90334f17719be8feed3",
+    ),
+    (
+        500,
+        "ed7dc2c15616ccc29cb1d11235e804f5c1ce2113e5e6cb01b0aeb6b9c74d4618",
+    ),
+    (
+        599,
+        "fa6bc0fe6891c2bab3eb78f30840de66cc1faaf291ac7cb122a92f989e60d74d",
+    ),
+];
+
+/// Pinned `fb.blake3` values for `zone01_spindash.input` (S1 Zone01): crouch from line 220,
+/// spindash charge presses on 270/273/276 and release on line 290. `PlayerObject.txt:3874`
+/// then sets `camera[0].style = CAMERASTYLE_HLOCKED` with `scrollDelay = 15`, so frames
+/// 290-304 run `SetPlayerHLockedScreenPosition` and frame 305 is back on `FOLLOW`.
+///
+/// The shipped `SGame.bin` has the `spindash` option off (`saveRAM[35] == 0`), so both the
+/// reference harness run and this test feed the engine a scratch save with word 35 set; the
+/// option also clears `speedCap`/`airSpeedCap`/`spikeBehavior`, which both sides share.
+const S1_ZONE01_SPINDASH: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        269,
+        "aa1ffcc89adeef97415a7fa2bf785729f3a40d8d2b795c6e19ced905a73fa49e",
+    ),
+    (
+        290,
+        "daca1b272457fdd883990b06334245157b6cee82a76c0914992bf9389ae7af81",
+    ),
+    (
+        291,
+        "68e85c9228fa80f213d6a8c613f63a4942709c0ed18c5daa637c8e008a744bc0",
+    ),
+    (
+        295,
+        "7fff25c1764044c25316e4b48617cbaad84662aab05f23e509ea2526ebef8913",
+    ),
+    (
+        300,
+        "52f5c917d3e31e9c1d04fb101b9d5181579d2d64c3e4914e256e60b506cc2dea",
+    ),
+    (
+        304,
+        "3fe5e6a765b1366af27ffa5fb7d1e97d6f34a41f83506bb0bdf552ce40398a1c",
+    ),
+    (
+        305,
+        "db04b16066a7501c3b7482906bcc42dbbcb8e12ff217ee66ae1c99f7baf29f87",
+    ),
+    (
+        320,
+        "cc5d52de308940a2f8937210fce71acd5813156f1fe7038980ffae92b1404b1d",
+    ),
+    (
+        359,
+        "fcc7e3ae7687d46cc4c06c57c42e1f63f84cbca883ec0c3868fa2046c626c41c",
     ),
 ];
 
@@ -436,6 +542,306 @@ const S2_TITLE_START: &[(u64, &str)] = &[
     ),
 ];
 
+/// Pinned `fb.blake3` values from `tools/ref-harness/run.sh --game S1 --boot --frames 1600`
+/// (idle input). `--boot` starts with no `stage=`/`scene=` argument, so the real `GameConfig`
+/// list is used with `Title` at list position 0. The idle attract demo expires and the engine
+/// `LoadStage`s `Zone01` (flat list position 6) on the `STAGEMODE_LOAD` tick at frame 1049;
+/// frames 1048/1049 are blank load ticks and 1088 is the first drawn title-card frame.
+const S1_BOOT_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        59,
+        "abcfd1e06c5bd7703a8d0d2c5b6fba0c07e3344be1aeaae573fbfa761b6106f3",
+    ),
+    (
+        600,
+        "8adbfbf024411853d5f55d951802f99dc08699fda78636c33528f2c14973c2b5",
+    ),
+    (
+        900,
+        "156d3aee7f24a6a902436e8356f4a3503999f29dedb25807aeeee9d348e581d8",
+    ),
+    (
+        1048,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        1049,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        1088,
+        "b1ba7eb993931deeee16a397137fff1e66ae215ad7d73bf8d10df8bf99db7405",
+    ),
+    (
+        1100,
+        "d41a0ba386feccb4d5c86bc47cd1e5daedbf2b88ee18b1d235ff809afcfe2923",
+    ),
+    (
+        1500,
+        "d8692a82710f10577d3a4bfde55ff79e1605735b172ddc1958ad0b0e058cb52f",
+    ),
+    (
+        1599,
+        "f69be45a040048f841e49fb14d64227478cec862bc8ec41ace67873f048b1e5f",
+    ),
+];
+
+/// Pinned `fb.blake3` values from `tools/ref-harness/run.sh --game S1 --scene Continue --act 1
+/// --frames 1200` (idle input). The countdown expires with no input: `ContinueScreen` reaches
+/// `CONTINUESETUP_FADETOMENU`, fades to black, and `ContinueSetup` writes `engine.state = 8`
+/// (`ENGINE_RESETGAME`) on frame 806. The reset tick keeps the black framebuffer (805-807) and
+/// the engine re-enters the first `GameConfig` entry (`Title`, list position 0) on the
+/// `STAGEMODE_LOAD` tick at 807; the Title screen starts drawing at 818.
+const S1_CONTINUE_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        320,
+        "12fb9c27bbdf93e762f8ea9aad3573f4772ca414cc1304360c83f39b91fe23d1",
+    ),
+    (
+        599,
+        "185bf124b602857645f274754e6f7162886fcf743c101ccec3dda08c1e9833f8",
+    ),
+    (
+        805,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        806,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        807,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        818,
+        "6a5cdea50a08d8995db4db69d5246516241c136e6d363c173860a7763173a93c",
+    ),
+    (
+        850,
+        "637666f70f29a0de6936769d668cfea383ede7870745cbb82ba845b6ae85d8bf",
+    ),
+    (
+        900,
+        "a29d1c259e1606bc5bbd5c5cf51940728ff7079f60d17d65dbfbaca5ce976029",
+    ),
+    (
+        1199,
+        "a56d468a842f8cda4fb6c2bcbdff51b10356a65e494127462caa3ddd8676ef0f",
+    ),
+];
+
+/// Pinned `fb.blake3` values from `tools/ref-harness/run.sh --game S1 --scene Credits --act 1
+/// --frames 1200` (idle input). `CreditsControl` walks the demo stages: `Zone01` (flat list
+/// position 6) loads at 211, the `Credits` stage returns at 831 (`Presentation` position 2)
+/// and `Zone02` Act 2 (flat list position 10) loads at 1043. The blank frames around each
+/// load pin the `STAGEMODE_LOAD` ticks; 215/843 are the first drawn frames after a load.
+const S1_CREDITS_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        210,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        211,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        215,
+        "c169c5cd18806a2bf7b0d764d0b0c6cc61b4a28702e441d55869ef1a61e52a7c",
+    ),
+    (
+        600,
+        "2a1e533c46850df37333852eb4aa001ac18ddb9fc2a77948c77143fb8748f2b1",
+    ),
+    (
+        830,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        831,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        843,
+        "dbd64f4fc9c0a4f2bd12417aa8f506ee3c9b68da765fa9e8b6140306a5ec4f4e",
+    ),
+    (
+        1043,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        1199,
+        "93df4c0be3a32bbb20821531ba6534b2a818bba73d69b30393ce0c1b40aed45c",
+    ),
+];
+
+/// Pinned `fb.blake3` values from `tools/ref-harness/run.sh --game S1 --scene LSelect --act 1
+/// --frames 600` (idle input). The level-select `MenuControl` object sets up both text menus,
+/// right-aligns them (`alignment = 1`), draws 20+19 rows and highlights `selection1` with the
+/// `+128` font rows. The pins cover the initial draw (0), the first drawn frame (6, when the
+/// back-scan clears `selection2`), the settled menu (21) and the column scroll phase.
+const S1_LSELECT_ACT1_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        1,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        6,
+        "26cbbb3bcf6d68ffd1809948ff34e295357a467bdfab3264e33a24fbd02fa4eb",
+    ),
+    (
+        21,
+        "129bd878c03d9c295f920416949a59d57576da5c4fea5eff5be8067ba6b02d42",
+    ),
+    (
+        251,
+        "2c6640017aa12aa0f5092acb6e25c7e9b7f25f1585bdc825b152bb742a5abc97",
+    ),
+    (
+        256,
+        "e46cb4d0567548b04c7a11d22322f1c042c1f9d5506e1862921be73037727505",
+    ),
+    (
+        262,
+        "816ab15bdc3606a2b3b6bae0038592f7d090598468aad942b93dd09f38d88705",
+    ),
+    (
+        599,
+        "129bd878c03d9c295f920416949a59d57576da5c4fea5eff5be8067ba6b02d42",
+    ),
+];
+const S2_LSELECT_ACT1_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        1,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        6,
+        "f236e5f364ab5b984e8f561428c0ad621d0ee09249b1bc17b0a86c33e7dae598",
+    ),
+    (
+        21,
+        "5fcbd9dbe431d6033343857ba737623357e00cf344108aca3fea5e3f11c00b88",
+    ),
+    (
+        251,
+        "175bdab39b08bacae2dbbd695ca96773fc02833ccf3394f981fdd34f75e73e03",
+    ),
+    (
+        256,
+        "276bf8beae03c64512e48913e89e63aa8b60d2cbbc3cb5c57ef3f7779a03eb55",
+    ),
+    (
+        262,
+        "6261d2dff3d77207a6b16eaf82b1bece7bad83665a1cedc8870163251de1926f",
+    ),
+    (
+        599,
+        "5fcbd9dbe431d6033343857ba737623357e00cf344108aca3fea5e3f11c00b88",
+    ),
+];
+
+/// Pinned `fb.blake3` values for `zone01_idle.input` on S1 `Special` Act 1 (idle, 600 frames).
+/// `SpecialSetup` runs `BoxCollisionTest(C_SOLID2, ...)` against the player every frame, so this
+/// window is a direct `BoxCollision2` regression; the final frame is the reference harness's
+/// `cfede829...92c976`.
+const S1_SPECIAL_ACT1_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        100,
+        "f535251667df463dd5bceb1ccbf23fd1ba3da217754059ba5480b06d09ed24b4",
+    ),
+    (
+        300,
+        "07a7e43097b4076a4b523ba9092c5d2e380e072405afe3d3b1e0c8c0191222c4",
+    ),
+    (
+        450,
+        "7d82c6c476718527980a3d04b5bab13c1f1e4a8d6d0717fec96b22f20ddfb822",
+    ),
+    (
+        599,
+        "cfede829d9a0e12f6cb2fff5c35962e83949c47ac458ce0865a3743fc892c976",
+    ),
+];
+
+/// Pinned `fb.blake3` values for `zone01_idle.input` on S1 `Mission_Zone02` Act 3 (idle, 600
+/// frames). The act places 13 `GlassPillar` entities; each runs
+/// `BoxCollisionTest(C_SOLID2, ...)` every frame, so the window pins `BoxCollision2` against
+/// the placed pillars.
+const S1_MISSION_ZONE02_ACT3_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        100,
+        "47786155f40903a34f7199bcabaf3805bc0dfe42b14a8afcfd2b9cceef01be5f",
+    ),
+    (
+        300,
+        "24b3cec66796c305d07866c57b6d6ed4e0ffe8a60cf9b57ce440ea9fec38a2f5",
+    ),
+    (
+        450,
+        "fe44c1b1c0d3f34b56293470da263b7c71a6ee246dd17d4914c8e7e4dc359e28",
+    ),
+    (
+        599,
+        "6287231b291fdb695137942de1ed03a25adce2c2448bf7528cf28913d372a657",
+    ),
+];
+
+/// Pinned `fb.blake3` values for `zone01_idle.input` on S2 `Zone07` (OOZ) Act 1 (idle, 600
+/// frames). The act places 11 `GasPlatform` entities, whose update calls
+/// `BoxCollisionTest(C_SOLID2, ...)` while the platform is not launching, covering the
+/// `C_SOLID2` path in the shipped S2 scripts.
+const S2_OOZ_GASPLATFORM_ACT1_IDLE: &[(u64, &str)] = &[
+    (
+        0,
+        "df783f7531b9128e26bbff557953acb02e66a23867e9d05e89be35b6d61b445b",
+    ),
+    (
+        100,
+        "f176ef1308ceafd5b7a7b50f72a3f10031f66b6dde017d54c588ec8a4fb47786",
+    ),
+    (
+        300,
+        "fa3f0f31fb33ad2a04ea1235094d0e30cd01b2a5cc7e11b0c67a21287b580617",
+    ),
+    (
+        450,
+        "9268950bdb630a37dc5c96285e3cd55da49c9ad8b99f860636a25c56dbb698c8",
+    ),
+    (
+        599,
+        "b9ff0f9c7d9e003b5e48294fef31cdcfc769776433b47b95e94ec9bb8fa18427",
+    ),
+];
+
 #[test]
 #[ignore = "requires assets; pins reference-harness framebuffer hashes"]
 fn zone01_idle_framebuffer_matches_reference() {
@@ -457,6 +863,28 @@ fn zone01_idle_framebuffer_matches_reference() {
     }
 }
 
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn s2_arz_idle_framebuffer_matches_reference() {
+    let scripted = scripted_input("zone01_idle.input");
+    let seed = scripted.seed().unwrap_or(DEFAULT_SEED);
+    let mut engine =
+        Engine::load(source("S2"), Some("Zone03"), Some("1"), seed).expect("engine load");
+    engine.set_scripted_input(scripted);
+    let mut frame = 0u64;
+    for &(target, expected) in S2_ARZ_IDLE {
+        while frame < target {
+            engine.run_frame().expect("frame");
+            frame += 1;
+        }
+        assert_eq!(
+            framebuffer_hash(&engine),
+            expected,
+            "S2/Zone03 idle frame {target} must match the reference harness"
+        );
+    }
+}
+
 fn scripted_input(file: &str) -> retro_input::ScriptedInput {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tools/ref-harness/testdata")
@@ -466,12 +894,12 @@ fn scripted_input(file: &str) -> retro_input::ScriptedInput {
     retro_input::ScriptedInput::from_str(&text).expect("scripted input")
 }
 
-/// Runs `input_file` for `pins` and asserts every pinned framebuffer hash. `scene` selects the
-/// starting scene (the Title START replay leaves it mid-run).
-fn check_scripted_pins(game: &str, scene: &str, input_file: &str, pins: &[(u64, &str)]) {
+/// Runs `input_file` for `pins` and asserts every pinned framebuffer hash. `scene`/`act` select
+/// the starting scene (the Title START replay leaves it mid-run).
+fn check_scripted_pins(game: &str, scene: &str, act: &str, input_file: &str, pins: &[(u64, &str)]) {
     let scripted = scripted_input(input_file);
     let seed = scripted.seed().unwrap_or(DEFAULT_SEED);
-    let mut engine = Engine::load(source(game), Some(scene), Some("1"), seed).expect("engine load");
+    let mut engine = Engine::load(source(game), Some(scene), Some(act), seed).expect("engine load");
     engine.set_scripted_input(scripted);
     let mut frame = 0u64;
     for &(target, expected) in pins {
@@ -491,7 +919,7 @@ fn check_scripted_pins(game: &str, scene: &str, input_file: &str, pins: &[(u64, 
 #[ignore = "requires assets; pins reference-harness framebuffer hashes"]
 fn zone01_right_framebuffer_matches_reference() {
     for (game, pins) in [("S1", S1_ZONE01_RIGHT), ("S2", S2_ZONE01_RIGHT)] {
-        check_scripted_pins(game, "Zone01", "zone01_right.input", pins);
+        check_scripted_pins(game, "Zone01", "1", "zone01_right.input", pins);
     }
 }
 
@@ -499,7 +927,54 @@ fn zone01_right_framebuffer_matches_reference() {
 #[ignore = "requires assets; pins reference-harness framebuffer hashes"]
 fn zone01_right400_framebuffer_matches_reference() {
     for (game, pins) in [("S1", S1_ZONE01_RIGHT400), ("S2", S2_ZONE01_RIGHT400)] {
-        check_scripted_pins(game, "Zone01", "zone01_right400.input", pins);
+        check_scripted_pins(game, "Zone01", "1", "zone01_right400.input", pins);
+    }
+}
+
+/// Save storage with the shipped save RAM but `saveRAM[35]` (`options.spindash`) forced on.
+///
+/// `PlayerObject`'s startup copies word 35 into `options.spindash`; the shipped `SGame.bin`
+/// leaves it zero, which makes `actionSpindash` jump instead. The reference window was captured
+/// with an identical scratch save, so both engines see the option on. Also exercised:
+/// `ReadSaveRAM` must load the provided storage before the startup op reads the word.
+fn spindash_storage() -> Box<dyn retro_platform::Storage> {
+    use retro_platform::Storage;
+    let path = asset_root().join("S1").join("SGame.bin");
+    let mut bytes =
+        std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    assert!(bytes.len() >= 36 * 4, "save RAM must hold word 35");
+    bytes[35 * 4..36 * 4].copy_from_slice(&1i32.to_le_bytes());
+    let mut storage = retro_platform::headless::MemoryStorage::new();
+    storage.write("SGame.bin", &bytes).expect("seed save RAM");
+    Box::new(storage)
+}
+
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn zone01_spindash_framebuffer_matches_reference() {
+    let scripted = scripted_input("zone01_spindash.input");
+    let seed = scripted.seed().unwrap_or(DEFAULT_SEED);
+    let mut engine = Engine::load_with_options(
+        source("S1"),
+        Some("Zone01"),
+        Some("1"),
+        seed,
+        spindash_storage(),
+        retro_engine::LoadOptions::default(),
+    )
+    .expect("engine load");
+    engine.set_scripted_input(scripted);
+    let mut frame = 0u64;
+    for &(target, expected) in S1_ZONE01_SPINDASH {
+        while frame < target {
+            engine.run_frame().expect("frame");
+            frame += 1;
+        }
+        assert_eq!(
+            framebuffer_hash(&engine),
+            expected,
+            "S1/Zone01 spindash frame {target} must match the reference harness"
+        );
     }
 }
 
@@ -510,7 +985,7 @@ fn zone01_right400_framebuffer_matches_reference() {
 #[ignore = "requires assets; pins reference-harness framebuffer hashes"]
 fn zone01_pause_framebuffer_matches_reference() {
     for (game, pins) in [("S1", S1_ZONE01_PAUSE), ("S2", S2_ZONE01_PAUSE)] {
-        check_scripted_pins(game, "Zone01", "zone01_pause.input", pins);
+        check_scripted_pins(game, "Zone01", "1", "zone01_pause.input", pins);
     }
 }
 
@@ -518,8 +993,218 @@ fn zone01_pause_framebuffer_matches_reference() {
 #[ignore = "requires assets; pins reference-harness framebuffer hashes"]
 fn title_start_framebuffer_matches_reference() {
     for (game, pins) in [("S1", S1_TITLE_START), ("S2", S2_TITLE_START)] {
-        check_scripted_pins(game, "Title", "title_start.input", pins);
+        check_scripted_pins(game, "Title", "1", "title_start.input", pins);
     }
+}
+
+/// The full boot flow without `--scene`: the real `GameConfig` list with `Title` at position 0.
+/// The idle attract demo must `LoadStage` into `Zone01` (flat reference list position 6) at
+/// frame 1049 and keep drawing the demo through 1599, matching the `--boot` reference window
+/// frame for frame.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn s1_boot_idle_framebuffer_matches_reference() {
+    let mut engine = Engine::load(source("S1"), None, None, DEFAULT_SEED).expect("engine load");
+    assert_eq!(engine.stage_info(), ("Title", "1"), "boot starts on Title");
+    let mut frame = 0u64;
+    for &(target, expected) in S1_BOOT_IDLE {
+        while frame < target {
+            engine.run_frame().expect("frame");
+            frame += 1;
+        }
+        assert_eq!(
+            framebuffer_hash(&engine),
+            expected,
+            "S1 boot idle frame {target} must match the reference harness"
+        );
+    }
+    assert_eq!(
+        engine.stage_info(),
+        ("Zone01", "1"),
+        "the attract demo must end up in Zone01"
+    );
+    assert_eq!(
+        engine.state.stage.active_list, 1,
+        "the attract demo selects the regular category"
+    );
+}
+
+/// The idle `Continue` countdown expiring into `ENGINE_RESETGAME`: the framebuffer pins bracket
+/// the reset tick (806) and the Title reload, and the completion assertions prove the reset
+/// lands on the first `GameConfig` entry rather than replaying `Continue`.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn s1_continue_idle_framebuffer_matches_reference() {
+    let scripted = scripted_input("zone01_idle.input");
+    let seed = scripted.seed().unwrap_or(DEFAULT_SEED);
+    let mut engine =
+        Engine::load(source("S1"), Some("Continue"), Some("1"), seed).expect("engine load");
+    engine.set_scripted_input(scripted);
+    let mut frame = 0u64;
+    for &(target, expected) in S1_CONTINUE_IDLE {
+        while frame < target {
+            engine.run_frame().expect("frame");
+            frame += 1;
+        }
+        assert_eq!(
+            framebuffer_hash(&engine),
+            expected,
+            "S1/Continue idle frame {target} must match the reference harness"
+        );
+    }
+    assert_eq!(
+        engine.stage_info(),
+        ("Title", "1"),
+        "the idle countdown must reset to the first GameConfig entry"
+    );
+    assert_eq!(
+        (engine.state.stage.active_list, engine.state.stage.list_pos),
+        (0, 0),
+        "ENGINE_RESETGAME resets the active list and position"
+    );
+}
+
+/// The credits demo walk: `CreditsControl` loads `Zone01` (211), reloads `Credits` (831) and
+/// starts `Zone02` Act 2 (1043), matching the `--scene Credits` reference window. The final
+/// assertion proves the credits script's `LoadStage` calls reached the regular category.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn s1_credits_idle_framebuffer_matches_reference() {
+    let scripted = scripted_input("zone01_idle.input");
+    let seed = scripted.seed().unwrap_or(DEFAULT_SEED);
+    let mut engine =
+        Engine::load(source("S1"), Some("Credits"), Some("1"), seed).expect("engine load");
+    engine.set_scripted_input(scripted);
+    let mut frame = 0u64;
+    for &(target, expected) in S1_CREDITS_IDLE {
+        while frame < target {
+            engine.run_frame().expect("frame");
+            frame += 1;
+        }
+        assert_eq!(
+            framebuffer_hash(&engine),
+            expected,
+            "S1/Credits idle frame {target} must match the reference harness"
+        );
+    }
+    assert_eq!(
+        engine.stage_info(),
+        ("Zone02", "2"),
+        "the credits demo must walk on to Zone02 Act 2"
+    );
+    assert_eq!(
+        engine.state.stage.active_list, 1,
+        "the credits script selects the regular category"
+    );
+}
+
+/// Ports `SetupTextMenu`/`AddTextMenuEntry`/`DrawTextMenu`; the level-select cursor, row
+/// highlights, right alignment and `DrawTextMenu`'s selection handling all feed the framebuffer.
+/// Also proves the op arms report through `record_op` rather than the stub histogram.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn lselect_act1_menus_framebuffer_matches_reference() {
+    for (game, pins) in [("S1", S1_LSELECT_ACT1_IDLE), ("S2", S2_LSELECT_ACT1_IDLE)] {
+        let mut engine = Engine::load(source(game), Some("LSelect"), Some("1"), DEFAULT_SEED)
+            .expect("engine load");
+        let mut frame = 0u64;
+        for &(target, expected) in pins {
+            while frame < target {
+                engine.run_frame().expect("frame");
+                frame += 1;
+            }
+            assert_eq!(
+                framebuffer_hash(&engine),
+                expected,
+                "{game}/LSelect Act1 idle frame {target} must match the reference harness"
+            );
+        }
+        for op in ["SetupMenu", "AddMenuEntry", "DrawMenu"] {
+            assert!(
+                engine.op_histogram().contains_key(op),
+                "{game}/LSelect must record {op}"
+            );
+            assert!(
+                !engine.stub_histogram().contains_key(op),
+                "{game}/LSelect must not stub {op}"
+            );
+        }
+    }
+}
+
+/// `TextMessage`'s startup fills `MENU_1` through `SetupMenu`/`AddMenuEntry`; before M8 WP2 the
+/// menu was empty, so `TextMessage_SetupTextChars` divided by a zero
+/// `GetTextInfo(MENU_1, TEXTINFO_TEXTSIZE, ...)` at frame 321. 3D rendering is still stubbed
+/// (M9 owns the framebuffer pin), so this is a completion regression.
+#[test]
+#[ignore = "requires assets; flow guard until the M9 3D render pass is ported"]
+fn s2_special_act1_runs_past_the_text_message_divide_by_zero() {
+    let mut engine = Engine::load(source("S2"), Some("Special"), Some("1"), DEFAULT_SEED)
+        .expect("S2/Special must load");
+    let outcome = engine
+        .run_frames(600, false)
+        .expect("S2/Special Act1 must run 600 frames without HostError");
+    assert_eq!(outcome.frames, 600);
+    assert_eq!(
+        engine.op_histogram().get("SetupMenu"),
+        Some(&1),
+        "TextMessage's startup must set up MENU_1"
+    );
+    assert!(
+        engine
+            .op_histogram()
+            .get("AddMenuEntry")
+            .copied()
+            .unwrap_or(0)
+            >= 15,
+        "all 15 message rows must be added"
+    );
+    assert_eq!(
+        engine.state.text_menus[0].row_count, 15,
+        "MENU_1 holds the 15 special-stage messages"
+    );
+}
+
+/// S1 `Special` Act 1 idle: `SpecialSetup`'s `C_SOLID2` call is the scene's main player
+/// interaction, so this pins `BoxCollision2`'s floor/ceiling/wall resolution in real data.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn s1_special_act1_idle_framebuffer_matches_reference() {
+    check_scripted_pins(
+        "S1",
+        "Special",
+        "1",
+        "zone01_idle.input",
+        S1_SPECIAL_ACT1_IDLE,
+    );
+}
+
+/// S1 `Mission_Zone02` Act 3 idle: the 13 `GlassPillar` instances each call `C_SOLID2` per
+/// frame, so this covers `BoxCollision2` against a moving solid pillar.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn s1_mission_zone02_act3_idle_framebuffer_matches_reference() {
+    check_scripted_pins(
+        "S1",
+        "Mission_Zone02",
+        "3",
+        "zone01_idle.input",
+        S1_MISSION_ZONE02_ACT3_IDLE,
+    );
+}
+
+/// S2 `Zone07` (OOZ) Act 1 idle: the 11 `GasPlatform` instances call `C_SOLID2` in their update
+/// loop, covering the shipped S2 user of `BoxCollision2`.
+#[test]
+#[ignore = "requires assets; pins reference-harness framebuffer hashes"]
+fn s2_ooz_gasplatform_act1_idle_framebuffer_matches_reference() {
+    check_scripted_pins(
+        "S2",
+        "Zone07",
+        "1",
+        "zone01_idle.input",
+        S2_OOZ_GASPLATFORM_ACT1_IDLE,
+    );
 }
 
 /// Prints a combined summary of the four required scenes.
@@ -566,6 +1251,36 @@ fn s2_br8zone09_act3_600_frames_regression() {
         .expect("BR8Zone09 Act3 must run 600 frames without HostError");
     println!("S2/BR8Zone09 Act3 hash: {}", outcome.final_hash);
     assert_eq!(outcome.frames, 600);
+}
+
+/// S1 `Continue` idle: the scripted countdown expires without input, `ContinueSetup` writes
+/// `engine.state = 8` (`ENGINE_RESETGAME`) on standalone and the engine must reset to the first
+/// GameConfig entry. `s1_continue_idle_framebuffer_matches_reference` pins the same window
+/// against the reference harness; this longer guard keeps the reset independent of the pinned
+/// frame set and reports the exact reset frame.
+#[test]
+#[ignore = "requires assets; flow guard without a reference pin yet"]
+fn s1_continue_idle_resets_to_the_first_game_config_entry() {
+    let mut engine = Engine::load(source("S1"), Some("Continue"), Some("1"), DEFAULT_SEED)
+        .expect("S1/Continue must load");
+    assert_eq!(engine.stage_info(), ("Continue", "1"));
+
+    let mut reset_frame = None;
+    for frame in 0..2400u64 {
+        engine.run_frame().expect("frame");
+        if engine.stage_info().0 != "Continue" {
+            reset_frame = Some(frame);
+            break;
+        }
+    }
+    let reset_frame = reset_frame.expect("the idle countdown must expire into the reset flow");
+    assert_eq!(engine.state.stage.active_list, 0);
+    assert_eq!(engine.state.stage.list_pos, 0);
+    println!(
+        "S1/Continue idle reset to {} act {} at frame {reset_frame}",
+        engine.stage_info().0,
+        engine.stage_info().1
+    );
 }
 
 /// Boots every `Data/Stages/*/Act*.bin` in S1 and S2 for 60 frames and asserts that none of
