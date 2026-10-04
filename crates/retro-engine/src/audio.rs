@@ -67,6 +67,10 @@ pub struct AudioState {
     sfx_cache: Vec<Option<SfxId>>,
     sfx_failed: Vec<bool>,
     tracks: Vec<TrackInfo>,
+    /// `music.volume` (upstream `musicVolume`): the script-visible master volume.
+    music_volume: u8,
+    /// `Settings.ini` `streamVolume` (upstream `engine.streamVolume`): scales the master.
+    stream_volume: u8,
     /// Per-track loaded stream, tagged with the path it was loaded from.
     stream_cache: Vec<Option<CachedStream>>,
     /// Per-track path whose stream load last failed (`None` when it has not failed).
@@ -90,6 +94,8 @@ impl AudioState {
             sfx_cache: Vec::new(),
             sfx_failed: Vec::new(),
             tracks: vec![TrackInfo::default(); TRACK_COUNT],
+            music_volume: MAX_VOLUME,
+            stream_volume: MAX_VOLUME,
             stream_cache: vec![None; TRACK_COUNT],
             stream_failed: vec![None; TRACK_COUNT],
             scratch: Vec::new(),
@@ -122,6 +128,7 @@ impl AudioState {
         state.sfx_cache = vec![None; state.sfx_paths.len()];
         state.sfx_failed = vec![false; state.sfx_paths.len()];
         state.mixer.set_stream_volume(settings.stream_volume);
+        state.stream_volume = state.mixer.stream_volume();
         state.mixer.set_sfx_volume(settings.sfx_volume);
         state
     }
@@ -246,19 +253,29 @@ impl AudioState {
     }
 
     /// Music volume in upstream `0..=100` units (`music.volume`).
+    ///
+    /// This is the script-visible master (`musicVolume` upstream), independent of `Settings.ini`:
+    /// the mixer receives `music.volume * streamVolume / 100`.
     #[must_use]
     pub fn music_volume(&self) -> u8 {
-        self.mixer.stream_volume()
+        self.music_volume
     }
 
     /// Sets the music volume in upstream `0..=100` units (`music.volume` / `SetMusicVolume`).
     ///
     /// Upstream keeps `masterVolume` (`music.volume`) and `bgmVolume` (from `Settings.ini`)
-    /// separately and mixes with their product; this port keeps a single stream-volume field, so
-    /// a script write replaces the settings volume instead of scaling it.
+    /// separately and mixes with their product; this port applies the product to the mixer's
+    /// single stream-volume field.
     pub fn set_music_volume_level(&mut self, volume: i32) {
-        self.mixer
-            .set_stream_volume_level(volume.clamp(0, i32::from(MAX_VOLUME)) as u8);
+        self.music_volume = volume.clamp(0, i32::from(MAX_VOLUME)) as u8;
+        self.apply_stream_volume();
+    }
+
+    /// Pushes `music.volume * Settings.ini streamVolume` onto the mixer.
+    fn apply_stream_volume(&mut self) {
+        let effective =
+            u16::from(self.music_volume) * u16::from(self.stream_volume) / u16::from(MAX_VOLUME);
+        self.mixer.set_stream_volume_level(effective as u8);
     }
 
     /// Music stream position in source PCM frames (`music.position`).
@@ -337,6 +354,12 @@ impl AudioState {
     /// A track without a file or whose stream fails to load stops the current music, like
     /// upstream, and returns `false`. Returns `true` only when a stream actually started, which
     /// is when upstream sets `trackID`.
+    ///
+    /// A file-backed play resets `music.volume` to full, exactly like upstream
+    /// `AudioLegacy.cpp:49` (`musicVolume = 100` on every `PlayMusic` branch that has a track
+    /// file). Scripts fade `music.volume` to `0` before switching tracks (`MusicEvent`), so
+    /// without this reset the next `PlayMusic` would start silent. An out-of-range track or one
+    /// without a file only stops the music (`StopChannel`), which upstream leaves the volume for.
     pub fn play_music(&mut self, track: i32) -> bool {
         let Some(index) = usize::try_from(track)
             .ok()
@@ -354,6 +377,10 @@ impl AudioState {
             self.stop_music();
             return false;
         }
+        // Upstream unconditionally sets `musicVolume = 100` after `PlayStream` for a file-backed
+        // track, whether or not the stream eventually opens, so reset before loading it.
+        self.music_volume = MAX_VOLUME;
+        self.apply_stream_volume();
         let Some(id) = self.ensure_stream(index) else {
             self.stop_music();
             return false;
@@ -903,23 +930,164 @@ mod tests {
             &stage_config(Vec::new()),
             &settings,
         );
-        assert_eq!(state.music_volume(), 50);
+        assert_eq!(
+            state.music_volume(),
+            100,
+            "music.volume is the master volume, not the settings volume"
+        );
+        assert_eq!(
+            state.mixer().stream_volume(),
+            50,
+            "the mixer receives music.volume * streamVolume"
+        );
         assert_eq!(state.sfx_volume(), 25);
     }
 
     #[test]
     fn music_volume_and_position_are_script_writable() {
         let (mut state, _) = state_with_sfx();
-        assert_eq!(state.music_volume(), 80, "default streamVolume is 0.8");
+        assert_eq!(state.music_volume(), 100, "music.volume defaults to full");
+        assert_eq!(
+            state.mixer().stream_volume(),
+            80,
+            "the mixer still applies the Settings.ini streamVolume"
+        );
         state.set_music_volume_level(40);
         assert_eq!(state.music_volume(), 40);
+        assert_eq!(
+            state.mixer().stream_volume(),
+            32,
+            "a script write scales with the settings volume"
+        );
         state.set_music_volume_level(-5);
         assert_eq!(state.music_volume(), 0);
+        assert_eq!(state.mixer().stream_volume(), 0);
         state.set_music_volume_level(1000);
         assert_eq!(state.music_volume(), 100);
+        assert_eq!(state.mixer().stream_volume(), 80);
         state.set_sfx_volume_level(25);
         assert_eq!(state.sfx_volume(), 25);
         assert_eq!(state.music_position(), 0);
+    }
+
+    /// Ticks once with a fresh capture window and returns the mix hash, asserting the tick is
+    /// audible (`captured_pcm` holds exactly this tick's non-silent samples).
+    fn capture_audible_tick(state: &mut AudioState) -> [u8; 32] {
+        state.set_capture(false);
+        state.set_capture(true);
+        let hash = state.tick();
+        assert!(
+            state.captured_pcm().iter().any(|sample| *sample != 0.0),
+            "the tick must be audible"
+        );
+        hash
+    }
+
+    /// The 50-frame `music.volume -= 2` fade shared by all `MusicEvent` states
+    /// (`Data/Scripts/Global/MusicEvent.txt`), from a full 100 down to 0.
+    fn fade_music_to_zero(state: &mut AudioState) {
+        for _ in 0..50 {
+            state.set_music_volume_level(i32::from(state.music_volume()) - 2);
+        }
+        assert_eq!(state.music_volume(), 0, "the fade must reach silence");
+        assert_eq!(state.mixer().stream_volume(), 0);
+    }
+
+    /// Sonic 2's EHZ boss sequence: the level track fades to 0, `PlayMusic` switches to the boss
+    /// track, the defeat fade reaches 0 again, and `PlayMusic` restores the level track. Upstream
+    /// `PlayMusic` resets `musicVolume = 100` (`AudioLegacy.cpp:49`), so both switches must be
+    /// audible and byte-identical to a fresh play of the same track.
+    #[test]
+    fn boss_music_event_fade_then_play_is_audible_again() {
+        let (mut state, _) = state_with_music();
+        state.set_track(0, "a.ogg", true, 0);
+        state.set_track(1, "b.ogg", true, 0);
+        assert!(state.play_music(0), "the level track starts");
+        capture_audible_tick(&mut state);
+
+        // MUSICEVENT_FADETOBOSS_ACTION: fade the stage music, then PlayMusic(TRACK_BOSS).
+        fade_music_to_zero(&mut state);
+        state.set_capture(false);
+        state.set_capture(true);
+        state.tick();
+        assert!(
+            state.captured_pcm().iter().all(|sample| *sample == 0.0),
+            "at music.volume 0 the faded track must be silent"
+        );
+        assert!(state.play_music(1), "the boss track starts");
+        assert_eq!(state.music_volume(), 100, "PlayMusic resets music.volume");
+        assert_eq!(
+            state.mixer().stream_volume(),
+            80,
+            "the settings streamVolume still scales the reset master volume"
+        );
+        let boss_tick = capture_audible_tick(&mut state);
+        let (mut fresh, _) = state_with_music();
+        fresh.set_track(1, "b.ogg", true, 0);
+        assert!(fresh.play_music(1));
+        assert_eq!(
+            boss_tick,
+            fresh.tick(),
+            "the boss track must restart byte-identically to a fresh play"
+        );
+
+        // MUSICEVENT_FADETOSTAGE_ACTION: fade the boss music, then PlayMusic(TRACK_STAGE).
+        fade_music_to_zero(&mut state);
+        assert!(state.play_music(0), "the level track starts again");
+        assert_eq!(state.music_volume(), 100);
+        let stage_tick = capture_audible_tick(&mut state);
+        let (mut fresh_stage, _) = state_with_music();
+        fresh_stage.set_track(0, "a.ogg", true, 0);
+        assert!(fresh_stage.play_music(0));
+        assert_eq!(
+            stage_tick,
+            fresh_stage.tick(),
+            "the level track must be audible again after the boss"
+        );
+    }
+
+    /// Upstream sets `musicVolume = 100` for every file-backed `PlayMusic`, even when the stream
+    /// later fails to open; only an empty track (`StopChannel`) keeps the faded volume.
+    #[test]
+    fn play_music_reset_applies_to_failed_and_empty_tracks_like_upstream() {
+        let (mut state, _) = state_with_sfx();
+        state.set_track(0, "Missing.ogg", true, 0);
+        state.set_music_volume_level(0);
+        assert!(!state.play_music(0), "the missing stream reports failure");
+        assert_eq!(
+            state.music_volume(),
+            100,
+            "a file-backed play resets music.volume even when the load fails"
+        );
+
+        state.set_music_volume_level(0);
+        state.set_track(1, "", false, 0);
+        assert!(!state.play_music(1), "an empty track stops the music");
+        assert_eq!(
+            state.music_volume(),
+            0,
+            "upstream's empty-track branch only calls StopChannel"
+        );
+    }
+
+    /// `SwapMusicTrack` calls `PlayMusic` upstream (`AudioLegacy.cpp:76`), so it resets as well.
+    #[test]
+    fn swap_music_track_resets_a_faded_volume() {
+        let (mut state, _) = state_with_music();
+        state.set_track(0, "a.ogg", true, 0);
+        assert!(state.play_music(0));
+        fade_music_to_zero(&mut state);
+        assert!(state.swap_music_track(1, "b.ogg", 0));
+        assert_eq!(state.music_volume(), 100);
+        capture_audible_tick(&mut state);
+
+        // StopMusic/PauseMusic/ResumeMusic must not reset (`AudioLegacy.hpp:25`).
+        state.set_music_volume_level(0);
+        state.stop_music();
+        state.pause_music();
+        state.resume_music();
+        assert_eq!(state.music_volume(), 0);
+        assert_eq!(state.mixer().stream_volume(), 0);
     }
 
     #[test]
