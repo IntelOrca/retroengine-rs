@@ -12,11 +12,10 @@
 //!
 //! Known gaps (documented, deterministic):
 //!
-//! * `BoxCollision2` is wired through `SceneCollision::box_collision2`, which currently delegates
-//!   to `BoxCollision` until M8 WP4 lands the exact port; the 3D matrix/vertex ops are explicit
-//!   stubs (see [`EngineState::stub_histogram`]); `TouchCollision`, `BoxCollision`,
-//!   `PlatformCollision`, `Get16x16TileInfo`, `Set16x16TileInfo` and `Copy16x16Tile` are fully
-//!   ported.
+//! * `BoxCollision2` is wired through `SceneCollision::box_collision2`, the exact
+//!   `CollisionLegacyv4.cpp:2644-2946` port; the 3D matrix/vertex ops are explicit stubs (see
+//!   [`EngineState::stub_histogram`]); `TouchCollision`, `BoxCollision`, `PlatformCollision`,
+//!   `Get16x16TileInfo`, `Set16x16TileInfo` and `Copy16x16Tile` are fully ported.
 //! * `stage.deformationData0..3` are script-visible views of
 //!   [`retro_render::RenderState::deform_data`]; `SetLayerDeformation` fills them and the tile
 //!   layer renderers sample them.

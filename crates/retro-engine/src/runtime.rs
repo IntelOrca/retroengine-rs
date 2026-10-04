@@ -452,7 +452,8 @@ impl Engine {
         );
         state.audio = audio;
         // State that lives on across `LoadStageFiles`: save RAM, input, RNG (already carried),
-        // menus, diagnostics and the frame counter. Global VM variables are restored below.
+        // the script-visible menu selections, diagnostics and the frame counter. Global VM
+        // variables are restored below.
         state.save = std::mem::replace(&mut self.state.save, SaveState::in_memory());
         state.input = self.state.input;
         state.input_press = self.state.input_press;
@@ -462,8 +463,11 @@ impl Engine {
         state.frame = self.state.frame;
         state.menu1_selection = self.state.menu1_selection;
         state.menu2_selection = self.state.menu2_selection;
-        // `gameMenu` is a global that survives `LoadStageFiles`; carry the script-visible
-        // selections into the rebuilt menus.
+        // Only the script-visible `menu1`/`menu2` selections survive into the rebuilt menus;
+        // upstream keeps the whole `gameMenu` array across `LoadStageFiles` (only
+        // `visibleRowOffset` is reset, `SceneLegacyv4.cpp:40-41`), so row data, entry sizes and
+        // highlights rebuilt by the new scene's scripts are a latent divergence for menus that
+        // are not re-`SetupMenu`ed.
         for (index, selection) in [(0, state.menu1_selection), (1, state.menu2_selection)] {
             if let Some(menu) = state.text_menus.get_mut(index) {
                 menu.selection1 = selection;

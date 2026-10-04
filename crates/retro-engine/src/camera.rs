@@ -438,16 +438,26 @@ fn set_player_screen_position_cd_style(state: &mut EngineState, target: usize) {
                     } else {
                         state.camera.locked_y = 1;
                     }
+                    state.camera.ypos = camera_y_plus(
+                        state.camera.ypos,
+                        dif,
+                        state.stage.cur_y_boundary1.wrapping_add(scroll_up),
+                    );
                 } else if dif > 6 {
                     dif = 6;
+                    state.camera.ypos = camera_y_plus(
+                        state.camera.ypos,
+                        dif,
+                        state.stage.cur_y_boundary1.wrapping_add(scroll_up),
+                    );
                 } else {
                     state.camera.locked_y = 1;
+                    state.camera.ypos = camera_y_plus(
+                        state.camera.ypos,
+                        dif,
+                        state.stage.cur_y_boundary1.wrapping_add(scroll_up),
+                    );
                 }
-                state.camera.ypos = camera_y_plus(
-                    state.camera.ypos,
-                    dif,
-                    state.stage.cur_y_boundary1.wrapping_add(scroll_up),
-                );
             }
         } else {
             let mut dif = target_y.wrapping_sub(state.camera.ypos);
@@ -458,14 +468,20 @@ fn set_player_screen_position_cd_style(state: &mut EngineState, target: usize) {
                     } else {
                         state.camera.locked_y = 1;
                     }
+                    state.camera.ypos = camera_y_plus(
+                        state.camera.ypos,
+                        dif,
+                        state.stage.cur_y_boundary1.wrapping_add(scroll_up),
+                    );
                 } else if dif < -6 {
                     dif = -6;
+                    state.camera.ypos = camera_y_plus(
+                        state.camera.ypos,
+                        dif,
+                        state.stage.cur_y_boundary1.wrapping_add(scroll_up),
+                    );
                 }
-                state.camera.ypos = camera_y_plus(
-                    state.camera.ypos,
-                    dif,
-                    state.stage.cur_y_boundary1.wrapping_add(scroll_up),
-                );
+                // `-6 <= dif <= 0` runs none of upstream's arms: `ypos` is left unchanged.
             } else {
                 dif = 0;
                 // Upstream branches on `abs(target->yvel) > 0x60000` here but sets
@@ -1035,6 +1051,65 @@ mod tests {
         handle_cameras(&mut state);
         assert_eq!(target_entity(&state).look_pos_x, -4);
         assert_eq!(state.camera.xpos, 216);
+    }
+
+    #[test]
+    fn cd_style_small_falling_gap_does_not_move_the_camera() {
+        // `SceneLegacyv4.cpp:1313-1345`: with no scroll tracking, a falling target only moves
+        // `ypos` through the `dif < -32`/`abs(yvel)` and `dif < -6` arms; `-6 <= dif <= 0`
+        // matches neither, so the camera must stay put instead of easing by `dif`.
+        fn cd_falling_ypos(target_y: i32) -> i32 {
+            let mut state = target(212, target_y);
+            wide_bounds(&mut state);
+            state.camera.style = CAMERASTYLE_EXTENDED;
+            state.camera.ypos = 500;
+            set_target(&mut state, |entity| {
+                entity.gravity = 0;
+                entity.direction = 1;
+                entity.look_pos_x = 0;
+            });
+            handle_cameras(&mut state);
+            state.camera.ypos
+        }
+
+        for gap in 0..=6 {
+            assert_eq!(
+                cd_falling_ypos(500 - gap),
+                500,
+                "a {gap}px falling gap must not move the camera"
+            );
+        }
+        assert_eq!(cd_falling_ypos(493), 494, "dif < -6 steps exactly 6px");
+        assert_eq!(cd_falling_ypos(468), 494, "dif == -32 is still the -6 arm");
+        assert_eq!(cd_falling_ypos(467), 484, "dif < -32 steps at most 16px");
+    }
+
+    #[test]
+    fn cd_style_rising_gap_applies_the_clamp_in_every_arm() {
+        // Mirror of the falling window: every rising arm reaches the clamp-add, so gaps of
+        // 1..=6px still move `ypos` by `dif` (and latch), gaps >6px step 6 and `dif > 32`
+        // steps at most 16.
+        fn cd_rising(target_y: i32) -> (i32, i32) {
+            let mut state = target(212, target_y);
+            wide_bounds(&mut state);
+            state.camera.style = CAMERASTYLE_EXTENDED;
+            state.camera.ypos = 500;
+            set_target(&mut state, |entity| {
+                entity.gravity = 0;
+                entity.direction = 1;
+                entity.look_pos_x = 0;
+            });
+            handle_cameras(&mut state);
+            (state.camera.ypos, state.camera.locked_y)
+        }
+
+        assert_eq!(cd_rising(503), (503, 1), "1..=6px gaps add dif and latch");
+        assert_eq!(
+            cd_rising(507),
+            (506, 0),
+            "dif > 6 steps 6px without latching"
+        );
+        assert_eq!(cd_rising(533), (516, 0), "dif > 32 steps at most 16px");
     }
 
     #[test]
