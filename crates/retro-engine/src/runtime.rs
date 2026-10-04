@@ -1251,6 +1251,47 @@ impl Engine {
                 put_i32(&mut hasher, *value);
             }
         }
+        // `scene3D`: the six scalars, the three matrices and the *full* vertex/face buffers.
+        // Full buffers (not just the used counts) are script-visible: scripts read and write
+        // scratch slots 4094/4095 and the buffers are never reset at load (`SceneLegacyv4.cpp`
+        // resets only `vertexCount`/`faceCount`). `drawList3D`/`vertexBufferT` are derived
+        // scratch and stay out.
+        for value in [
+            self.state.scene3d.vertex_count,
+            self.state.scene3d.face_count,
+            self.state.scene3d.projection_x,
+            self.state.scene3d.projection_y,
+            self.state.scene3d.fog_color,
+            self.state.scene3d.fog_strength,
+        ] {
+            put_i32(&mut hasher, value);
+        }
+        for matrix in [
+            &self.state.scene3d.mat_world,
+            &self.state.scene3d.mat_view,
+            &self.state.scene3d.mat_temp,
+        ] {
+            for row in &matrix.values {
+                for value in row {
+                    put_i32(&mut hasher, *value);
+                }
+            }
+        }
+        for vertex in self.state.scene3d.vertex_buffer.iter() {
+            put_i32(&mut hasher, vertex.x);
+            put_i32(&mut hasher, vertex.y);
+            put_i32(&mut hasher, vertex.z);
+            put_i32(&mut hasher, vertex.u);
+            put_i32(&mut hasher, vertex.v);
+        }
+        for face in self.state.scene3d.face_buffer.iter() {
+            put_i32(&mut hasher, face.a);
+            put_i32(&mut hasher, face.b);
+            put_i32(&mut hasher, face.c);
+            put_i32(&mut hasher, face.d);
+            put_i32(&mut hasher, face.color as i32);
+            put_i32(&mut hasher, face.flag);
+        }
         // The software framebuffer is part of the canonical state: every backing pixel
         // (`pitch * height`, including the padding columns) is hashed as little-endian u16.
         self.state.render.framebuffer.hash_into(&mut hasher);

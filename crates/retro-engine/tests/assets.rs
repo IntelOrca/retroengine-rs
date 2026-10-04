@@ -1203,6 +1203,67 @@ fn s2_special_act1_runs_past_the_text_message_divide_by_zero() {
     );
 }
 
+/// M9 WP1 wiring: `Special`'s `Halfpipe` startup builds the persistent tube mesh
+/// (`vertexCount = 1400`, `faceCount = 740`) and sets the projection/fog scalars. After 600
+/// idle frames every matrix/transform op must be ported; `Draw3DScene` stays the only 3D stub
+/// until M9b owns the rasterizer.
+#[test]
+#[ignore = "requires assets; M9 WP1 scene3D wiring"]
+fn s2_special_act1_scene3d_wiring() {
+    let mut engine = Engine::load(source("S2"), Some("Special"), Some("1"), DEFAULT_SEED)
+        .expect("S2/Special must load");
+    let scene3d = &engine.state.scene3d;
+    assert_eq!(scene3d.vertex_count, 1400, "Halfpipe startup vertex cursor");
+    assert_eq!(scene3d.face_count, 740, "Halfpipe startup face cursor");
+    assert_eq!(scene3d.projection_x, 216);
+    assert_eq!(scene3d.projection_y, 216);
+    assert_eq!(scene3d.fog_strength, 0x50);
+
+    engine
+        .run_frames(600, false)
+        .expect("S2/Special must run 600 frames");
+
+    let matrix_ops = [
+        "SetIdentityMatrix",
+        "MatrixMultiply",
+        "MatrixTranslateXYZ",
+        "MatrixScaleXYZ",
+        "MatrixRotateX",
+        "MatrixRotateY",
+        "MatrixRotateZ",
+        "MatrixRotateXYZ",
+        "MatrixInverse",
+        "TransformVertices",
+    ];
+    for op in matrix_ops {
+        assert!(
+            !engine.stub_histogram().contains_key(op),
+            "{op} must be ported by M9a"
+        );
+    }
+    // The shipped Special acts exercise these six (Draw3DScene is still M9b's stub).
+    for op in [
+        "Draw3DScene",
+        "MatrixInverse",
+        "MatrixMultiply",
+        "MatrixRotateXYZ",
+        "MatrixTranslateXYZ",
+        "TransformVertices",
+    ] {
+        assert!(
+            engine.op_histogram().contains_key(op),
+            "{op} must appear in the op histogram"
+        );
+    }
+    let stubbed_3d: Vec<&str> = engine
+        .stub_histogram()
+        .keys()
+        .filter(|name| matrix_ops.contains(&name.as_str()) || name.as_str() == "Draw3DScene")
+        .map(String::as_str)
+        .collect();
+    assert_eq!(stubbed_3d, vec!["Draw3DScene"]);
+}
+
 /// S1 `Special` Act 1 idle: `SpecialSetup`'s `C_SOLID2` call is the scene's main player
 /// interaction, so this pins `BoxCollision2`'s floor/ceiling/wall resolution in real data.
 #[test]
