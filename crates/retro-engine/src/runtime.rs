@@ -53,7 +53,10 @@ use crate::loader::{self, SceneAssets};
 use crate::profile::EngineSettings;
 use crate::rng::DEFAULT_SEED;
 use crate::save::{SaveState, seed_memory_storage};
-use crate::state::{EngineState, STAGEMODE_FROZEN, STAGEMODE_NORMAL, STAGEMODE_PAUSED};
+use crate::state::{
+    ENGINE_EXITPAUSE, ENGINE_INITPAUSE, ENGINE_MAINGAME, ENGINE_WAIT, EngineState,
+    STAGEMODE_FROZEN, STAGEMODE_NORMAL, STAGEMODE_PAUSED,
+};
 
 /// The compiled script file and its VM execution state.
 pub struct ScriptRuntime {
@@ -565,6 +568,24 @@ impl Engine {
             // input line nor advances the idle-dimming timer (`SceneLegacyv4.cpp`). The load
             // frame still presents (`FlipScreen`): dimming runs, the frame counter advances and
             // audio mixes, but no updates or drawing happen.
+            self.state.render.process_dimming();
+            self.state.frame += 1;
+            self.state.audio.tick();
+            return Ok(());
+        }
+        // `Legacy::v4::ProcessEngine` dispatches on `gameMode`, which scripts write through
+        // `engine.state` (`VAR_ENGINESTATE`). The pause handshake and `ENGINE_WAIT` run no stage
+        // logic at all; the pause cases also reset the mode, so exactly one frame is skipped
+        // (`RetroEnginev4.cpp:307-309`). `ENGINE_DEVMENU`/`ENGINE_INITDEVMENU`/`ENGINE_SCRIPTERROR`
+        // are not modelled and keep the existing normal-stage path.
+        if matches!(
+            self.state.game_mode,
+            ENGINE_INITPAUSE | ENGINE_EXITPAUSE | ENGINE_WAIT
+        ) {
+            if self.state.game_mode != ENGINE_WAIT {
+                self.state.game_mode = ENGINE_MAINGAME;
+            }
+            // `FlipScreen` still runs on a skipped frame; the framebuffer is left untouched.
             self.state.render.process_dimming();
             self.state.frame += 1;
             self.state.audio.tick();

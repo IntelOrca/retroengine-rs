@@ -33,7 +33,7 @@ use retro_scene::collision::{
 use retro_scene::{ENTITY_COUNT, TEMPENTITY_START};
 use retro_script::{Op, ScriptError, ScriptEvent, ScriptHost, VmState};
 
-use crate::state::{ENGINE_MAINGAME, EngineState, LayerState, PARALLAX_COUNT, ScriptFrame};
+use crate::state::{EngineState, LayerState, PARALLAX_COUNT, ScriptFrame};
 
 /// First rev03 object variable id (`object.entityPos`).
 const VAR_OBJECT_ENTITY_POS: i32 = 19;
@@ -1471,7 +1471,7 @@ impl ScriptHost for EngineHost<'_> {
         } else if (VAR_HPARALLAX_FIRST..=VAR_VPARALLAX_LAST).contains(&var) {
             self.read_parallax_var(var, array_index)
         } else if var == VAR_ENGINE_STATE {
-            ENGINE_MAINGAME
+            self.state.game_mode
         } else if var == VAR_ENGINE_SFX_VOLUME {
             i32::from(self.state.audio.sfx_volume())
         } else if var == VAR_ENGINE_BGM_VOLUME {
@@ -1540,6 +1540,10 @@ impl ScriptHost for EngineHost<'_> {
             self.state.audio.set_sfx_volume_level(value);
         } else if var == VAR_ENGINE_BGM_VOLUME {
             self.state.audio.set_music_volume_level(value);
+        } else if var == VAR_ENGINE_STATE {
+            // `engine.state = N` writes `gameMode` (`ScriptLegacyv4.cpp`'s `VAR_ENGINESTATE`
+            // set case); the runtime dispatches it at the start of the next frame.
+            self.state.game_mode = value;
         }
         // Input and touchscreen globals are read-only.
         if (VAR_SCREEN_FIRST..=VAR_SCREEN_LAST).contains(&var) {
