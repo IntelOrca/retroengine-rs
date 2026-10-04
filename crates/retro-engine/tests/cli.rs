@@ -252,6 +252,10 @@ fn windowed_frames_run_exits_promptly() {
     assert!(text.contains("presented-frames: 5"), "{text}");
     assert!(text.contains("hash: "), "{text}");
     assert!(text.contains("audio: 44100 Hz stereo f32"), "{text}");
+    assert!(
+        text.contains("audio: submitted ") && text.contains("underrun(s)"),
+        "windowed runs must report audio flow-control diagnostics: {text}"
+    );
     assert!(text.contains("video: dummy"), "{text}");
     let _ = std::fs::remove_dir_all(&root);
 }

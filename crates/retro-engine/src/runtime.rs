@@ -742,6 +742,15 @@ impl Engine {
         self.state.audio.last_hash_hex()
     }
 
+    /// One-line flow-control report for the attached audio device (`audio:` diagnostics).
+    ///
+    /// `None` when no device is attached (headless or muted runs). Reported after a windowed
+    /// run to expose device underruns and overrun resyncs that would otherwise be silent gaps.
+    #[must_use]
+    pub fn audio_diagnostics(&self) -> Option<String> {
+        self.state.audio.audio_diagnostics()
+    }
+
     /// Persists a dirty save RAM (called at exit; `WriteSaveRAM` writes immediately).
     pub fn flush_save(&mut self) -> bool {
         self.state.save.flush()

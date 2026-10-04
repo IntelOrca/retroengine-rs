@@ -1,5 +1,6 @@
 //! SDL3 backend providing a real window, streaming RGB565 texture, audio stream and device input.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -332,11 +333,13 @@ impl Window for Sdl3Window {
 
 /// SDL3 audio stream accepting interleaved f32 samples.
 ///
-/// The device is opened paused (`SDL_OpenAudioDeviceStream` semantics) and the queue cap and
-/// prebuffer are enforced one layer up by `retro_audio::AudioEngine::with_prebuffer`, which uses
-/// [`AudioDevice::queued_frames`] and calls [`AudioDevice::start`] when the target is queued.
-/// `SDL_PutAudioStreamData` is non-blocking and appends, so this device simply reports the
-/// stream's queued input frames and accepts every frame it is offered.
+/// The device is opened paused (`SDL_OpenAudioDeviceStream` semantics) and the device queue
+/// high-water, backlog and prebuffer are enforced one layer up by
+/// `retro_audio::AudioEngine::with_prebuffer`, which uses [`AudioDevice::queued_frames`] and
+/// calls [`AudioDevice::start`] when the target is queued. `SDL_PutAudioStreamData` is
+/// non-blocking and appends (SDL does not drop queued input), so this device simply reports the
+/// stream's queued input frames and accepts every frame it is offered; unaccepted frames stay
+/// in the engine's backlog.
 pub struct Sdl3Audio {
     stream: AudioStreamOwner,
     sample_rate: u32,
@@ -975,9 +978,24 @@ impl InputSource for Sdl3Input {
     }
 }
 
+/// One 60 Hz frame period.
+const FRAME_PERIOD: Duration = Duration::from_micros(1_000_000 / TARGET_FPS);
+
 /// Wall-clock driven fixed-step clock.
+///
+/// The clock paces the windowed loop to real time: frame `n` is due `n` periods after the
+/// schedule origin. It deliberately does **not** replay missed time as a catch-up burst. If the
+/// loop falls at least one full frame behind the schedule (engine load, a long present, the
+/// process being suspended), the origin is rebased forward so the current frame is due now and
+/// the missed frames are dropped. Audio production therefore cannot outrun real time after a
+/// hitch: the logic loop never mixes several ticks back to back to make up lost time.
+///
+/// VSync (`SDL_SetRenderVSync`) additionally blocks presentation to the display refresh; the
+/// wall-clock schedule is the primary pacing and keeps the loop at 60 Hz even with vsync off.
 pub struct SystemClock {
     start: Instant,
+    /// Origin of the current pacing schedule; rebased when the loop falls a frame behind.
+    basis: Cell<Instant>,
     frame: u64,
 }
 
@@ -985,10 +1003,26 @@ impl SystemClock {
     /// Creates a clock starting now.
     #[must_use]
     pub fn new() -> Self {
+        let now = Instant::now();
         Self {
-            start: Instant::now(),
+            start: now,
+            basis: Cell::new(now),
             frame: 0,
         }
+    }
+}
+
+/// Returns `basis` rebased forward when `frame`'s deadline is more than one period in the past.
+///
+/// Pure so the resynchronization policy is unit-testable. Rebasing makes the missed time
+/// vanish: the returned origin reports `target` elapsed right now, so the caller sleeps for the
+/// current frame's remaining time (zero) and the next frame is a full period away.
+fn rebase_schedule(basis: Instant, target: Duration, now: Instant) -> Instant {
+    let elapsed = now.saturating_duration_since(basis);
+    if elapsed > target + FRAME_PERIOD {
+        basis + (elapsed - target)
+    } else {
+        basis
     }
 }
 
@@ -1013,7 +1047,9 @@ impl Clock for SystemClock {
 
     fn sleep_until_next_frame(&self) -> Result<(), PlatformError> {
         let target = Duration::from_micros(self.frame * 1_000_000 / TARGET_FPS);
-        let elapsed = self.start.elapsed();
+        let basis = rebase_schedule(self.basis.get(), target, Instant::now());
+        self.basis.set(basis);
+        let elapsed = basis.elapsed();
         if target > elapsed {
             std::thread::sleep(target - elapsed);
         }
@@ -1024,6 +1060,25 @@ impl Clock for SystemClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_clock_schedule_resyncs_instead_of_catching_up() {
+        let basis = Instant::now();
+        let target = FRAME_PERIOD * 10;
+
+        // On schedule and less than one frame late: the origin is untouched.
+        assert_eq!(rebase_schedule(basis, target, basis + target), basis);
+        assert_eq!(
+            rebase_schedule(basis, target, basis + target + FRAME_PERIOD / 2),
+            basis
+        );
+
+        // A multi-second hitch (load, suspend, debugger) is dropped, not replayed: the rebased
+        // origin reports exactly `target` elapsed now, so the missed frames never burst.
+        let now = basis + target + Duration::from_secs(2);
+        let rebased = rebase_schedule(basis, target, now);
+        assert_eq!(now.saturating_duration_since(rebased), target);
+    }
 
     #[test]
     fn audio_description_reports_device_format_and_buffer() {
