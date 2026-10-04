@@ -3639,7 +3639,7 @@ mod tests {
         state.camera.target = -1;
         state.camera.xpos = 0;
         state.camera.ypos = 0;
-        crate::runtime::follow_camera(&mut state);
+        crate::camera::handle_cameras(&mut state);
         assert_eq!((state.screen.x_scroll, state.screen.y_scroll), (44, -3));
         assert_eq!((state.camera.xpos, state.camera.ypos), (0, 0));
     }
@@ -3663,7 +3663,7 @@ mod tests {
         state
             .entities
             .reset_object_entity(0, 1, 0, 212 << 16, 120 << 16);
-        crate::runtime::follow_camera(&mut state);
+        crate::camera::handle_cameras(&mut state);
         // `SetPlayerScreenPosition` centres the camera on the target horizontally; vertically
         // it clamps the camera to `curYBoundary1 + SCREEN_SCROLL_UP` (104), which makes the
         // derived `yScrollOffset` equal `curYBoundary1`.
@@ -3673,7 +3673,7 @@ mod tests {
         // A disabled camera leaves the script scroll untouched even with a live target.
         state.screen.x_scroll = 44;
         state.camera.enabled = 0;
-        crate::runtime::follow_camera(&mut state);
+        crate::camera::handle_cameras(&mut state);
         assert_eq!(state.screen.x_scroll, 44);
     }
 

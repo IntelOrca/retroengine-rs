@@ -329,6 +329,9 @@ pub struct EngineState {
     pub rng: GlibcRand,
     /// Camera globals.
     pub camera: Camera,
+    /// `cameraShift`: the look-ahead direction latched by `SetPlayerScreenPositionCDStyle`
+    /// (styles 1-3); reset by `STAGEMODE_LOAD` alongside the camera.
+    pub camera_shift: i32,
     /// Screen globals.
     pub screen: Screen,
     /// Stage globals.
@@ -500,6 +503,7 @@ impl EngineState {
             math: MathTables::new(),
             rng,
             camera: Camera::scene_load(),
+            camera_shift: 0,
             screen,
             stage,
             layers,

@@ -15,12 +15,11 @@
 //! The state hash is a canonical little-endian serialisation of all entity slots, the object
 //! list, camera/screen/stage metadata, global VM state and the RNG state, fed through BLAKE3.
 //!
-//! # Camera divergence
+//! # Camera
 //!
-//! Upstream tracks the camera through `SetPlayerScreenPosition`/`SetPlayerScreenPositionCDStyle`
-//! (look-ahead, y-locking and boundary easing, ~200 lines). M3 uses a deterministic
-//! centre-and-clamp follow instead; `object.outOfBounds` and update ranges therefore differ from
-//! the reference near screen edges.
+//! `HandleCameras` dispatches `camera.target`'s style (0-6) or the `enabled != 1` locked branch;
+//! see [`camera`] for the ports of `SetPlayerScreenPosition`, `...CDStyle`, `...HLocked`,
+//! `...Locked`, `...Fixed` and `...Static`.
 
 use std::sync::Arc;
 
@@ -47,6 +46,7 @@ use retro_script::{ScriptEvent, ScriptFile, Vm, VmState};
 
 use crate::EngineError;
 use crate::audio::AudioState;
+use crate::camera;
 use crate::host::EngineHost;
 use crate::input::{EngineInput, PRESS_BUTTONS, apply_players};
 use crate::loader::{self, SceneAssets};
@@ -377,6 +377,7 @@ impl Engine {
     fn prepare_act_reload(&mut self) {
         self.state.render.fade_mode = 0;
         self.state.camera = Camera::scene_load();
+        self.state.camera_shift = 0;
         self.state.screen.x_scroll = 0;
         self.state.screen.y_scroll = 0;
         self.state.music_track = 0;
@@ -1053,20 +1054,14 @@ impl Engine {
         Ok(())
     }
 
-    /// Deterministic simplified camera follow.
+    /// `HandleCameras`: the camera follows `camera.target` once per frame.
     ///
-    /// Upstream only recomputes `xScrollOffset`/`yScrollOffset` from the camera while
-    /// `cameraEnabled == 1` (`Scene.cpp:251-579` call `SetPlayerScreenPosition` under that
-    /// guard). Scenes that keep the camera disabled (the title screens) drive the scroll
-    /// themselves through `screen.xoffset`/`screen.yoffset`, so an unconditional follow here
-    /// would clobber the script-set values every frame.
-    ///
-    /// Only `CAMERASTYLE_FOLLOW` (0) is dispatched; upstream's other styles
-    /// (`EXTENDED`/`EXTENDED_OFFSET_L`/`EXTENDED_OFFSET_R`/`HLOCKED`/`FIXED`/`STATIC`, 1-6)
-    /// and the `cameraEnabled != 1` branch that calls `SetPlayerLockedScreenPosition` are
-    /// dormant. The verified S1/S2 runs use style 0 only.
+    /// Scenes whose `cameraTarget` is out of range (the title screens keep `-1`) return
+    /// untouched, so their script-driven `screen.xoffset`/`screen.yoffset` writes survive.
+    /// See [`camera::handle_cameras`] for the style dispatch and the ports of
+    /// `SetPlayerScreenPosition` and friends (`SceneLegacyv4.cpp:379-1905`).
     fn update_camera(&mut self) {
-        follow_camera(&mut self.state);
+        camera::handle_cameras(&mut self.state);
     }
 
     /// Hashes the canonical engine state.
@@ -1117,6 +1112,7 @@ impl Engine {
         ] {
             put_i32(&mut hasher, value);
         }
+        put_i32(&mut hasher, self.state.camera_shift);
         put_bytes(&mut hasher, self.state.scene.title.as_bytes());
         for value in [
             i32::from(self.state.scene.mid_point),
@@ -1274,268 +1270,6 @@ impl Engine {
     #[must_use]
     pub fn framebuffer(&self) -> &retro_render::Framebuffer {
         &self.state.render.framebuffer
-    }
-}
-
-/// `SetPlayerScreenPosition` (`CAMERASTYLE_FOLLOW`), ported from `SceneLegacyv4.cpp`.
-///
-/// `ProcessStage` only calls this through `HandleCameras` while `cameraEnabled == 1`; scenes
-/// that keep the camera disabled or targetless (the title screens) drive the scroll themselves
-/// through `screen.xoffset`/`screen.yoffset`, so an unconditional follow would clobber the
-/// script-set values. The boundary easing, the `xPosDif`/`yPosDif` dead zones, the
-/// `cameraLockedY` latch and the `SCREEN_SCROLL_UP`/`DOWN` clamps all mirror upstream exactly.
-///
-/// This is the only camera style implemented: upstream's `HandleCameras` also dispatches
-/// `EXTENDED`/`EXTENDED_OFFSET_L`/`EXTENDED_OFFSET_R` (`SetPlayerScreenPositionCDStyle`),
-/// `HLOCKED` (`SetPlayerHLockedScreenPosition`), `FIXED`, `STATIC`, and falls back to
-/// `SetPlayerLockedScreenPosition` when `cameraEnabled != 1`. Those paths stay dormant until a
-/// scene needs them.
-pub(crate) fn follow_camera(state: &mut EngineState) {
-    if state.camera.enabled != 1 {
-        return;
-    }
-    let Some(target) = usize::try_from(state.camera.target).ok() else {
-        return;
-    };
-    let Some(entity) = state.entities.get(target).copied() else {
-        return;
-    };
-
-    let screen_w = state.screen.xsize;
-    let screen_h = state.screen.ysize;
-    let half_x = state.screen.center_x();
-    let scroll_up = screen_h / 2 - 16;
-    let scroll_down = screen_h / 2 + 16;
-    let target_x = entity.xpos >> 16;
-    let target_y = state.camera.adjust_y.wrapping_add(entity.ypos >> 16);
-    let x_vel = entity.xvel;
-    let y_vel = entity.yvel;
-
-    // Boundary easing towards the script-written `new*Boundary` values.
-    if state.stage.new_y_boundary1 > state.stage.cur_y_boundary1 {
-        state.stage.cur_y_boundary1 = if state.stage.new_y_boundary1 >= state.screen.y_scroll {
-            state.screen.y_scroll
-        } else {
-            state.stage.new_y_boundary1
-        };
-    }
-    if state.stage.new_y_boundary1 < state.stage.cur_y_boundary1 {
-        if state.stage.cur_y_boundary1 >= state.screen.y_scroll {
-            state.stage.cur_y_boundary1 = state.stage.cur_y_boundary1.wrapping_sub(1);
-        } else {
-            state.stage.cur_y_boundary1 = state.stage.new_y_boundary1;
-        }
-    }
-    if state.stage.new_y_boundary2 < state.stage.cur_y_boundary2 {
-        if state.stage.cur_y_boundary2 <= state.screen.y_scroll.wrapping_add(screen_h)
-            || state.stage.new_y_boundary2 >= state.screen.y_scroll.wrapping_add(screen_h)
-        {
-            state.stage.cur_y_boundary2 = state.stage.cur_y_boundary2.wrapping_sub(1);
-        } else {
-            state.stage.cur_y_boundary2 = state.screen.y_scroll.wrapping_add(screen_h);
-        }
-    }
-    if state.stage.new_y_boundary2 > state.stage.cur_y_boundary2 {
-        if state.screen.y_scroll.wrapping_add(screen_h) >= state.stage.cur_y_boundary2 {
-            state.stage.cur_y_boundary2 = state.stage.cur_y_boundary2.wrapping_add(1);
-            if y_vel > 0 {
-                let buffer = state.stage.cur_y_boundary2.wrapping_add(y_vel >> 16);
-                state.stage.cur_y_boundary2 = if state.stage.new_y_boundary2 < buffer {
-                    state.stage.new_y_boundary2
-                } else {
-                    buffer
-                };
-            }
-        } else {
-            state.stage.cur_y_boundary2 = state.stage.new_y_boundary2;
-        }
-    }
-    if state.stage.new_x_boundary1 > state.stage.cur_x_boundary1 {
-        state.stage.cur_x_boundary1 = if state.screen.x_scroll <= state.stage.new_x_boundary1 {
-            state.screen.x_scroll
-        } else {
-            state.stage.new_x_boundary1
-        };
-    }
-    if state.stage.new_x_boundary1 < state.stage.cur_x_boundary1 {
-        if state.screen.x_scroll <= state.stage.cur_x_boundary1 {
-            state.stage.cur_x_boundary1 = state.stage.cur_x_boundary1.wrapping_sub(1);
-            if x_vel < 0 {
-                state.stage.cur_x_boundary1 = state.stage.cur_x_boundary1.wrapping_add(x_vel >> 16);
-                if state.stage.cur_x_boundary1 < state.stage.new_x_boundary1 {
-                    state.stage.cur_x_boundary1 = state.stage.new_x_boundary1;
-                }
-            }
-        } else {
-            state.stage.cur_x_boundary1 = state.stage.new_x_boundary1;
-        }
-    }
-    if state.stage.new_x_boundary2 < state.stage.cur_x_boundary2 {
-        state.stage.cur_x_boundary2 =
-            if state.stage.new_x_boundary2 > screen_w.wrapping_add(state.screen.x_scroll) {
-                state.stage.new_x_boundary2
-            } else {
-                screen_w.wrapping_add(state.screen.x_scroll)
-            };
-    }
-    if state.stage.new_x_boundary2 > state.stage.cur_x_boundary2 {
-        if screen_w.wrapping_add(state.screen.x_scroll) >= state.stage.cur_x_boundary2 {
-            state.stage.cur_x_boundary2 = state.stage.cur_x_boundary2.wrapping_add(1);
-            if x_vel > 0 {
-                state.stage.cur_x_boundary2 = state.stage.cur_x_boundary2.wrapping_add(x_vel >> 16);
-                if state.stage.cur_x_boundary2 > state.stage.new_x_boundary2 {
-                    state.stage.cur_x_boundary2 = state.stage.new_x_boundary2;
-                }
-            }
-        } else {
-            state.stage.cur_x_boundary2 = state.stage.new_x_boundary2;
-        }
-    }
-
-    // Horizontal follow: an 8px dead zone, at most 16px per frame, clamped to the boundaries.
-    let mut x_pos_dif = target_x.wrapping_sub(state.camera.xpos);
-    if target_x > state.camera.xpos {
-        x_pos_dif = x_pos_dif.wrapping_sub(8);
-        if x_pos_dif >= 0 {
-            if x_pos_dif >= 17 {
-                x_pos_dif = 16;
-            }
-        } else {
-            x_pos_dif = 0;
-        }
-    } else {
-        x_pos_dif = x_pos_dif.wrapping_add(8);
-        if x_pos_dif > 0 {
-            x_pos_dif = 0;
-        } else if x_pos_dif <= -17 {
-            x_pos_dif = -16;
-        }
-    }
-    let mut centered_x_bound1 = state.camera.xpos.wrapping_add(x_pos_dif);
-    state.camera.xpos = centered_x_bound1;
-    if centered_x_bound1 < half_x.wrapping_add(state.stage.cur_x_boundary1) {
-        state.camera.xpos = half_x.wrapping_add(state.stage.cur_x_boundary1);
-        centered_x_bound1 = state.camera.xpos;
-    }
-    let centered_x_bound2 = state.stage.cur_x_boundary2.wrapping_sub(half_x);
-    if centered_x_bound2 < centered_x_bound1 {
-        state.camera.xpos = centered_x_bound2;
-        centered_x_bound1 = centered_x_bound2;
-    }
-
-    // Vertical follow: `scrollTracking` uses a 32px window; otherwise the camera latches once
-    // it settles within 6px of the target.
-    let mut y_pos_dif;
-    if entity.scroll_tracking != 0 {
-        if target_y <= state.camera.ypos {
-            y_pos_dif = target_y.wrapping_sub(state.camera.ypos).wrapping_add(32);
-            if y_pos_dif <= 0 {
-                if y_pos_dif <= -17 {
-                    y_pos_dif = -16;
-                }
-            } else {
-                y_pos_dif = 0;
-            }
-        } else {
-            y_pos_dif = target_y.wrapping_sub(state.camera.ypos).wrapping_sub(32);
-            if y_pos_dif >= 0 {
-                if y_pos_dif >= 17 {
-                    y_pos_dif = 16;
-                }
-            } else {
-                y_pos_dif = 0;
-            }
-        }
-        state.camera.locked_y = 0;
-    } else if state.camera.locked_y != 0 {
-        y_pos_dif = 0;
-        state.camera.ypos = target_y;
-    } else if target_y <= state.camera.ypos {
-        y_pos_dif = target_y.wrapping_sub(state.camera.ypos);
-        if target_y.wrapping_sub(state.camera.ypos) <= 0 {
-            if y_pos_dif >= -32 && y_vel.unsigned_abs() <= 0x60000 {
-                if y_pos_dif < -6 {
-                    y_pos_dif = -6;
-                }
-            } else if y_pos_dif < -16 {
-                y_pos_dif = -16;
-            }
-        } else {
-            y_pos_dif = 0;
-            state.camera.locked_y = 1;
-        }
-    } else {
-        y_pos_dif = target_y.wrapping_sub(state.camera.ypos);
-        if target_y.wrapping_sub(state.camera.ypos) < 0 {
-            y_pos_dif = 0;
-            state.camera.locked_y = 1;
-        } else if y_pos_dif > 32 || y_vel.unsigned_abs() > 0x60000 {
-            if y_pos_dif > 16 {
-                y_pos_dif = 16;
-            } else {
-                state.camera.locked_y = 1;
-            }
-        } else if y_pos_dif <= 6 {
-            state.camera.locked_y = 1;
-        } else {
-            y_pos_dif = 6;
-        }
-    }
-
-    let mut new_cam_y = state.camera.ypos.wrapping_add(y_pos_dif);
-    if new_cam_y
-        <= state
-            .stage
-            .cur_y_boundary1
-            .wrapping_add(scroll_up.wrapping_sub(1))
-    {
-        new_cam_y = state.stage.cur_y_boundary1.wrapping_add(scroll_up);
-    }
-    state.camera.ypos = new_cam_y;
-    if state
-        .stage
-        .cur_y_boundary2
-        .wrapping_sub(scroll_down.wrapping_sub(1))
-        <= new_cam_y
-    {
-        state.camera.ypos = state.stage.cur_y_boundary2.wrapping_sub(scroll_down);
-    }
-
-    state.screen.x_scroll = state.camera.shake_x.wrapping_add(centered_x_bound1) - half_x;
-    let pos = state
-        .camera
-        .ypos
-        .wrapping_add(entity.look_pos_y)
-        .wrapping_sub(scroll_up);
-    state.screen.y_scroll = if pos < state.stage.cur_y_boundary1 {
-        state.stage.cur_y_boundary1
-    } else {
-        pos
-    };
-    let mut y = state.stage.cur_y_boundary2.wrapping_sub(screen_h);
-    if state
-        .stage
-        .cur_y_boundary2
-        .wrapping_sub(screen_h.wrapping_sub(1))
-        > state.screen.y_scroll
-    {
-        y = state.screen.y_scroll;
-    }
-    state.screen.y_scroll = state.camera.shake_y.wrapping_add(y);
-
-    if state.camera.shake_x != 0 {
-        state.camera.shake_x = if state.camera.shake_x <= 0 {
-            !state.camera.shake_x
-        } else {
-            -state.camera.shake_x
-        };
-    }
-    if state.camera.shake_y != 0 {
-        state.camera.shake_y = if state.camera.shake_y <= 0 {
-            !state.camera.shake_y
-        } else {
-            -state.camera.shake_y
-        };
     }
 }
 
