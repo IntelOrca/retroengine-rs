@@ -67,7 +67,8 @@ pub struct Args {
     /// Like `--list` but prints machine-readable JSON
     #[arg(long)]
     pub list_json: bool,
-    /// Scripted input file to replay; overrides the windowed SDL input in either mode
+    /// Scripted input file to replay; overrides the windowed SDL input in either mode. Its
+    /// `seed` header seeds the run when `--seed` is omitted
     #[arg(long)]
     pub input: Option<PathBuf>,
     /// Directory to dump presented frames into as `frame_%04d.png`
@@ -76,7 +77,8 @@ pub struct Args {
     /// Dump every Nth frame (default 1; frame 0 is dumped before the loop)
     #[arg(long, default_value_t = 1)]
     pub dump_frame_every: u64,
-    /// RNG seed
+    /// RNG seed; overrides the `--input` replay's `seed` header. Without either, the built-in
+    /// default is used
     #[arg(long)]
     pub seed: Option<u32>,
     /// Print one `frame,hash` line per frame instead of only the final hash
@@ -316,6 +318,14 @@ pub fn list(args: &Args) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// Picks the RNG seed for a run: an explicit `--seed` wins, then the `--input` replay's `seed`
+/// header, then the built-in default.
+fn resolve_seed(explicit: Option<u32>, scripted: Option<&ScriptedInput>) -> u32 {
+    explicit
+        .or_else(|| scripted.and_then(ScriptedInput::seed))
+        .unwrap_or(crate::rng::DEFAULT_SEED)
+}
+
 /// Parses arguments, loads the requested scene and runs the frame loop.
 pub fn run(args: &Args) -> Result<(), EngineError> {
     if args.list || args.list_json {
@@ -327,7 +337,18 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
     let quit_signals = args.headless && retro_platform::signals::install();
     let assets = resolve_assets(&args.assets_dir)?;
     let source: Arc<dyn DataSource> = Arc::new(DirSource::new(&assets.root)?);
-    let seed = args.seed.unwrap_or(crate::rng::DEFAULT_SEED);
+    // Parse the replay before the engine is loaded: the engine is constructed with the final
+    // seed, and an explicit `--seed` must override the replay's `seed` header.
+    let scripted = if let Some(path) = &args.input {
+        let bytes = std::fs::read(path)?;
+        Some(
+            ScriptedInput::load(&bytes)
+                .map_err(|error| EngineError::Input(format!("{}: {error}", path.display())))?,
+        )
+    } else {
+        None
+    };
+    let seed = resolve_seed(args.seed, scripted.as_ref());
 
     let mut platform = retro_platform::create(backend_for(args))?;
     platform.init()?;
@@ -343,10 +364,7 @@ pub fn run(args: &Args) -> Result<(), EngineError> {
         },
     )?;
 
-    if let Some(path) = &args.input {
-        let bytes = std::fs::read(path)?;
-        let scripted = ScriptedInput::load(&bytes)
-            .map_err(|error| EngineError::Input(format!("{}: {error}", path.display())))?;
+    if let Some(scripted) = scripted {
         engine.set_scripted_input(scripted);
     } else if !args.headless {
         engine.set_platform_input();
@@ -670,6 +688,28 @@ mod tests {
         assert!(!FrameLimit::Bounded(5).reached(4));
         assert!(FrameLimit::Bounded(5).reached(5));
         assert!(FrameLimit::Bounded(5).reached(6));
+    }
+
+    #[test]
+    fn replay_seed_header_is_used_unless_seed_flag_overrides_it() {
+        let with_seed = ScriptedInput::from_str(
+            "retro-input 1\nseed 12345\n0 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n",
+        )
+        .unwrap();
+        // An explicit `--seed` wins over the replay header.
+        assert_eq!(resolve_seed(Some(7), Some(&with_seed)), 7);
+        // Without `--seed`, the replay header seeds the run.
+        assert_eq!(resolve_seed(None, Some(&with_seed)), 12345);
+
+        // A replay without a seed header (and no input at all) keeps the built-in default.
+        let headerless =
+            ScriptedInput::from_str("retro-input 1\n0 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n")
+                .unwrap();
+        assert_eq!(
+            resolve_seed(None, Some(&headerless)),
+            crate::rng::DEFAULT_SEED
+        );
+        assert_eq!(resolve_seed(None, None), crate::rng::DEFAULT_SEED);
     }
 
     #[test]

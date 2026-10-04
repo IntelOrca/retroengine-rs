@@ -453,6 +453,88 @@ fn origins_flag_selects_the_script_platform() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The `--input` replay's `seed` header seeds the run when `--seed` is omitted; an explicit
+/// `--seed` overrides it and a missing header (or no input) keeps the built-in default.
+#[test]
+fn replay_seed_header_is_used_unless_seed_flag_overrides_it() {
+    let root = temp_assets("replay-seed");
+    write_assets(&root);
+    let replay = root.join("input.txt");
+    std::fs::write(
+        &replay,
+        "retro-input 1\n\
+         seed 12345\n\
+         0 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n",
+    )
+    .unwrap();
+
+    let input_args = [
+        root.to_str().unwrap(),
+        "--headless",
+        "--frames",
+        "1",
+        "--mute",
+        "--input",
+        replay.to_str().unwrap(),
+    ];
+    let header = run(&input_args);
+    assert!(header.status.success(), "{}", stderr(&header));
+    assert!(
+        stdout(&header).contains("seed: 12345"),
+        "{}",
+        stdout(&header)
+    );
+
+    let with_override = run(&[
+        root.to_str().unwrap(),
+        "--headless",
+        "--frames",
+        "1",
+        "--mute",
+        "--input",
+        replay.to_str().unwrap(),
+        "--seed",
+        "7",
+    ]);
+    assert!(with_override.status.success(), "{}", stderr(&with_override));
+    assert!(
+        stdout(&with_override).contains("seed: 7"),
+        "{}",
+        stdout(&with_override)
+    );
+
+    // A replay without a seed header leaves the built-in default in place.
+    std::fs::write(
+        &replay,
+        "retro-input 1\n\
+         0 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -\n",
+    )
+    .unwrap();
+    let headerless = run(&input_args);
+    assert!(headerless.status.success(), "{}", stderr(&headerless));
+    assert!(
+        stdout(&headerless).contains(&format!("seed: {}", retro_engine::rng::DEFAULT_SEED)),
+        "{}",
+        stdout(&headerless)
+    );
+
+    // No `--input` at all keeps the same default.
+    let no_input = run(&[
+        root.to_str().unwrap(),
+        "--headless",
+        "--frames",
+        "1",
+        "--mute",
+    ]);
+    assert!(no_input.status.success(), "{}", stderr(&no_input));
+    assert!(
+        stdout(&no_input).contains(&format!("seed: {}", retro_engine::rng::DEFAULT_SEED)),
+        "{}",
+        stdout(&no_input)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A windowed run with scripted input must still pump SDL events so a quit signal can close
 /// it. SDL turns SIGTERM into a quit event, exactly like the window close button.
 #[cfg(unix)]
