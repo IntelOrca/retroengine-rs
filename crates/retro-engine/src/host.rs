@@ -1548,11 +1548,8 @@ impl ScriptHost for EngineHost<'_> {
                     menu.edit_entry(&text, row_id, highlight);
                 }
             }
-            // The matrix/transform ops are ported (M9a); `Draw3DScene` stays a stub until M9b
-            // implements the rasterizer, so it keeps `record_stub` (and its histogram) unchanged.
             Op::Draw3DScene => {
-                // M9b: flip to `record_op("Draw3DScene")` and implement the actual draw pass.
-                self.state.record_stub(stub_name(op));
+                self.state.record_op("Draw3DScene");
                 let sheet = self.current_sheet_id();
                 self.state.draw_3d_scene(sheet);
             }
@@ -4255,9 +4252,9 @@ mod tests {
         assert_eq!(host.state.scene3d.vertex_buffer[0].u, 3, "u/v untouched");
         assert!(!host.state.stub_histogram.contains_key("TransformVertices"));
 
-        // `Draw3DScene` remains the only stubbed 3D op until M9b.
+        // M9b ported `Draw3DScene`; no 3D op is stubbed any more.
         host.engine_op(Op::Draw3DScene, &mut vm_state).unwrap();
-        assert_eq!(host.state.stub_histogram.get("Draw3DScene"), Some(&1));
+        assert!(!host.state.stub_histogram.contains_key("Draw3DScene"));
         assert_eq!(host.state.op_histogram.get("Draw3DScene"), Some(&1));
     }
 }

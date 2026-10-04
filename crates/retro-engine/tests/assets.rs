@@ -1241,7 +1241,7 @@ fn s2_special_act1_scene3d_wiring() {
             "{op} must be ported by M9a"
         );
     }
-    // The shipped Special acts exercise these six (Draw3DScene is still M9b's stub).
+    // The shipped Special acts exercise these six.
     for op in [
         "Draw3DScene",
         "MatrixInverse",
@@ -1255,13 +1255,81 @@ fn s2_special_act1_scene3d_wiring() {
             "{op} must appear in the op histogram"
         );
     }
+    // M9b ported `Draw3DScene`: no 3D op may remain in the stub histogram.
     let stubbed_3d: Vec<&str> = engine
         .stub_histogram()
         .keys()
         .filter(|name| matrix_ops.contains(&name.as_str()) || name.as_str() == "Draw3DScene")
         .map(String::as_str)
         .collect();
-    assert_eq!(stubbed_3d, vec!["Draw3DScene"]);
+    assert!(stubbed_3d.is_empty(), "unexpected 3D stubs: {stubbed_3d:?}");
+}
+
+/// M9 WP2 smoke: all eight `Special` acts run 600 idle frames with the rasterizer live, no 3D
+/// op is stubbed, the halfpipe is visible at frame 599 and Act 1 is bit-identical across runs.
+/// Reference framebuffer pins are M9c's job; this only guards the port from stubs and panics.
+#[test]
+#[ignore = "requires assets; release-only; M9 rasterizer smoke"]
+fn s2_special_acts_3d_smoke() {
+    let ops_3d = [
+        "Draw3DScene",
+        "SetIdentityMatrix",
+        "MatrixMultiply",
+        "MatrixTranslateXYZ",
+        "MatrixScaleXYZ",
+        "MatrixRotateX",
+        "MatrixRotateY",
+        "MatrixRotateZ",
+        "MatrixRotateXYZ",
+        "MatrixInverse",
+        "TransformVertices",
+    ];
+    for act in 1..=8 {
+        let act = act.to_string();
+        let mut engine = Engine::load(
+            source("S2"),
+            Some("Special"),
+            Some(act.as_str()),
+            DEFAULT_SEED,
+        )
+        .expect("S2/Special must load");
+        engine
+            .run_frames(600, false)
+            .expect("600-frame run must succeed");
+        for op in ops_3d {
+            assert!(
+                !engine.stub_histogram().contains_key(op),
+                "Act {act} still stubs {op}"
+            );
+        }
+        assert!(
+            engine
+                .op_histogram()
+                .get("Draw3DScene")
+                .copied()
+                .unwrap_or(0)
+                >= 600,
+            "Act {act} must draw 3D every frame"
+        );
+        if act == "1" {
+            let ratio = engine.state.render.framebuffer.non_black_ratio();
+            eprintln!("S2 Special Act 1 frame 599 non-black ratio: {ratio}");
+            assert!(
+                ratio > 0.05,
+                "frame 599 should show the halfpipe, non-black ratio {ratio}"
+            );
+        }
+    }
+
+    // Act 1 determinism: `state_hash` covers the framebuffer and the full scene3D buffers.
+    let mut first = Engine::load(source("S2"), Some("Special"), Some("1"), DEFAULT_SEED)
+        .expect("S2/Special must load");
+    first.run_frames(600, false).expect("600-frame run");
+    let expected = first.state_hash();
+    let mut second = Engine::load(source("S2"), Some("Special"), Some("1"), DEFAULT_SEED)
+        .expect("S2/Special must load");
+    second.run_frames(600, false).expect("600-frame run");
+    assert_eq!(second.state_hash(), expected, "Act 1 must be deterministic");
 }
 
 /// S1 `Special` Act 1 idle: `SpecialSetup`'s `C_SOLID2` call is the scene's main player
