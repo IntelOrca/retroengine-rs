@@ -60,6 +60,19 @@ tools/ref-harness/run.sh \
     --ppm 155,240            # optional keyframe PPM dumps
 ```
 
+Without `--scene`/`--act`, `--boot` starts the reference with no `stage=`/`scene=` argument so it boots
+the real `GameConfig` list (Title at list position 0) for attract/Continue/game-over/credits windows:
+
+```sh
+tools/ref-harness/run.sh --game S1 --boot --frames 1600 \
+    --out /tmp/opencode/refrun/s1-boot
+```
+
+`--record-input` adds the parsed and actual controller button masks to every record (see below);
+`--input-trace` logs the per-player masks to stderr each tick. `--text-menus` adds the legacy
+`gameMenu` state to each record, and `--screens` adds per-screen framebuffer hashes when
+`videoSettings.screenCount > 1` (dormant for standalone S1/S2, which use one screen).
+
 Outputs under `--out` (default `tools/ref-harness/out/<game>-<scene>-<act>`, gitignored):
 
 * `records.jsonl` – one record per processed frame (format below)
@@ -77,15 +90,23 @@ default; pass `--game-type 1` for Origins (`USE_ORIGINS`) scripts.
 ## Scripted input
 
 `--input` accepts exactly the Rust `retro-input 1` format (see
-`crates/retro-input/src/scripted.rs`), so the same file drives both engines. Only player 1's
-button field is used (axes/touches are parsed and ignored):
+`crates/retro-input/src/scripted.rs`), so the same file drives both engines. The four per-player
+button columns are injected; axes/touches are parsed but ignored:
 
 ```text
 retro-input 1
 seed 1592594996
 0 - 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -
-60 RIGHT 0 0 -  - 0 0 -  - 0 0 -  - 0 0 -
+60 RIGHT 0 0 -  LEFT|B 0 0 -  - 0 0 -  - 0 0 -
 ```
+
+Upstream maps `entity.controlMode + 1` onto the controller array, so player 1 reads
+`controller[CONT_P1]` (index 1), player 2 reads `controller[2]`, etc. Column 1 (Rust player 0) is
+therefore applied to `controller[1]`, column 2 (Rust player 1) to `controller[2]`, and columns 3/4
+to `controller[3]`/`controller[4]`. `controller[CONT_ANY]` (index 0) — what unassigned devices feed
+and what the pause/frame-step checks read — receives the OR of all players. For the M7 1P files
+(only column 1 ever non-neutral) this is byte-identical to the old behaviour of applying column 1
+to `controller[0]` and `controller[1]`.
 
 * Frame numbers must be sequential from 0; the header and `seed` line are optional only in that
   `seed` may be omitted.
@@ -119,6 +140,9 @@ button continuously (idle/hold-RIGHT) but shifts every press edge by one tick.
 * `zone01_idle.input` – header-only, idle (repeat)
 * `zone01_right.input` – idle through frame 59, then RIGHT held
 * `zone01_right400.input` – idle through frame 399, then RIGHT held
+* `zone01_pause.input` – idle through frame 199, then START held (pause)
+* `players_split.input` – column 1 RIGHT from line 10, column 2 `LEFT|B` from line 50 (injection
+  verification; use with `--record-input`)
 
 ## Record stream format (`records.jsonl`)
 
@@ -155,12 +179,28 @@ START path overwrites `stage.activeList`/`listPos` in `Start.txt` before calling
 * `v4.player` is the entity at `playerListPos`, always with its 48 `values`.
 * `v4.ents` lists every entity with `type != 0` (plus the player slot). Set
   `REF_HARNESS_ENT_VALUES=1` to also dump all 48 `values` per entity (large).
+* With `REF_HARNESS_RECORD_INPUT=1` each record also carries
+  `"input":{"p1":N,"p2":N,"p3":N,"p4":N,"ctrl":[N,N,N,N,N]}`: the four parsed button masks
+  (`p1` = first column) and the held-button masks reconstructed from `controller[0..4]` after the
+  tick. This is how per-player injection is verified (`run.sh --record-input`).
+* With `REF_HARNESS_TEXT_MENUS=1` each record also carries
+  `"textMenus":[{"rowCount":..,"visibleRowCount":..,"visibleRowOffset":..,"selection1":..,
+  "selection2":..,"selectionCount":..,"alignment":..,"timer":..,"textDataPos":..,
+  "entryStart":[..],"entrySize":[..],"entryHighlight":[..]}, ...]` (two legacy menus, arrays
+  truncated to `rowCount`); `run.sh --text-menus`.
+* With `REF_HARNESS_SCREENS=1` and `videoSettings.screenCount > 1`, each record also carries
+  `"screens":[{"w":..,"h":..,"blake3":".."}, ...]`, one hashed visible framebuffer per active
+  screen (each with its own `size`/`pitch`); `fb` remains `screens[0]`. `run.sh --screens`.
 * `cameras` are `Legacy::cameras[0..1]`; `scroll`/`shake`/`lag` are the legacy camera globals.
 * Names/strings are JSON-escaped.
 
 Environment variables honoured by the binary (normally set by `run.sh`):
 `REF_HARNESS_DUMP`, `REF_HARNESS_INPUT`, `REF_HARNESS_FRAMES`, `REF_HARNESS_SEED`,
-`REF_HARNESS_PPM_DIR`, `REF_HARNESS_PPM_FRAMES`, `REF_HARNESS_PPM_EVERY`, `REF_HARNESS_ENT_VALUES`.
+`REF_HARNESS_PPM_DIR`, `REF_HARNESS_PPM_FRAMES`, `REF_HARNESS_PPM_EVERY`, `REF_HARNESS_ENT_VALUES`,
+`REF_HARNESS_RECORD_INPUT` (adds the `input` object; `0`/unset = off), `REF_HARNESS_INPUT_TRACE`
+(stderr line per tick with the injected `p1..p4`/`any` masks), `REF_HARNESS_TEXT_MENUS` (adds the
+`textMenus` array) and `REF_HARNESS_SCREENS` (adds the `screens` array when
+`videoSettings.screenCount > 1`).
 
 ## Diffing
 
@@ -204,6 +244,7 @@ same BLAKE3 as `fb.blake3`. It reports the first divergent frame, and
 | `0002-disable-video.patch` | Compiles out libogg/libtheora video playback under `RETRO_HARNESS` (S1/S2 ship no `Data/Video`; avoids a dependency that has no user-local build here). |
 | `0003-reference-harness.patch` | Adds `RSDKv5/refharness.{hpp,cpp}` and hooks: deterministic RNG seed (`Math.cpp`), scripted input injection (`Input.cpp`), no frame-skip/no wall clock + software-renderer fallback + presentation skip (`SDL2RenderDevice.cpp`), frame recording and frame-limit exit (`RetroEngine.cpp`). |
 | `0004-reject-lr-buttons.patch` | Rejects `L`/`R` button names and mask bits in the input script parser; rev03 `ControllerState` has no L/R fields, so they could only be silently ignored. |
+| `0005-per-player-input.patch` | Parses all four per-player button columns and injects them into `controller[CONT_P1..CONT_P4]` (with `CONT_ANY` = OR of all players); adds the optional `input`, `textMenus` and `screens` record blocks plus the per-tick mask trace (`REF_HARNESS_RECORD_INPUT`, `REF_HARNESS_TEXT_MENUS`, `REF_HARNESS_SCREENS`, `REF_HARNESS_INPUT_TRACE`). |
 
 The harness only activates when a `REF_HARNESS_*` variable is set; without it the binary behaves
 like the upstream decompilation.
@@ -235,6 +276,31 @@ Commands: the `run.sh` invocation above, plus the Rust command from "Reference v
 Earlier revisions of the port diverged in the title-card fade (frame 155) and at the first
 death (`STAGEMODE_FROZEN` handling, record 377); both are fixed and covered by pinned tests in
 `crates/retro-engine/tests/{collision_parity,assets}.rs`.
+
+## M8 reference windows (patch 0005)
+
+Generated with the rebuilt harness (patches 0001–0005) and `zone01_idle.input`/`title_idle.input`
+(seed 1592594996); records under `/tmp/opencode/m8-harness/records/` (scratch, not committed).
+`fb.blake3` is the final record's framebuffer hash (frame index in parentheses):
+
+| Window | Frames | Final `fb.blake3` |
+|---|---|---|
+| S1 `LSelect` act 1 idle | 600 | `129bd878c03d9c295f920416949a59d57576da5c4fea5eff5be8067ba6b02d42` (599) |
+| S2 `LSelect` act 1 idle | 600 | `5fcbd9dbe431d6033343857ba737623357e00cf344108aca3fea5e3f11c00b88` (599) |
+| S1 `Special` act 1 idle | 600 | `cfede829d9a0e12f6cb2fff5c35962e83949c47ac458ce0865a3743fc892c976` (599) |
+| S1 `Continue` idle | 600 | `185bf124b602857645f274754e6f7162886fcf743c101ccec3dda08c1e9833f8` (599) |
+| S1 `Credits` idle | 600 | `14579eb008f57f0b54dced061dc19d2edbd0552a741c0d606d57c1880eddffea` (599; loads `Zone01` at 211) |
+| S1 `Title` idle (`--scene Title`) | 1600 | `f69be45a040048f841e49fb14d64227478cec862bc8ec41ace67873f048b1e5f` (1599; attract loads `Zone01` at 1049) |
+| S1 boot idle (`--boot`) | 1600 | `f69be45a040048f841e49fb14d64227478cec862bc8ec41ace67873f048b1e5f` (1599; real list pos 0, `TITLE SCREEN`) |
+| S2 `Zone03` (ARZ) act 1 idle | 600 | `fa6bc0fe6891c2bab3eb78f30840de66cc1faaf291ac7cb122a92f989e60d74d` (599) |
+
+`--scene Title` records the synthetic `_RSDK_SCENE` entry at `list=60`; `--boot` records the real
+`GameConfig` entry (`cat=0,list=0,scenename="TITLE SCREEN"`) and is the closer match for the Rust
+port's real-list boot. Both reach the same attract state by frame 1600.
+
+Per-player injection is verified with `players_split.input` (column 1 RIGHT from line 10, column 2
+`LEFT|B` from line 50) and `--record-input`: record 10 has `input.ctrl=[8,8,0,0,0]` (P1 RIGHT;
+`CONT_ANY` = OR) and record 50 has `input.ctrl=[44,8,36,0,0]` (P2 `LEFT|B` = 36, `CONT_ANY` = 44).
 
 ## Limitations
 
