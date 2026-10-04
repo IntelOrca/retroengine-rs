@@ -104,6 +104,44 @@ fn s2_zone01_600_frames() {
     assert_600_frames("S2", "Zone01");
 }
 
+/// Regression for the S2 `Zone08` (HPZ) Act 1 hang that started at frame ~160: `HPZSetup` is
+/// type 40, its `ObjectDraw` appends `object.entityPos` to draw list 2 (`HPZSetup.txt:888`), and
+/// the port walked that list by live length, so the draw event re-appended itself forever
+/// (unbounded memory, no frame completion). `DrawObjectList` must snapshot the size like upstream
+/// (`Drawing.cpp:997-1007`). The wall-clock bound keeps a regression from hanging the suite.
+#[test]
+#[ignore = "requires assets"]
+fn s2_zone08_act1_600_frames_finish_under_wall_clock_bound() {
+    use std::time::{Duration, Instant};
+
+    let started = Instant::now();
+    let (engine, outcome) = run("S2", "Zone08", DEFAULT_SEED, false);
+    let elapsed = started.elapsed();
+
+    assert_eq!(outcome.frames, 600);
+    assert_eq!(
+        engine.stage_info(),
+        ("Zone08", "1"),
+        "the run must stay in S2 Zone08 Act 1"
+    );
+    assert!(
+        engine
+            .state
+            .draw_lists
+            .iter()
+            .all(|list| list.len() <= retro_scene::ENTITY_COUNT),
+        "draw lists must stay bounded by the entity bank"
+    );
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "S2/Zone08 Act 1 must finish 600 frames, took {elapsed:?}"
+    );
+    println!(
+        "S2 Zone08 act 1: 600 frames in {elapsed:?}, hash {}",
+        outcome.final_hash
+    );
+}
+
 /// BLAKE3 of the visible RGB565 framebuffer, rows contiguous and little-endian, exactly the
 /// `fb.blake3` value the C reference harness writes for each frame.
 fn framebuffer_hash(engine: &Engine) -> String {
